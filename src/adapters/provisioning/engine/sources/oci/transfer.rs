@@ -61,19 +61,6 @@ pub(crate) struct OciPullRequest {
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct OciPullStore;
-
-impl OciPullStore {
-    pub fn new() -> Self {
-        Self
-    }
-
-    pub(crate) async fn spawn(&self, request: OciPullRequest) -> OperationResult<SpawnedProcess> {
-        spawn_local_pull(request)
-    }
-}
-
-#[derive(Clone, Debug, Default)]
 pub(crate) struct OciTransferCancellation {
     requested: Arc<AtomicBool>,
     notify: Arc<tokio::sync::Notify>,
@@ -126,7 +113,7 @@ fn pull_flags(request: &OciPullRequest) -> u64 {
     }
 }
 
-fn spawn_local_pull(request: OciPullRequest) -> OperationResult<SpawnedProcess> {
+pub(super) fn spawn_pull(request: OciPullRequest) -> OperationResult<SpawnedProcess> {
     let (writer, reader) = tokio::net::unix::pipe::pipe()
         .map_err(|error| OperationFailure::Io(PathBuf::from("OCI transfer pipe"), error))?;
     let cancellation = OciTransferCancellation::default();
@@ -236,13 +223,10 @@ where
                     // cancellation request and CancelTransfer. Keep waiting
                     // for its authoritative TransferRemoved result; the outer
                     // wait timeout will fail closed if no result arrives.
-                    log::warn!(
-                        "CancelTransfer({transfer_id}) failed while awaiting final transfer state: {error}"
-                    );
                     write_transfer_line(
                         &mut output,
                         format!(
-                            "WARNING: cancellation request failed ({error}); awaiting authoritative transfer result."
+                            "WARNING: cancellation request for transfer {transfer_id} failed ({error}); awaiting authoritative transfer result."
                         ),
                     ).await;
                 }

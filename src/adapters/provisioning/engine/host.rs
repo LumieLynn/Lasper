@@ -2,7 +2,7 @@
 
 use crate::adapters::config::{NspawnConfigStore, SystemdUnitStore};
 use crate::adapters::platform::nvidia::NvidiaStateStore;
-use crate::adapters::process::CommandRunner;
+use crate::adapters::process::{CommandRunner, RootfsProcessRunner};
 use crate::adapters::provisioning::engine::failure::{OperationFailure, OperationResult};
 use crate::adapters::provisioning::engine::guest::GuestInitializer;
 use crate::adapters::system_operation::SystemOperationStore;
@@ -35,21 +35,28 @@ pub(crate) struct DirectProvisioningCapabilities {
     pub(super) guest: GuestInitializer,
     pub(super) commands: std::sync::Arc<dyn CommandRunner>,
     pub(super) nvidia_state: NvidiaStateStore,
+    pub(super) rootfs_processes: std::sync::Arc<dyn RootfsProcessRunner>,
 }
 
 impl DirectProvisioningCapabilities {
     pub(crate) fn from_direct(
         command_runner: std::sync::Arc<dyn CommandRunner>,
+        rootfs_processes: std::sync::Arc<dyn RootfsProcessRunner>,
         state_root: TrustedStateRoot,
     ) -> Self {
         Self {
             system_operations: SystemOperationStore::direct(command_runner.clone()),
             nspawn: NspawnConfigStore::direct(),
             systemd_unit: SystemdUnitStore::direct(),
-            guest: GuestInitializer::new(command_runner.clone()),
+            guest: GuestInitializer::new(command_runner.clone(), rootfs_processes.clone()),
+            rootfs_processes,
             commands: command_runner,
             nvidia_state: NvidiaStateStore::direct(state_root),
         }
+    }
+
+    pub(crate) fn commands(&self) -> &std::sync::Arc<dyn CommandRunner> {
+        &self.commands
     }
 
     pub(crate) fn system_operations(&self) -> &SystemOperationStore {

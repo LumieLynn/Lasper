@@ -22,11 +22,11 @@ pub(crate) struct BootstrapRequest {
 }
 
 #[derive(Clone)]
-pub struct BootstrapStore {
+pub struct BootstrapCommand {
     cmd_runner: Arc<dyn CommandRunner>,
 }
 
-impl BootstrapStore {
+impl BootstrapCommand {
     pub fn new(cmd_runner: Arc<dyn CommandRunner>) -> Self {
         Self { cmd_runner }
     }

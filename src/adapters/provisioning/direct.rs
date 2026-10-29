@@ -1,15 +1,15 @@
 //! Direct provisioning runner used by root/direct mode and inside the daemon.
 
 use super::engine::sources::{
-    BootstrapDeployer, BootstrapStore, CloneDeployer, Deployer, ImageAcquisitionStore,
-    ImageDeployer, ImageFormat, ImageImportStore, ImageSource, OciDeployer, OciPullStore,
+    ArchiveImport, BootstrapCommand, BootstrapDeployer, CloneDeployer, ImageSource, OciDeployer,
+    RawImageImport, RootfsSource,
 };
 use super::engine::{
-    DeploymentDiagnostics, DeploymentExecution, DirectProvisioningCapabilities, StoragePreparation,
+    DeploymentDiagnostics, DeploymentExecution, DeploymentMethod, DirectProvisioningCapabilities,
     SystemConfiguration,
 };
 use super::state::FilesystemDeploymentState;
-use crate::adapters::process::{CommandRunner, DefaultCommandRunner};
+use crate::adapters::process::{CommandRunner, DefaultCommandRunner, DefaultRootfsProcessRunner};
 use crate::adapters::storage::{
     DirectoryBackend, DiskImageBackend, StorageBackend, SubvolumeBackend,
 };
@@ -28,10 +28,6 @@ pub(crate) struct DirectProvisioningExecutor {
     host: DirectProvisioningCapabilities,
     host_operations: HostOperationTracker,
     managed_storage: crate::adapters::storage::ManagedStorageStore,
-    bootstrap: BootstrapStore,
-    image_acquisition: ImageAcquisitionStore,
-    image_import: ImageImportStore,
-    oci_pull: OciPullStore,
     deployment_state: Arc<dyn DeploymentStatePort>,
     artifact_source: Option<Arc<std::fs::File>>,
 }
@@ -78,14 +74,11 @@ impl DirectProvisioningExecutor {
         Self {
             host: DirectProvisioningCapabilities::from_direct(
                 Arc::clone(&command_runner),
+                Arc::new(DefaultRootfsProcessRunner),
                 state_root,
             ),
             host_operations,
             managed_storage: crate::adapters::storage::ManagedStorageStore::new(),
-            bootstrap: BootstrapStore::new(command_runner.clone()),
-            image_acquisition: ImageAcquisitionStore::new(),
-            image_import: ImageImportStore::new(command_runner),
-            oci_pull: OciPullStore::new(),
             deployment_state,
             artifact_source: artifact_source.map(Arc::new),
         }
@@ -125,88 +118,64 @@ impl DirectProvisioningExecutor {
                 "an artifact source fd was supplied for a deployment without a local artifact",
             ));
         }
-        let (source, storage, configuration): (Box<dyn Deployer>, _, _) = match spec {
-            DeploymentSpec::Bootstrap(deployment) => {
-                let source = Box::new(BootstrapDeployer {
+        let method = match spec {
+            DeploymentSpec::Bootstrap(deployment) => DeploymentMethod::Rootfs {
+                source: RootfsSource::Bootstrap(Box::new(BootstrapDeployer {
                     include_sudo: deployment.users.iter().any(|user| user.sudoer),
                     spec: deployment.provider,
-                    bootstrap: self.bootstrap.clone(),
-                });
-                (
-                    source,
-                    StoragePreparation::Allocate(self.storage(deployment.storage)),
-                    Some(SystemConfiguration {
-                        machine: deployment.machine,
-                        users: deployment.users,
-                        wayland: deployment.wayland,
-                        integration: deployment.integration,
-                    }),
-                )
-            }
+                    bootstrap: BootstrapCommand::new(self.host.commands().clone()),
+                })),
+                storage: self.storage(deployment.storage),
+                configuration: Box::new(SystemConfiguration {
+                    machine: deployment.machine,
+                    users: deployment.users,
+                    wayland: deployment.wayland,
+                    integration: deployment.integration,
+                }),
+            },
             DeploymentSpec::Import(deployment) => {
-                let (source, format, storage, allow_unsafe_remote_tar) = match deployment.image {
+                let configuration = Box::new(SystemConfiguration {
+                    machine: deployment.machine,
+                    users: Vec::new(),
+                    wayland: Vec::new(),
+                    integration: deployment.integration,
+                });
+                match deployment.image {
                     ImageImport::Archive {
                         source,
                         storage,
                         allow_unsafe_remote_tar,
-                    } => (
-                        source,
-                        ImageFormat::Tar,
-                        StoragePreparation::Allocate(self.storage(storage)),
-                        allow_unsafe_remote_tar,
-                    ),
-                    ImageImport::DiskImage { source } => (
-                        source,
-                        ImageFormat::Raw,
-                        StoragePreparation::ProviderImage,
-                        false,
-                    ),
-                };
-                (
-                    Box::new(ImageDeployer {
-                        source: self.image_source(source),
-                        format,
-                        acquisition: self.image_acquisition.clone(),
-                        image_import: self.image_import.clone(),
-                        allow_unsafe_remote_tar,
-                    }),
-                    storage,
-                    Some(SystemConfiguration {
-                        machine: deployment.machine,
-                        users: Vec::new(),
-                        wayland: Vec::new(),
-                        integration: deployment.integration,
-                    }),
-                )
+                    } => DeploymentMethod::Rootfs {
+                        source: RootfsSource::Archive(ArchiveImport {
+                            source: self.image_source(source),
+                            allow_unsafe_remote: allow_unsafe_remote_tar,
+                        }),
+                        storage: self.storage(storage),
+                        configuration,
+                    },
+                    ImageImport::DiskImage { source } => DeploymentMethod::RawImage {
+                        source: RawImageImport {
+                            source: self.image_source(source),
+                            commands: self.host.commands().clone(),
+                        },
+                        configuration,
+                    },
+                }
             }
-            DeploymentSpec::Clone(deployment) => (
-                Box::new(CloneDeployer {
-                    source_name: deployment.source_name,
-                    system_operations: self.host.system_operations().clone(),
-                    nspawn: self.host.nspawn().clone(),
-                    systemd_unit: self.host.systemd_unit().clone(),
-                }),
-                StoragePreparation::ProviderImage,
-                None,
-            ),
-            DeploymentSpec::Oci(deployment) => (
-                Box::new(OciDeployer {
-                    reference: deployment.reference,
-                    read_only: deployment.read_only,
-                    network: deployment.network,
-                    oci_pull: self.oci_pull.clone(),
-                    nspawn: self.host.nspawn().clone(),
-                }),
-                StoragePreparation::ProviderImage,
-                None,
-            ),
+            DeploymentSpec::Clone(deployment) => DeploymentMethod::Clone(CloneDeployer {
+                source_name: deployment.source_name,
+                system_operations: self.host.system_operations().clone(),
+                nspawn: self.host.nspawn().clone(),
+                systemd_unit: self.host.systemd_unit().clone(),
+            }),
+            DeploymentSpec::Oci(deployment) => DeploymentMethod::Oci(OciDeployer {
+                reference: deployment.reference,
+                read_only: deployment.read_only,
+                network: deployment.network,
+                nspawn: self.host.nspawn().clone(),
+            }),
         };
-        Ok(DeploymentExecution {
-            target,
-            source,
-            storage,
-            configuration,
-        })
+        Ok(DeploymentExecution { target, method })
     }
 }
 
@@ -305,7 +274,14 @@ mod tests {
                     )),
                 )
                 .unwrap();
-            let storage = execution.storage.backend().unwrap();
+            let DeploymentMethod::Rootfs {
+                storage,
+                configuration,
+                ..
+            } = execution.method
+            else {
+                panic!("archive imports must allocate rootfs storage");
+            };
             assert_eq!(storage.get_type(), expected_type);
             let expected_path = match expected_type {
                 StorageType::Directory | StorageType::Subvolume => {
@@ -314,7 +290,6 @@ mod tests {
                 StorageType::DiskImage => crate::paths::machine_raw_image(machine),
             };
             assert_eq!(storage.get_path(machine), expected_path);
-            let configuration = execution.configuration.unwrap();
             assert!(configuration.users.is_empty());
             assert!(configuration.wayland.is_empty());
         }
@@ -339,8 +314,10 @@ mod tests {
             integration: Default::default(),
         }));
         let execution = executor.execution(machine.clone(), import).unwrap();
-        assert!(execution.storage.backend().is_none());
-        assert!(execution.configuration.unwrap().users.is_empty());
+        let DeploymentMethod::RawImage { configuration, .. } = execution.method else {
+            panic!("raw imports must publish an image without another storage backend");
+        };
+        assert!(configuration.users.is_empty());
         for spec in [
             DeploymentSpec::Clone(CloneDeployment {
                 name: machine.to_string(),
@@ -354,8 +331,10 @@ mod tests {
             }),
         ] {
             let execution = executor.execution(machine.clone(), spec).unwrap();
-            assert!(execution.storage.backend().is_none());
-            assert!(execution.configuration.is_none());
+            assert!(matches!(
+                execution.method,
+                DeploymentMethod::Clone(_) | DeploymentMethod::Oci(_)
+            ));
         }
     }
 }

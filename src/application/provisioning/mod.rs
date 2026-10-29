@@ -1,4 +1,6 @@
 mod contract;
+mod ownership;
+mod plan;
 mod preparation;
 mod recovery;
 mod service;
@@ -10,13 +12,13 @@ pub use contract::{
     DeploymentSecrets, DeploymentStartError, DeploymentStatus, DeploymentSubmission,
     RemoteTarSafety, SourcePreflight, UserSecret,
 };
+pub use plan::DeploymentPlan;
 pub use preparation::{
     HostCapability, HostGpuDevice, HostHardwareSnapshot, ImagePartitionInfo, ImagePartitionProbe,
     InterfaceValidation, ProvisioningHostSnapshot, ProvisioningPreparationPort,
     ProvisioningPreparationService, StorageBackendKind, UnclassifiedNvidiaFile,
 };
 pub use service::ProvisioningService;
-pub use state::DeploymentPlan;
 
 #[cfg(test)]
 pub(crate) use contract::MemoryDeploymentClaimControl;
@@ -24,15 +26,16 @@ pub(crate) use contract::{
     deployment_job_channel, DeploymentCancellation, DeploymentClaimControl, DeploymentJobContext,
     DeploymentRequestId, DeploymentSecretsWire, ResourceApplyStatus,
 };
+pub(crate) use ownership::{DeploymentResource, ResourceDisposition, ResourceLedger};
+pub(crate) use plan::PlanFingerprint;
 pub(crate) use recovery::{
     DeploymentRecoveryEvidence, DeploymentRecoveryObservation, DeploymentRecoveryProbe,
     DeploymentRecoveryReport,
 };
 pub(crate) use service::run_deployment_executor;
 pub(crate) use state::{
-    DeploymentCrashManifest, DeploymentManifestState, DeploymentResource, DeploymentStage,
-    DeploymentStateError, DeploymentStatePort, DeploymentStateSession, PlanFingerprint,
-    ResourceDisposition, ResourceLedger,
+    DeploymentCrashManifest, DeploymentManifestState, DeploymentStage, DeploymentStateError,
+    DeploymentStatePort, DeploymentStateSession,
 };
 
 #[cfg(test)]

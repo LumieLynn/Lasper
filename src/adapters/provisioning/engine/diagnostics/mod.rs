@@ -37,6 +37,15 @@ impl DeploymentDiagnostics {
     }
 
     pub(super) fn message(&self, message: impl Into<String>) {
+        self.write(log::Level::Info, message.into());
+    }
+
+    pub(super) fn warning(&self, message: impl Into<String>) {
+        self.write(log::Level::Warn, message.into());
+    }
+
+    /// Provider output has no structured severity; classify it only at this boundary.
+    pub(super) fn command_output(&self, message: impl Into<String>) {
         let message = message.into();
         let level = if is_high_signal(&message) {
             log::Level::Warn

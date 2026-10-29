@@ -26,7 +26,7 @@ pub(crate) async fn wait_for_deployment_command(
     }
 
     if let Some(error) = stream_error {
-        logs.message(format!(
+        logs.warning(format!(
             "Stopping {label} after its output stream failed..."
         ));
         spawned
@@ -101,7 +101,7 @@ fn report_command_line(diagnostics: &DeploymentDiagnostics, line: &[u8], truncat
     if truncated {
         text.push_str(" [command output truncated]");
     }
-    diagnostics.message(text);
+    diagnostics.command_output(text);
 }
 
 #[cfg(test)]

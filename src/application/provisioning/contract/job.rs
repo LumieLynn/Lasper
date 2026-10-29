@@ -7,7 +7,7 @@ use tokio::sync::{mpsc, watch};
 use super::identity::DeploymentId;
 use super::secrets::DeploymentSecrets;
 use super::DeploymentResult;
-use crate::application::provisioning::state::{DeploymentPlan, DeploymentStateSession};
+use crate::application::provisioning::{DeploymentPlan, DeploymentStateSession};
 
 pub(crate) const DEPLOYMENT_EVENT_CAPACITY: usize = 256;
 

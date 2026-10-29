@@ -4,6 +4,7 @@ mod limits;
 
 use super::validate_source;
 use crate::adapters::process::{read_bounded_stream, terminate_child_process_group};
+use crate::adapters::provisioning::engine::diagnostics::DeploymentDiagnostics;
 use crate::adapters::provisioning::engine::execution::check_deployment_cancellation;
 use crate::adapters::provisioning::engine::failure::{OperationFailure, OperationResult};
 use crate::adapters::provisioning::engine::host::HostResultExt;
@@ -44,8 +45,9 @@ pub(crate) struct ImageImportReport {
 pub(crate) async fn import_tar_image(
     request: ImportTarRequest,
     source: std::fs::File,
+    logs: &DeploymentDiagnostics,
     cancellation: &DeploymentCancellation,
-) -> OperationResult<ImageImportReport> {
+) -> OperationResult<()> {
     validate_source(&source)?;
     validate_tar_target(&request.target).await?;
     let target = request.target.path();
@@ -57,9 +59,11 @@ pub(crate) async fn import_tar_image(
         result = preparation => result?,
         _ = cancellation.cancelled() => return Err(OperationFailure::Cancelled),
     };
+    for warning in report.warnings {
+        logs.warning(format!("WARNING: {warning}"));
+    }
     check_deployment_cancellation(cancellation)?;
-    extract_tar_at(&target, source, cancellation).await?;
-    Ok(report)
+    extract_tar_at(&target, source, cancellation).await
 }
 
 async fn prepare_tar_import(
@@ -78,9 +82,6 @@ async fn prepare_tar_import(
     })??;
     let assessment = inspect_tar_runtime().await?;
     let report = tar_runtime_policy(source_origin, &assessment, allow_unsafe_remote)?;
-    for warning in &report.warnings {
-        log::warn!("[AUDIT] [Tar import] {warning}");
-    }
     Ok((source, report))
 }
 

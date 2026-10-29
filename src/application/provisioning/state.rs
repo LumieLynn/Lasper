@@ -1,80 +1,17 @@
-//! Secret-free deployment planning, resource ownership, and crash state.
+//! Durable deployment stages, crash manifests and revision-checked persistence.
 
-use super::{DeploymentError, DeploymentId};
+use crate::application::provisioning::ownership::{
+    DeploymentResource, ResourceLedger, ResourceLedgerSnapshot,
+};
+use crate::application::provisioning::plan::{DeploymentPlan, PlanFingerprint};
+use crate::application::provisioning::DeploymentId;
 use crate::application::{ResourceClaim, ResourceKey};
 use crate::domain::machine::MachineName;
-use crate::domain::provisioning::DeploymentSpec;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 pub(crate) const DEPLOYMENT_MANIFEST_SCHEMA_VERSION: u32 = 1;
-
-#[derive(Clone, Debug)]
-pub struct DeploymentPlan {
-    spec: DeploymentSpec,
-    target: MachineName,
-    fingerprint: PlanFingerprint,
-}
-
-impl DeploymentPlan {
-    pub(crate) fn build(spec: DeploymentSpec) -> Result<Self, DeploymentError> {
-        spec.validate()
-            .map_err(|error| DeploymentError::rejected(error.to_string()))?;
-        let target = MachineName::new(spec.target_name())
-            .map_err(|error| DeploymentError::rejected(error.to_string()))?;
-        let normalized = serde_json::to_vec(&spec).map_err(|error| {
-            DeploymentError::failed(format!("Could not normalize deployment plan: {error}"))
-        })?;
-        let digest = Sha256::digest(&normalized);
-        let fingerprint = PlanFingerprint(
-            digest
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>(),
-        );
-        Ok(Self {
-            spec,
-            target,
-            fingerprint,
-        })
-    }
-
-    pub fn target(&self) -> &MachineName {
-        &self.target
-    }
-
-    pub(crate) fn fingerprint(&self) -> &PlanFingerprint {
-        &self.fingerprint
-    }
-
-    pub(crate) fn into_spec(self) -> DeploymentSpec {
-        self.spec
-    }
-
-    pub(crate) fn resource_claims(&self) -> Vec<ResourceClaim> {
-        let mut claims = vec![ResourceClaim::exclusive(ResourceKey::for_machine(
-            &self.target,
-        ))];
-        if let DeploymentSpec::Clone(deployment) = &self.spec {
-            let source = crate::domain::runtime::ImageName::new(&deployment.source_name)
-                .expect("validated deployment plan has a valid clone source");
-            claims.push(ResourceClaim::shared(ResourceKey::for_image(&source)));
-        }
-        claims
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub(crate) struct PlanFingerprint(String);
-
-impl PlanFingerprint {
-    pub(crate) fn is_valid(&self) -> bool {
-        self.0.len() == 64 && self.0.bytes().all(|byte| byte.is_ascii_hexdigit())
-    }
-}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -87,176 +24,6 @@ pub(crate) enum DeploymentStage {
     RuntimeCommit,
     Cleanup,
     Rollback,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(tag = "kind", content = "target", rename_all = "snake_case")]
-pub(crate) enum DeploymentResource {
-    LocalStorage(MachineName),
-    ExternalImage(MachineName),
-    StorageMount(MachineName),
-    RawConfigurationMount(MachineName),
-    NvidiaState(MachineName),
-    NspawnConfig(MachineName),
-    SystemdOverride(MachineName),
-    RootfsHostname(MachineName),
-    RootfsAccounts(MachineName),
-    RootfsNvidia(MachineName),
-    RootfsNetwork(MachineName),
-}
-
-impl DeploymentResource {
-    pub(crate) fn label(&self) -> &'static str {
-        match self {
-            Self::LocalStorage(_) => "local storage",
-            Self::ExternalImage(_) => "external image",
-            Self::StorageMount(_) => "storage mount",
-            Self::RawConfigurationMount(_) => "raw image configuration mount",
-            Self::NvidiaState(_) => "NVIDIA state",
-            Self::NspawnConfig(_) => ".nspawn configuration",
-            Self::SystemdOverride(_) => "systemd service override",
-            Self::RootfsHostname(_) => "rootfs hostname state",
-            Self::RootfsAccounts(_) => "rootfs account state",
-            Self::RootfsNvidia(_) => "rootfs NVIDIA state",
-            Self::RootfsNetwork(_) => "rootfs network state",
-        }
-    }
-
-    fn target(&self) -> &MachineName {
-        match self {
-            Self::LocalStorage(target)
-            | Self::ExternalImage(target)
-            | Self::StorageMount(target)
-            | Self::RawConfigurationMount(target)
-            | Self::NvidiaState(target)
-            | Self::NspawnConfig(target)
-            | Self::SystemdOverride(target)
-            | Self::RootfsHostname(target)
-            | Self::RootfsAccounts(target)
-            | Self::RootfsNvidia(target)
-            | Self::RootfsNetwork(target) => target,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ResourceDisposition {
-    Created,
-    Adopted,
-    PreExisting,
-    Transferred,
-    Committed,
-    CleanupPending,
-    OutcomeUnknown,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ResourceLedgerEntry {
-    pub(crate) resource: DeploymentResource,
-    pub(crate) disposition: ResourceDisposition,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct ResourceLedger {
-    entries: Vec<ResourceLedgerEntry>,
-}
-
-impl ResourceLedger {
-    pub(crate) fn record(
-        &mut self,
-        resource: DeploymentResource,
-        disposition: ResourceDisposition,
-    ) {
-        if let Some(entry) = self
-            .entries
-            .iter_mut()
-            .find(|entry| entry.resource == resource)
-        {
-            entry.disposition = disposition;
-        } else {
-            self.entries.push(ResourceLedgerEntry {
-                resource,
-                disposition,
-            });
-        }
-    }
-
-    pub(crate) fn owns(&self, resource: &DeploymentResource) -> bool {
-        self.entries.iter().any(|entry| {
-            &entry.resource == resource
-                && matches!(
-                    entry.disposition,
-                    ResourceDisposition::Created
-                        | ResourceDisposition::Adopted
-                        | ResourceDisposition::Transferred
-                        | ResourceDisposition::Committed
-                        | ResourceDisposition::CleanupPending
-                )
-        })
-    }
-
-    pub(crate) fn disposition(&self, resource: &DeploymentResource) -> Option<ResourceDisposition> {
-        self.entries
-            .iter()
-            .find(|entry| &entry.resource == resource)
-            .map(|entry| entry.disposition)
-    }
-
-    pub(crate) fn remove(&mut self, resource: &DeploymentResource) {
-        self.entries.retain(|entry| &entry.resource != resource);
-    }
-
-    pub(crate) fn owned_in_reverse(&self) -> Vec<DeploymentResource> {
-        self.entries
-            .iter()
-            .rev()
-            .filter(|entry| self.owns(&entry.resource))
-            .map(|entry| entry.resource.clone())
-            .collect()
-    }
-
-    pub(crate) fn snapshot(&self) -> ResourceLedgerSnapshot {
-        ResourceLedgerSnapshot {
-            entries: self.entries.clone(),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct ResourceLedgerSnapshot {
-    entries: Vec<ResourceLedgerEntry>,
-}
-
-impl ResourceLedgerSnapshot {
-    pub(crate) fn entries(&self) -> &[ResourceLedgerEntry] {
-        &self.entries
-    }
-
-    fn validate(&self, target: &MachineName) -> Result<(), DeploymentStateError> {
-        let mut resources = std::collections::HashSet::new();
-        if self
-            .entries
-            .iter()
-            .any(|entry| !resources.insert(&entry.resource))
-        {
-            return Err(DeploymentStateError::Invalid(
-                "deployment ledger contains a duplicate resource".into(),
-            ));
-        }
-        if self
-            .entries
-            .iter()
-            .any(|entry| entry.resource.target() != target)
-        {
-            return Err(DeploymentStateError::Invalid(
-                "deployment ledger contains a resource for another target".into(),
-            ));
-        }
-        Ok(())
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -310,7 +77,9 @@ impl DeploymentCrashManifest {
                 "deployment manifest has an invalid revision or plan hash".into(),
             ));
         }
-        self.committed_ledger.validate(&self.target)?;
+        self.committed_ledger
+            .validate(&self.target)
+            .map_err(|reason| DeploymentStateError::Invalid(reason.into()))?;
         if let DeploymentManifestState::Applying {
             intended_resources, ..
         } = &self.state
@@ -531,7 +300,9 @@ impl DeploymentStateSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::provisioning::ownership::{ResourceDisposition, ResourceLedgerEntry};
     use crate::domain::machine::MachineConfig;
+    use crate::domain::provisioning::DeploymentSpec;
 
     fn request() -> DeploymentSpec {
         DeploymentSpec::Import(Box::new(crate::domain::provisioning::ImportDeployment {
@@ -546,87 +317,6 @@ mod tests {
             },
             integration: Default::default(),
         }))
-    }
-
-    #[test]
-    fn plan_fingerprint_is_stable_and_changes_with_non_secret_intent() {
-        let first = DeploymentPlan::build(request()).unwrap();
-        let second = DeploymentPlan::build(request()).unwrap();
-        assert_eq!(first.fingerprint(), second.fingerprint());
-
-        let mut changed = request();
-        let DeploymentSpec::Import(deployment) = &mut changed else {
-            unreachable!()
-        };
-        deployment.machine.guest_hostname = "different".into();
-        let changed = DeploymentPlan::build(changed).unwrap();
-        assert_ne!(first.fingerprint(), changed.fingerprint());
-    }
-
-    #[test]
-    fn plan_fingerprint_is_independent_of_nvidia_destination_insertion_order() {
-        use crate::domain::nvidia::{NvidiaFileCategory, NvidiaPassthroughProfile};
-
-        let mut first_profile = NvidiaPassthroughProfile::default();
-        first_profile
-            .category_destinations
-            .insert(NvidiaFileCategory::Lib64, "/opt/nvidia/lib64".into());
-        first_profile
-            .category_destinations
-            .insert(NvidiaFileCategory::Bin, "/opt/nvidia/bin".into());
-        let mut second_profile = NvidiaPassthroughProfile::default();
-        second_profile
-            .category_destinations
-            .insert(NvidiaFileCategory::Bin, "/opt/nvidia/bin".into());
-        second_profile
-            .category_destinations
-            .insert(NvidiaFileCategory::Lib64, "/opt/nvidia/lib64".into());
-
-        let mut first_request = request();
-        let DeploymentSpec::Import(first) = &mut first_request else {
-            unreachable!()
-        };
-        first.integration.nvidia_profile = Some(first_profile);
-        let mut second_request = request();
-        let DeploymentSpec::Import(second) = &mut second_request else {
-            unreachable!()
-        };
-        second.integration.nvidia_profile = Some(second_profile);
-
-        assert_eq!(
-            DeploymentPlan::build(first_request).unwrap().fingerprint(),
-            DeploymentPlan::build(second_request).unwrap().fingerprint()
-        );
-    }
-
-    #[test]
-    fn resource_ledger_updates_one_typed_resource_without_duplicates() {
-        let machine = MachineName::new("test").unwrap();
-        let resource = DeploymentResource::NspawnConfig(machine);
-        let mut ledger = ResourceLedger::default();
-        ledger.record(resource.clone(), ResourceDisposition::Created);
-        ledger.record(resource.clone(), ResourceDisposition::CleanupPending);
-
-        assert!(ledger.owns(&resource));
-        assert_eq!(ledger.snapshot().entries.len(), 1);
-        assert_eq!(
-            ledger.snapshot().entries[0].disposition,
-            ResourceDisposition::CleanupPending
-        );
-    }
-
-    #[test]
-    fn outcome_unknown_is_recovery_evidence_not_ownership() {
-        let machine = MachineName::new("test").unwrap();
-        let resource = DeploymentResource::NspawnConfig(machine);
-        let mut ledger = ResourceLedger::default();
-        ledger.record(resource.clone(), ResourceDisposition::OutcomeUnknown);
-
-        assert!(!ledger.owns(&resource));
-        assert_eq!(
-            ledger.disposition(&resource),
-            Some(ResourceDisposition::OutcomeUnknown)
-        );
     }
 
     #[test]

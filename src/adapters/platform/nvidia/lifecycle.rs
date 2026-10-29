@@ -141,6 +141,7 @@ async fn inject_persistent_device_allow(
 pub(crate) async fn inject_env_once(
     target: &crate::adapters::storage::rootfs::RootfsTarget,
     state: &NvidiaState,
+    runner: &dyn crate::adapters::process::RootfsProcessRunner,
 ) -> Result<Vec<String>> {
     let (ld_cache_folders, environment, write_environment) = nvidia_rootfs_config(state);
     crate::adapters::platform::nvidia::rootfs::configure(
@@ -148,6 +149,7 @@ pub(crate) async fn inject_env_once(
         &ld_cache_folders,
         &environment,
         write_environment,
+        runner,
     )
     .await
 }
@@ -298,7 +300,13 @@ pub(crate) async fn ensure_gpu_passthrough(
     )?;
 
     // 4. Cleanup stale files in rootfs
-    for warning in crate::adapters::platform::nvidia::rootfs::cleanup(name, &death_list).await? {
+    for warning in crate::adapters::platform::nvidia::rootfs::cleanup(
+        name,
+        &death_list,
+        &crate::adapters::process::DefaultRootfsProcessRunner,
+    )
+    .await?
+    {
         log::warn!("{}", warning);
     }
 

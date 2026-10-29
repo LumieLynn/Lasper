@@ -4,7 +4,7 @@ mod hostname;
 mod network;
 mod users;
 
-use crate::adapters::process::{CommandRunner, DefaultRootfsProcessRunner, RootfsProcessRunner};
+use crate::adapters::process::{CommandRunner, RootfsProcessRunner};
 use crate::adapters::provisioning::engine::failure::{OperationFailure, OperationResult};
 use crate::adapters::provisioning::engine::host::HostResultExt;
 use crate::adapters::storage::rootfs::{access::RootfsAccess, RootfsTarget};
@@ -21,10 +21,13 @@ pub(super) struct GuestInitializer {
 }
 
 impl GuestInitializer {
-    pub(super) fn new(commands: Arc<dyn CommandRunner>) -> Self {
+    pub(super) fn new(
+        commands: Arc<dyn CommandRunner>,
+        processes: Arc<dyn RootfsProcessRunner>,
+    ) -> Self {
         Self {
             commands,
-            processes: Arc::new(DefaultRootfsProcessRunner),
+            processes,
         }
     }
 

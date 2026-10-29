@@ -61,9 +61,6 @@ async fn enable_systemd_unit(
         .await
         .map_err(|error| OperationFailure::Io(nspawn_io_path(), error))?;
     log_output(&format!("systemctl enable {unit}"), &out);
-    if !out.status.success() {
-        log::warn!("Failed to enable {} inside {}", unit, rootfs.display());
-    }
     Ok(out)
 }
 

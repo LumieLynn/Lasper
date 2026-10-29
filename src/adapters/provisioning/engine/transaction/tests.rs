@@ -93,6 +93,7 @@ async fn finish_owned_image(
     let directory = tempfile::tempdir().unwrap();
     let host = DirectProvisioningCapabilities::from_direct(
         Arc::new(commands),
+        Arc::new(crate::adapters::process::MockRootfsProcessRunner::new()),
         TrustedStateRoot::for_test(directory.path().join("state")),
     );
     let plan = DeploymentPlan::build(DeploymentSpec::Clone(CloneDeployment {
@@ -117,8 +118,15 @@ async fn finish_owned_image(
     let mut report = ApplyReport::new(plan.target().clone());
     report.record_created(AppliedResource::ExternalImage);
     let transaction = Transaction {
+        method: DeploymentMethod::Clone(
+            crate::adapters::provisioning::engine::sources::CloneDeployer {
+                source_name: "base".into(),
+                system_operations: host.system_operations().clone(),
+                nspawn: host.nspawn().clone(),
+                systemd_unit: host.systemd_unit().clone(),
+            },
+        ),
         host,
-        storage: StoragePreparation::ProviderImage,
         job: job.with_state_session(session),
         logs: &mut logs,
         report,

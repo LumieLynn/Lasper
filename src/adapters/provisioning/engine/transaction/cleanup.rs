@@ -22,7 +22,7 @@ pub(super) async fn finish(
 ) -> Result<DeploymentResult, DeploymentFailure> {
     let Transaction {
         host,
-        storage,
+        method,
         job,
         logs,
         mut report,
@@ -50,7 +50,7 @@ pub(super) async fn finish(
         let error = result.unwrap_err();
         let message =
             "mounts and resources were preserved because the operation outcome is unconfirmed";
-        logs.message(message);
+        logs.warning(message);
         let mut cleanup_errors = vec![message.into()];
         if let Err(state_error) = persist_cleanup_pending(&job, &report).await {
             cleanup_errors.push(format!("cleanup-pending state: {state_error}"));
@@ -87,7 +87,7 @@ pub(super) async fn finish(
                 }
                 Err(error) => {
                     let message = format!("raw image configuration mount: {error}");
-                    log::warn!("Failed to clean up {message}");
+                    logs.warning(format!("Failed to clean up {message}"));
                     report.record_typed(resource, ResourceDisposition::CleanupPending);
                     report.block_storage_removal(message.clone());
                     cleanup_errors.push(message);
@@ -103,7 +103,7 @@ pub(super) async fn finish(
         }
     }
 
-    if let Some(storage) = storage.backend().filter(|_| storage_mount_attempted) {
+    if let Some(storage) = method.storage().filter(|_| storage_mount_attempted) {
         logs.message("Cleaning up storage mount...".to_string());
         let resource = DeploymentResource::StorageMount(report.target.clone());
         if durable_cleanup_failed {
@@ -136,7 +136,7 @@ pub(super) async fn finish(
                     }
                     Err(error) => {
                         let message = format!("storage unmount: {error}");
-                        log::warn!("Failed to clean up {message}");
+                        logs.warning(format!("Failed to clean up {message}"));
                         report.record_typed(resource, ResourceDisposition::CleanupPending);
                         report.block_storage_removal(message.clone());
                         cleanup_errors.push(message);
@@ -174,7 +174,7 @@ pub(super) async fn finish(
                 .push("rollback was not attempted after durable cleanup state failed".into());
         } else {
             rollback_errors.extend(
-                rollback_apply_report(&name, &mut report, storage.backend(), &host, logs, &job)
+                rollback_apply_report(&name, &mut report, method.storage(), &host, logs, &job)
                     .await,
             );
         }
@@ -183,8 +183,7 @@ pub(super) async fn finish(
             let warning = format!(
                 "external provider did not confirm ownership of image {name:?}; any partial provider output was preserved for manual inspection"
             );
-            log::warn!("{warning}");
-            logs.message(format!("WARNING: {warning}"));
+            logs.warning(format!("WARNING: {warning}"));
         }
 
         for resource in report.outcome_unknown_resources() {
@@ -208,7 +207,7 @@ pub(super) async fn finish(
             rollback_errors.push(format!("deployment cleanup state: {state_error}"));
         }
         for rollback_error in &rollback_errors {
-            logs.message(format!("ROLLBACK ERROR: {rollback_error}"));
+            logs.error(format!("ROLLBACK ERROR: {rollback_error}"));
         }
         return Err(DeploymentFailure::new(error, rollback_errors));
     }

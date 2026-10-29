@@ -1,139 +1,78 @@
-//! Import of a system image from an acquired local or remote artifact.
+//! Import an acquired artifact into a mounted rootfs or a managed RAW image.
 
 mod acquisition;
 mod archive;
 mod raw;
 
-pub(crate) use acquisition::{ImageAcquisitionStore, ImageSource};
+pub(crate) use acquisition::ImageSource;
 pub(crate) use archive::{inspect_tar_runtime, TarRuntimeAssessment};
 
 use crate::adapters::process::CommandRunner;
 use crate::adapters::provisioning::engine::diagnostics::DeploymentDiagnostics;
 use crate::adapters::provisioning::engine::execution::check_deployment_cancellation;
-use crate::adapters::provisioning::engine::failure::{OperationFailure, OperationResult};
+use crate::adapters::provisioning::engine::failure::OperationResult;
 use crate::adapters::provisioning::engine::host::HostResultExt;
 use crate::adapters::provisioning::engine::resources::{AppliedResource, ApplyReport};
-use crate::adapters::provisioning::engine::sources::Deployer;
 use crate::adapters::storage::rootfs::RootfsTarget;
-use crate::application::provisioning::{DeploymentCancellation, DeploymentResource};
+use crate::application::provisioning::DeploymentCancellation;
 use crate::domain::machine::MachineName;
-use archive::{import_tar_image, ImageImportReport, ImportTarRequest, TarSourceOrigin};
-use async_trait::async_trait;
+use acquisition::acquire_image;
+use archive::{import_tar_image, ImportTarRequest};
 use raw::validate_raw_system_image;
 use std::sync::Arc;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ImageFormat {
-    Tar,
-    Raw,
-}
-
-pub struct ImageDeployer {
+pub(crate) struct ArchiveImport {
     pub source: ImageSource,
-    pub format: ImageFormat,
-    pub acquisition: ImageAcquisitionStore,
-    pub image_import: ImageImportStore,
-    pub allow_unsafe_remote_tar: bool,
+    pub allow_unsafe_remote: bool,
 }
 
-#[async_trait]
-impl Deployer for ImageDeployer {
-    fn source_stage_resources(&self, target: &MachineName) -> Vec<DeploymentResource> {
-        vec![match self.format {
-            ImageFormat::Tar => DeploymentResource::LocalStorage(target.clone()),
-            ImageFormat::Raw => DeploymentResource::ExternalImage(target.clone()),
-        }]
-    }
-
-    async fn deploy(
+impl ArchiveImport {
+    pub(crate) async fn deploy(
         &self,
-        name: &str,
-        rootfs: &std::path::Path,
+        target: &RootfsTarget,
+        logs: &DeploymentDiagnostics,
+        cancellation: &DeploymentCancellation,
+    ) -> OperationResult<()> {
+        check_deployment_cancellation(cancellation)?;
+        let source = acquire_image(&self.source, logs, cancellation).await?;
+        check_deployment_cancellation(cancellation)?;
+        validate_source(&source)?;
+        logs.message("Extracting rootfs archive...");
+        let request = ImportTarRequest {
+            target: target.clone(),
+            source_origin: self.source.tar_origin(),
+            allow_unsafe_remote: self.allow_unsafe_remote,
+        };
+        import_tar_image(request, source, logs, cancellation).await?;
+        check_deployment_cancellation(cancellation)
+    }
+}
+
+pub(crate) struct RawImageImport {
+    pub source: ImageSource,
+    pub commands: Arc<dyn CommandRunner>,
+}
+
+impl RawImageImport {
+    pub(crate) async fn deploy(
+        &self,
+        machine: &MachineName,
         logs: &DeploymentDiagnostics,
         cancellation: &DeploymentCancellation,
         report: &mut ApplyReport,
     ) -> OperationResult<()> {
         check_deployment_cancellation(cancellation)?;
-        let source = self
-            .acquisition
-            .acquire(&self.source, logs, cancellation)
-            .await?;
+        let source = acquire_image(&self.source, logs, cancellation).await?;
         check_deployment_cancellation(cancellation)?;
-        match self.format {
-            ImageFormat::Raw => {
-                logs.message("Importing typed RAW machine image...");
-                let machine = MachineName::new(name)
-                    .map_err(|error| OperationFailure::InvalidInput(error.to_string()))?;
-                let path = self.image_import.import_raw(machine, source).await?;
-                report.record_created(AppliedResource::ExternalImage);
-                check_deployment_cancellation(cancellation)?;
-                self.image_import.validate_raw(&path).await?;
-                check_deployment_cancellation(cancellation)?;
-            }
-            ImageFormat::Tar => {
-                logs.message("Extracting typed rootfs archive...");
-                let target = RootfsTarget::from_provisioned_path(name, rootfs)
-                    .host_context("resolve archive target")?;
-                let report = self
-                    .image_import
-                    .import_tar(
-                        target,
-                        source,
-                        self.source.tar_origin(),
-                        self.allow_unsafe_remote_tar,
-                        cancellation,
-                    )
-                    .await?;
-                for warning in report.warnings {
-                    logs.message(format!("WARNING: {warning}"));
-                }
-                check_deployment_cancellation(cancellation)?;
-            }
-        }
-        Ok(())
-    }
-}
-
-#[derive(Clone)]
-pub struct ImageImportStore {
-    commands: Arc<dyn CommandRunner>,
-}
-
-impl ImageImportStore {
-    pub fn new(commands: Arc<dyn CommandRunner>) -> Self {
-        Self { commands }
-    }
-
-    pub(crate) async fn import_raw(
-        &self,
-        machine: MachineName,
-        source: std::fs::File,
-    ) -> OperationResult<std::path::PathBuf> {
         validate_source(&source)?;
-        crate::adapters::storage::image_ops::import_raw_image(&machine, source)
+        logs.message("Importing RAW machine image...");
+        let path = crate::adapters::storage::image_ops::import_raw_image(machine, source)
             .await
-            .host_context("publish imported raw image")
-    }
-
-    async fn validate_raw(&self, path: &std::path::Path) -> OperationResult<()> {
-        validate_raw_system_image(path, self.commands.as_ref()).await
-    }
-
-    pub(crate) async fn import_tar(
-        &self,
-        target: RootfsTarget,
-        source: std::fs::File,
-        source_origin: TarSourceOrigin,
-        allow_unsafe_remote: bool,
-        cancellation: &DeploymentCancellation,
-    ) -> OperationResult<ImageImportReport> {
-        validate_source(&source)?;
-        let request = ImportTarRequest {
-            target,
-            source_origin,
-            allow_unsafe_remote,
-        };
-        import_tar_image(request, source, cancellation).await
+            .host_context("publish imported raw image")?;
+        report.record_created(AppliedResource::ExternalImage);
+        check_deployment_cancellation(cancellation)?;
+        validate_raw_system_image(&path, self.commands.as_ref()).await?;
+        check_deployment_cancellation(cancellation)
     }
 }
 

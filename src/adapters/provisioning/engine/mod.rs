@@ -20,7 +20,7 @@ pub(super) mod sources;
 mod transaction;
 
 pub(super) use diagnostics::DeploymentDiagnostics;
-pub(super) use execution::{DeploymentExecution, StoragePreparation, SystemConfiguration};
+pub(super) use execution::{DeploymentExecution, DeploymentMethod, SystemConfiguration};
 pub(super) use failure::DeploymentFailure;
 pub(super) use host::DirectProvisioningCapabilities;
 pub(super) use transaction::run_deployment;

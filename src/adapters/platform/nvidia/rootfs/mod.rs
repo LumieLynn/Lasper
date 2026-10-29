@@ -1,6 +1,6 @@
 use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::log_output;
-use crate::adapters::process::{nspawn_io_path, DefaultRootfsProcessRunner, RootfsProcessRunner};
+use crate::adapters::process::{nspawn_io_path, RootfsProcessRunner};
 use crate::adapters::storage::rootfs::RootfsTarget;
 use crate::domain::machine::MachineName;
 use crate::domain::secret::SecretBytes;
@@ -22,6 +22,7 @@ pub(super) async fn configure(
     ld_cache_folders: &[String],
     environment: &[(String, String)],
     write_environment: bool,
+    runner: &dyn RootfsProcessRunner,
 ) -> Result<Vec<String>> {
     validate_nvidia_config(ld_cache_folders, environment, write_environment)?;
     let path = target.required_directory().await?;
@@ -30,12 +31,16 @@ pub(super) async fn configure(
         ld_cache_folders,
         environment,
         write_environment,
-        &DefaultRootfsProcessRunner,
+        runner,
     )
     .await
 }
 
-pub(super) async fn cleanup(machine: &str, paths: &[String]) -> Result<Vec<String>> {
+pub(super) async fn cleanup(
+    machine: &str,
+    paths: &[String],
+    runner: &dyn RootfsProcessRunner,
+) -> Result<Vec<String>> {
     validate_cleanup_paths(paths)?;
     let machine =
         MachineName::new(machine).map_err(|error| NspawnError::Validation(error.to_string()))?;
@@ -45,7 +50,7 @@ pub(super) async fn cleanup(machine: &str, paths: &[String]) -> Result<Vec<Strin
     else {
         return Ok(Vec::new());
     };
-    cleanup_nvidia_files(&path, paths, &DefaultRootfsProcessRunner).await
+    cleanup_nvidia_files(&path, paths, runner).await
 }
 
 async fn configure_nvidia_rootfs(

@@ -7,12 +7,11 @@ use super::{
 };
 use crate::adapters::inspection::accounts::local_accounts;
 use crate::adapters::provisioning::engine::execution::{
-    check_deployment_cancellation, StoragePreparation, SystemConfiguration,
+    check_deployment_cancellation, DeploymentMethod, SystemConfiguration,
 };
 use crate::adapters::provisioning::engine::failure::{OperationFailure, OperationResult};
 use crate::adapters::provisioning::engine::host::HostResultExt;
 use crate::adapters::provisioning::engine::resources::AppliedResource;
-use crate::adapters::provisioning::engine::sources::Deployer;
 use crate::adapters::storage::rootfs::{RawRootfsMount, RootfsTarget};
 use crate::application::provisioning::{
     DeploymentResource, DeploymentSecrets, DeploymentStage, ResourceApplyStatus,
@@ -22,14 +21,12 @@ use crate::domain::machine::accounts::LocalAccountObservation;
 use crate::domain::machine::PrivateUsersMode;
 
 pub(super) async fn apply(
-    source: Box<dyn Deployer>,
-    configuration: Option<SystemConfiguration>,
     mut secrets: DeploymentSecrets,
     transaction: &mut Transaction<'_>,
 ) -> OperationResult<()> {
     let Transaction {
         host,
-        storage,
+        method,
         job,
         logs,
         report,
@@ -45,25 +42,17 @@ pub(super) async fn apply(
     logs.message(format!("=== Deploying '{name}' ==="));
     check_deployment_cancellation(&cancellation)?;
     for warning in inspect_deployment_sidecars(&name, host).await? {
-        log::warn!(
-            "[AUDIT] [Container: {}] [Step: Preflight] {}",
-            name,
-            warning
-        );
-        logs.message(format!("WARNING: {warning}"));
+        logs.warning(format!("WARNING: {warning}"));
     }
     check_deployment_cancellation(&cancellation)?;
 
-    if let Some(storage) = storage.backend() {
+    // 1. Allocate and mount only storage populated by a rootfs source.
+    if let Some(storage) = method.storage() {
         logs.enter_stage(DeploymentStage::StoragePreparation);
-        log::info!(
-            "[AUDIT] [Container: {}] [Step: Storage] Creating {} storage...",
-            name,
-            storage.get_type().label()
-        );
+
         logs.message(format!(
-            "Creating storage (type: {:?})...",
-            storage.get_type()
+            "Creating {} storage...",
+            storage.get_type().label()
         ));
         let local_storage = DeploymentResource::LocalStorage(target.clone());
         persist_applying(
@@ -82,11 +71,7 @@ pub(super) async fn apply(
         check_deployment_cancellation(&cancellation)?;
     }
 
-    let rootfs = if let Some(storage) = storage.backend() {
-        log::info!(
-            "[AUDIT] [Container: {}] [Step: Storage] Mounting storage tree...",
-            name
-        );
+    let rootfs = if let Some(storage) = method.storage() {
         logs.message("Mounting storage...".to_string());
         let storage_mount = DeploymentResource::StorageMount(target.clone());
         persist_applying(
@@ -103,19 +88,19 @@ pub(super) async fn apply(
             .host_context("mount deployment storage")?;
         report.record_typed(storage_mount, ResourceDisposition::Created);
         persist_committed(job, DeploymentStage::StoragePreparation, report).await?;
-        rootfs
+        Some(
+            RootfsTarget::from_provisioned_path(&name, &rootfs)
+                .host_context("resolve mounted deployment rootfs")?,
+        )
     } else {
-        // For externally managed storage (clone/pull), the machine is already in /var/lib/machines.
-        crate::paths::machine_root(&name)
+        None
     };
 
+    // 2. Persist source intent, then invoke it with its actual target type.
     logs.enter_stage(DeploymentStage::SourceDeployment);
-    log::info!(
-        "[AUDIT] [Container: {}] [Step: Deploy] Initiating base rootfs transfer...",
-        name
-    );
-    *external_provider_started = matches!(storage, StoragePreparation::ProviderImage);
-    let source_resources = source.source_stage_resources(&target);
+    logs.message("Preparing the source filesystem...");
+
+    let source_resources = method.source_stage_resources(&target);
     persist_applying(
         job,
         DeploymentStage::SourceDeployment,
@@ -123,31 +108,64 @@ pub(super) async fn apply(
         report,
     )
     .await?;
-    source
-        .deploy(&name, &rootfs, logs, &cancellation, report)
-        .await?;
+    *external_provider_started = method.storage().is_none();
+    let configuration = match &*method {
+        DeploymentMethod::Rootfs {
+            source,
+            configuration,
+            ..
+        } => {
+            // This directory was mounted above by this method's storage backend.
+            let rootfs = rootfs.expect("rootfs deployment has mounted storage");
+            source.deploy(&rootfs, logs, &cancellation).await?;
+            Some((configuration.as_ref(), rootfs))
+        }
+        DeploymentMethod::RawImage {
+            source,
+            configuration,
+        } => {
+            source.deploy(&target, logs, &cancellation, report).await?;
+            Some((
+                configuration.as_ref(),
+                RootfsTarget::Machine {
+                    machine: target.clone(),
+                },
+            ))
+        }
+        DeploymentMethod::Clone(source) => {
+            source.deploy(&target, logs, &cancellation, report).await?;
+            None
+        }
+        DeploymentMethod::Oci(source) => {
+            source.deploy(&target, logs, &cancellation, report).await?;
+            None
+        }
+    };
     persist_committed(job, DeploymentStage::SourceDeployment, report).await?;
     check_deployment_cancellation(&cancellation)?;
 
-    let Some(SystemConfiguration {
-        machine: cfg,
-        users,
-        wayland: wayland_intents,
-        integration,
-    }) = configuration
+    // Native clone/OCI operations own their configuration; only system images
+    // proceed through offline guest initialization and generated host settings.
+    let Some((
+        SystemConfiguration {
+            machine: cfg,
+            users,
+            wayland: wayland_intents,
+            integration,
+        },
+        mut actual_rootfs_target,
+    )) = configuration
     else {
-        check_deployment_cancellation(&cancellation)?;
         return Ok(());
     };
     let guest_hostname =
         crate::domain::machine::GuestHostname::resolve(&cfg.guest_hostname, &target)
             .map_err(|error| OperationFailure::InvalidInput(error.to_string()))?;
-    let nvidia_profile = integration.nvidia_profile;
-    let nvidia_cdi_source = integration.nvidia_cdi_source;
+    let nvidia_profile = &integration.nvidia_profile;
+    let nvidia_cdi_source = &integration.nvidia_cdi_source;
 
+    // 3. Keep temporary raw access owned until the transaction finishes cleanup.
     logs.enter_stage(DeploymentStage::RootfsMutation);
-    let mut actual_rootfs_target = RootfsTarget::from_provisioned_path(&name, &rootfs)
-        .host_context("resolve deployment rootfs")?;
     let rootfs_exists = host.guest.has_os_release(&actual_rootfs_target).await?;
     if !rootfs_exists && actual_rootfs_target.supports_raw_fallback() {
         logs.message("Mounting raw image for configuration...".to_string());
@@ -191,6 +209,7 @@ pub(super) async fn apply(
         ));
     }
 
+    // 4. Apply requested guest changes, then observe the resulting local accounts.
     if has_os_layout {
         logs.message(format!(
             "Setting guest hostname to {}...",
@@ -243,7 +262,7 @@ pub(super) async fn apply(
             check_deployment_cancellation(&cancellation)?;
         }
     } else if !has_os_layout {
-        logs.message(
+        logs.warning(
             "WARNING: Could not verify the rootfs OS layout; the guest hostname was not changed."
                 .to_string(),
         );
@@ -261,13 +280,13 @@ pub(super) async fn apply(
                 accounts.len()
             ));
             if !rejected_lines.is_empty() {
-                logs.message(format!(
+                logs.warning(format!(
                     "WARNING: {} malformed passwd record(s) were skipped.",
                     rejected_lines.len()
                 ));
             }
         }
-        _ => logs.message(
+        _ => logs.warning(
             "WARNING: Local accounts could not be read; see the deployment result for details.",
         ),
     }
@@ -298,7 +317,7 @@ pub(super) async fn apply(
             .resolve_user_identity(&actual_rootfs_target, &user.username)
             .await?;
         let grant = crate::domain::provisioning::wayland::resolve_wayland_grant(
-            intent,
+            intent.clone(),
             identity,
             cfg.private_users,
         )
@@ -335,7 +354,7 @@ pub(super) async fn apply(
                 )
                 .await?;
                 for warning in host.guest.configure_network(&actual_rootfs_target).await? {
-                    logs.message(warning);
+                    logs.warning(warning);
                 }
                 report.record_typed(rootfs_network, ResourceDisposition::Committed);
                 persist_committed(job, DeploymentStage::RootfsMutation, report).await?;
@@ -344,6 +363,7 @@ pub(super) async fn apply(
         }
     }
 
+    // 5. Prepare integration state before writing startup configuration.
     let mut initial_nvidia_state = None;
 
     if cfg.nvidia_gpu {
@@ -353,7 +373,7 @@ pub(super) async fn apply(
         // Remapping is applied inside get_nvidia_state after CDI + ldconfig collection.
         let state = crate::adapters::platform::nvidia::get_nvidia_state_from(
             nvidia_profile.as_ref(),
-            &nvidia_cdi_source,
+            nvidia_cdi_source,
         )
         .await
         .host_context("discover initial NVIDIA CDI configuration")?;
@@ -372,19 +392,19 @@ pub(super) async fn apply(
             for warning in crate::adapters::platform::nvidia::lifecycle::inject_env_once(
                 &actual_rootfs_target,
                 &state,
+                host.rootfs_processes.as_ref(),
             )
             .await
             .host_context("initialize guest NVIDIA environment")?
             {
-                log::warn!("{}", warning);
-                logs.message(warning);
+                logs.warning(warning);
             }
             report.record_typed(rootfs_nvidia, ResourceDisposition::Committed);
             persist_committed(job, DeploymentStage::RootfsMutation, report).await?;
         } else if has_os_layout {
-            logs.message("WARNING: Skipping NVIDIA env/ldconfig injection because this rootfs cannot run systemd-nspawn offline commands.".to_string());
+            logs.warning("WARNING: Skipping NVIDIA env/ldconfig injection because this rootfs cannot run systemd-nspawn offline commands.".to_string());
         } else {
-            logs.message("WARNING: Skipping NVIDIA env/ldconfig injection because the rootfs OS layout could not be verified.".to_string());
+            logs.warning("WARNING: Skipping NVIDIA env/ldconfig injection because the rootfs OS layout could not be verified.".to_string());
         }
         // Persist the validated snapshot and its profile for lifecycle diffing.
         logs.enter_stage(DeploymentStage::HostConfiguration);
@@ -405,13 +425,13 @@ pub(super) async fn apply(
         match state_apply {
             ResourceApplyStatus::ReplacedOwned => {
                 let warning = "Replaced existing Lasper-owned NVIDIA state for this deployment.";
-                log::warn!("[AUDIT] [Container: {}] [Step: NVIDIA] {}", name, warning);
-                logs.message(format!("WARNING: {warning}"));
+
+                logs.warning(format!("WARNING: {warning}"));
             }
             ResourceApplyStatus::ConflictUnknownOwner => {
                 let warning = "Preserved existing NVIDIA state because Lasper could not prove ownership; automatic NVIDIA lifecycle updates may use stale state.";
-                log::warn!("[AUDIT] [Container: {}] [Step: NVIDIA] {}", name, warning);
-                logs.message(format!("WARNING: {warning}"));
+
+                logs.warning(format!("WARNING: {warning}"));
             }
             ResourceApplyStatus::Created | ResourceApplyStatus::Unchanged => {}
         }
@@ -421,18 +441,14 @@ pub(super) async fn apply(
     }
 
     if cfg.private_users == Some(PrivateUsersMode::No) {
-        log::warn!(
-            "[AUDIT] [Container: {}] [Security] PrivateUsers=no, user namespacing disabled.",
-            name
-        );
-        logs.message("WARNING: PrivateUsers=no, user namespacing disabled.".to_string());
+        logs.warning("WARNING: PrivateUsers=no, user namespacing disabled.".to_string());
     }
 
     if cfg.privileged {
-        log::warn!("[AUDIT] [Container: {}] [Security: Dangerous] Privileged mode enabled. Capability=all granted.", name);
-        logs.message("DANGER: Privileged mode enabled (Capability=all).".to_string());
+        logs.warning("DANGER: Privileged mode enabled (Capability=all).".to_string());
     }
 
+    // 6. Commit host startup files; cleanup and final status remain in finish().
     logs.enter_stage(DeploymentStage::RuntimeCommit);
     logs.message("Writing .nspawn config...".to_string());
     persist_applying(
@@ -444,7 +460,7 @@ pub(super) async fn apply(
     .await?;
     let nspawn_apply = host
         .nspawn
-        .write_generated(&cfg, &resolved_wayland, initial_nvidia_state.as_ref())
+        .write_generated(cfg, &resolved_wayland, initial_nvidia_state.as_ref())
         .await
         .host_context("write deployment nspawn configuration")?;
     report.record_apply(AppliedResource::NspawnConfig, nspawn_apply)?;
@@ -452,10 +468,6 @@ pub(super) async fn apply(
     check_deployment_cancellation(&cancellation)?;
 
     if !cfg.device_binds.is_empty() || cfg.gpu_passthrough_all {
-        log::info!(
-            "[AUDIT] [Container: {}] [Step: Config] Writing systemd service override...",
-            name
-        );
         logs.message("Writing systemd service override...".to_string());
         persist_applying(
             job,
@@ -474,13 +486,13 @@ pub(super) async fn apply(
         match override_apply {
             ResourceApplyStatus::ReplacedOwned => {
                 let warning = "Replaced an existing Lasper-owned systemd service drop-in for this deployment.";
-                log::warn!("[AUDIT] [Container: {}] [Step: Config] {}", name, warning);
-                logs.message(format!("WARNING: {warning}"));
+
+                logs.warning(format!("WARNING: {warning}"));
             }
             ResourceApplyStatus::ConflictUnknownOwner => {
                 let warning = "Preserved the existing systemd service drop-in because Lasper could not prove ownership; requested device allowances were not written there.";
-                log::warn!("[AUDIT] [Container: {}] [Step: Config] {}", name, warning);
-                logs.message(format!("WARNING: {warning}"));
+
+                logs.warning(format!("WARNING: {warning}"));
             }
             ResourceApplyStatus::Created | ResourceApplyStatus::Unchanged => {}
         }

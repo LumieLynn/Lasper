@@ -5,12 +5,10 @@ use crate::adapters::provisioning::engine::execution::check_deployment_cancellat
 use crate::adapters::provisioning::engine::failure::{OperationFailure, OperationResult};
 use crate::adapters::provisioning::engine::host::HostResultExt;
 use crate::adapters::provisioning::engine::resources::{AppliedResource, ApplyReport};
-use crate::adapters::provisioning::engine::sources::Deployer;
 use crate::application::provisioning::{
     DeploymentCancellation, DeploymentResource, ResourceApplyStatus,
 };
 use crate::domain::machine::MachineName;
-use async_trait::async_trait;
 
 pub(crate) const CLONE_IDENTITY_NOTICE: &str = "Exact clone: guest hostname, machine-id, SSH host keys, user accounts, and application state are preserved. Reset guest identity manually before treating the clone as an independent machine.";
 
@@ -60,9 +58,8 @@ impl CloneApplyResult {
     }
 }
 
-#[async_trait]
-impl Deployer for CloneDeployer {
-    fn source_stage_resources(&self, target: &MachineName) -> Vec<DeploymentResource> {
+impl CloneDeployer {
+    pub(crate) fn source_stage_resources(&self, target: &MachineName) -> Vec<DeploymentResource> {
         vec![
             DeploymentResource::ExternalImage(target.clone()),
             DeploymentResource::NspawnConfig(target.clone()),
@@ -70,14 +67,14 @@ impl Deployer for CloneDeployer {
         ]
     }
 
-    async fn deploy(
+    pub(crate) async fn deploy(
         &self,
-        name: &str,
-        _rootfs: &std::path::Path,
+        target: &MachineName,
         logs: &DeploymentDiagnostics,
         cancellation: &DeploymentCancellation,
         report: &mut ApplyReport,
     ) -> OperationResult<()> {
+        let name = target.as_str();
         check_deployment_cancellation(cancellation)?;
         let source_config = self
             .nspawn
@@ -102,7 +99,7 @@ impl Deployer for CloneDeployer {
         check_deployment_cancellation(cancellation)?;
 
         logs.message(format!("Cloning image {} to {}...", self.source_name, name));
-        logs.message(format!("WARNING: {CLONE_IDENTITY_NOTICE}"));
+        logs.warning(format!("WARNING: {CLONE_IDENTITY_NOTICE}"));
 
         self.system_operations
             .clone_image(&self.source_name, name)

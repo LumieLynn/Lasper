@@ -35,30 +35,20 @@ impl ImageSource {
     }
 }
 
-#[derive(Clone, Debug, Default)]
-pub(crate) struct ImageAcquisitionStore;
-
-impl ImageAcquisitionStore {
-    pub(crate) fn new() -> Self {
-        Self
-    }
-
-    pub(crate) async fn acquire(
-        &self,
-        source: &ImageSource,
-        logs: &DeploymentDiagnostics,
-        cancellation: &DeploymentCancellation,
-    ) -> OperationResult<std::fs::File> {
-        let source = match source {
-            ImageSource::Local(path) => std::fs::File::open(path)
-                .map_err(|error| OperationFailure::Io(std::path::PathBuf::from(path), error))?,
-            ImageSource::Remote(url) => download_image(url, logs, cancellation).await?,
-            ImageSource::Opened(source) => source.try_clone().map_err(|error| {
-                OperationFailure::Io(std::path::PathBuf::from("artifact source fd"), error)
-            })?,
-        };
-        normalize_compression(source, logs, cancellation).await
-    }
+pub(super) async fn acquire_image(
+    source: &ImageSource,
+    logs: &DeploymentDiagnostics,
+    cancellation: &DeploymentCancellation,
+) -> OperationResult<std::fs::File> {
+    let source = match source {
+        ImageSource::Local(path) => std::fs::File::open(path)
+            .map_err(|error| OperationFailure::Io(std::path::PathBuf::from(path), error))?,
+        ImageSource::Remote(url) => download_image(url, logs, cancellation).await?,
+        ImageSource::Opened(source) => source.try_clone().map_err(|error| {
+            OperationFailure::Io(std::path::PathBuf::from("artifact source fd"), error)
+        })?,
+    };
+    normalize_compression(source, logs, cancellation).await
 }
 
 async fn download_image(
@@ -422,11 +412,11 @@ fn forward_curl_frame(
         return;
     }
     if truncated {
-        logs.message(format!("{trimmed} [command output truncated]"));
+        logs.command_output(format!("{trimmed} [command output truncated]"));
     } else if let Some(permille) = parse_curl_progress(trimmed) {
         logs.progress("Downloading image", permille);
     } else if !carriage_return || !looks_like_curl_progress(trimmed) {
-        logs.message(trimmed);
+        logs.command_output(trimmed);
     }
 }
 
@@ -631,14 +621,13 @@ mod tests {
             MachineName::new("test").unwrap(),
             logs,
         );
-        let mut decoded = ImageAcquisitionStore::new()
-            .acquire(
-                &ImageSource::Opened(std::sync::Arc::new(compressed)),
-                &logs,
-                &DeploymentCancellation::default(),
-            )
-            .await
-            .unwrap();
+        let mut decoded = acquire_image(
+            &ImageSource::Opened(std::sync::Arc::new(compressed)),
+            &logs,
+            &DeploymentCancellation::default(),
+        )
+        .await
+        .unwrap();
         let mut payload = Vec::new();
         decoded.read_to_end(&mut payload).unwrap();
         assert_eq!(payload, b"typed image payload");
@@ -656,13 +645,12 @@ mod tests {
             MachineName::new("test").unwrap(),
             logs,
         );
-        assert!(ImageAcquisitionStore::new()
-            .acquire(
-                &ImageSource::Opened(std::sync::Arc::new(compressed)),
-                &logs,
-                &DeploymentCancellation::default(),
-            )
-            .await
-            .is_err());
+        assert!(acquire_image(
+            &ImageSource::Opened(std::sync::Arc::new(compressed)),
+            &logs,
+            &DeploymentCancellation::default(),
+        )
+        .await
+        .is_err());
     }
 }

@@ -2,7 +2,7 @@
 
 mod transfer;
 
-pub(crate) use transfer::{ensure_pull_oci_available, OciPullStore};
+pub(crate) use transfer::ensure_pull_oci_available;
 
 use crate::adapters::provisioning::engine::command::wait_for_deployment_command;
 use crate::adapters::provisioning::engine::diagnostics::DeploymentDiagnostics;
@@ -10,38 +10,34 @@ use crate::adapters::provisioning::engine::execution::check_deployment_cancellat
 use crate::adapters::provisioning::engine::failure::{OperationFailure, OperationResult};
 use crate::adapters::provisioning::engine::host::HostResultExt;
 use crate::adapters::provisioning::engine::resources::{AppliedResource, ApplyReport};
-use crate::adapters::provisioning::engine::sources::Deployer;
 use crate::application::provisioning::{DeploymentCancellation, DeploymentResource};
 use crate::domain::machine::MachineName;
 use crate::domain::provisioning::oci::{OciNetworkMode, OciReference};
-use async_trait::async_trait;
 use transfer::OciPullRequest;
 
 pub struct OciDeployer {
     pub reference: String,
     pub read_only: bool,
     pub network: OciNetworkMode,
-    pub oci_pull: OciPullStore,
     pub nspawn: crate::adapters::config::NspawnConfigStore,
 }
 
-#[async_trait]
-impl Deployer for OciDeployer {
-    fn source_stage_resources(&self, target: &MachineName) -> Vec<DeploymentResource> {
+impl OciDeployer {
+    pub(crate) fn source_stage_resources(&self, target: &MachineName) -> Vec<DeploymentResource> {
         vec![
             DeploymentResource::ExternalImage(target.clone()),
             DeploymentResource::NspawnConfig(target.clone()),
         ]
     }
 
-    async fn deploy(
+    pub(crate) async fn deploy(
         &self,
-        name: &str,
-        _rootfs: &std::path::Path,
+        target: &MachineName,
         logs: &DeploymentDiagnostics,
         cancellation: &DeploymentCancellation,
         report: &mut ApplyReport,
     ) -> OperationResult<()> {
+        let name = target.as_str();
         ensure_pull_oci_available()?;
         check_deployment_cancellation(cancellation)?;
         self.nspawn
@@ -52,18 +48,14 @@ impl Deployer for OciDeployer {
         let request = OciPullRequest {
             reference: OciReference::new(self.reference.trim())
                 .map_err(|error| OperationFailure::InvalidInput(error.to_string()))?,
-            machine: MachineName::new(name)
-                .map_err(|error| OperationFailure::InvalidInput(error.to_string()))?,
+            machine: target.clone(),
             read_only: self.read_only,
         };
 
         logs.message("Pulling OCI application with systemd-importd (HTTPS authentication only)...");
-        log::warn!(
-            "[AUDIT] [Container: {}] [Step: OCI] Registry transport is authenticated by HTTPS; publisher signatures are not verified",
-            name
-        );
+        logs.warning("WARNING: Registry transport is authenticated by HTTPS; publisher signatures are not verified.");
 
-        let spawned = self.oci_pull.spawn(request).await?;
+        let spawned = transfer::spawn_pull(request)?;
         let status = wait_for_deployment_command(
             spawned,
             logs,
@@ -85,11 +77,8 @@ impl Deployer for OciDeployer {
             "Preserving OCI runtime configuration with PrivateUsers=no and network={}",
             self.network.as_str()
         ));
-        log::warn!(
-            "[AUDIT] [Container: {}] [Security] PrivateUsers=no, user namespacing disabled for system-scoped OCI application.",
-            name
-        );
-        logs.message(
+
+        logs.warning(
             "WARNING: PrivateUsers=no disables user namespace isolation for this OCI application.",
         );
         let apply = self
@@ -121,7 +110,6 @@ mod tests {
             reference: "docker.io/library/nginx:latest".into(),
             read_only: false,
             network: OciNetworkMode::Host,
-            oci_pull: OciPullStore::new(),
             nspawn: crate::adapters::config::NspawnConfigStore::direct(),
         };
 
