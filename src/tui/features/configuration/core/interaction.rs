@@ -11,7 +11,7 @@ use crate::tui::features::configuration::page::PageRequest;
 use crate::tui::features::configuration::page::{PageInput, PageInteractionContext};
 use crate::tui::features::configuration::pages::ConfigurationPageAction;
 use crate::tui::foundation::scrolling::ScrollAction;
-use crate::tui::foundation::widgets::display::title_tabs::clicked_title_tab;
+use crate::tui::foundation::widgets::control::{Control, ControlOutcome};
 
 impl ConfigurationView {
     fn dispatch_page_input(&mut self, input: PageInput) -> ConfigurationAction {
@@ -64,8 +64,7 @@ impl ConfigurationView {
             .checked_add(1)
             .expect("configuration draft generation exhausted");
         self.apply_error = None;
-        self.preview_scroll.reset();
-        self.preview_cache = None;
+        self.preview.reset();
         if self.draft_is_empty() {
             self.draft_preview = DraftPreviewState::Clean;
             return ConfigurationAction::None;
@@ -78,7 +77,7 @@ impl ConfigurationView {
             };
             return ConfigurationAction::None;
         };
-        self.preview_tab = PreviewTab::Diff;
+        self.preview.select_tab(PreviewTab::Diff);
         self.draft_preview = DraftPreviewState::Loading(self.draft_generation);
         ConfigurationAction::Preview {
             generation: self.draft_generation,
@@ -93,7 +92,7 @@ impl ConfigurationView {
     fn request_close_or_refresh(&mut self, intent: DiscardIntent) -> ConfigurationAction {
         if self.saving {
             self.apply_error = Some("A configuration save is still in progress".into());
-            self.preview_cache = None;
+            self.preview.invalidate();
             return ConfigurationAction::None;
         }
         if !self.draft_is_empty() {
@@ -153,18 +152,12 @@ impl ConfigurationView {
 
     pub(super) fn select_tab(&mut self, tab: PreviewTab) {
         self.pane = ConfigurationPane::Preview;
-        if self.preview_tab != tab {
-            self.preview_tab = tab;
-            self.preview_scroll.reset();
-            self.preview_cache = None;
-        }
+        self.preview.select_tab(tab);
     }
 
     fn navigate(&mut self, action: ScrollAction) {
         if self.pane == ConfigurationPane::Navigation {
             self.navigation.navigate(action);
-        } else if self.pane == ConfigurationPane::Preview {
-            self.preview_scroll.apply(action);
         } else if self.pane == ConfigurationPane::Content {
             let _ = self.dispatch_page_input(PageInput::Navigate(action));
         }
@@ -179,6 +172,11 @@ impl ConfigurationView {
         }
         if self.discard.is_some() {
             return self.handle_discard_key(key);
+        }
+        if self.pane == ConfigurationPane::Preview
+            && self.with_preview(|mut control| control.handle_key(key)) != ControlOutcome::Ignored
+        {
+            return ConfigurationAction::None;
         }
         if let Some(action) = ScrollAction::from_key(key) {
             self.navigate(action);
@@ -204,7 +202,7 @@ impl ConfigurationView {
                     if let Some(edit) = self.current_edit() {
                         self.saving = true;
                         self.apply_error = None;
-                        self.preview_cache = None;
+                        self.preview.invalidate();
                         return ConfigurationAction::Apply {
                             generation: self.draft_generation,
                             edit,
@@ -220,7 +218,7 @@ impl ConfigurationView {
             (KeyCode::Char('[') | KeyCode::Char(']'), KeyModifiers::NONE)
                 if self.pane == ConfigurationPane::Preview =>
             {
-                self.select_tab(self.preview_tab.adjacent(key.code == KeyCode::Char(']')));
+                self.select_tab(self.preview.tab().adjacent(key.code == KeyCode::Char(']')));
             }
             (_, KeyModifiers::NONE) if self.pane == ConfigurationPane::Navigation => {
                 if self.navigation.handle_key(key.code) {
@@ -249,17 +247,16 @@ impl ConfigurationView {
         if self.discard.is_some() || self.restart_confirmation.is_some() {
             return ConfigurationAction::None;
         }
-        if self
-            .preview_scrollbar
-            .handle_mouse(mouse, &mut self.preview_scroll)
-            == crate::tui::protocol::EventResult::Consumed
+        let preview_area = self.hits.preview;
+        if self.with_preview(|mut control| control.handle_mouse(mouse, preview_area))
+            != ControlOutcome::Ignored
         {
             self.pane = ConfigurationPane::Preview;
             return ConfigurationAction::None;
         }
         let position = (mouse.column, mouse.row).into();
         if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
-            if let Some(tab) = clicked_title_tab(&self.hits.preview_tabs, mouse) {
+            if let Some(tab) = self.preview.clicked_tab(mouse) {
                 self.select_tab(tab);
             } else if self.hits.navigation.contains(position) {
                 self.pane = ConfigurationPane::Navigation;
@@ -273,6 +270,7 @@ impl ConfigurationView {
         } else if let Some(action) = ScrollAction::from_mouse(mouse.kind) {
             if self.hits.preview.contains(position) {
                 self.pane = ConfigurationPane::Preview;
+                return ConfigurationAction::None;
             } else if self.hits.content.contains(position) {
                 self.pane = ConfigurationPane::Content;
             } else if self.hits.navigation.contains(position) {

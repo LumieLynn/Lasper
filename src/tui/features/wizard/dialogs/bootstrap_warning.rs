@@ -5,6 +5,7 @@ use crate::tui::foundation::components::form::{Form, FormItem, FormOutcome, Form
 use crate::tui::foundation::components::text_block::{TextBlockControl, TextBlockState};
 use crate::tui::foundation::footer::{FooterHint, FooterRegistry};
 use crate::tui::foundation::theme;
+use crate::tui::foundation::widgets::display::text::PlainText;
 use crate::tui::foundation::widgets::inputs::button::ButtonControl;
 use crate::tui::protocol::{AppMessage, Component, EventResult, WizardMessage};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, MouseEvent};
@@ -24,7 +25,7 @@ enum WarningControl {
 const MESSAGE_MIN_HEIGHT: u16 = 3;
 
 pub(crate) struct BootstrapWarningDialog {
-    content: String,
+    content: PlainText,
     text: TextBlockState,
     form: FormState<WarningControl>,
 }
@@ -55,14 +56,14 @@ impl BootstrapWarningDialog {
         let mut form = FormState::new(WarningControl::Message);
         form.set_focus(true);
         Some(Self {
-            content,
+            content: PlainText::new(content),
             text: TextBlockState::default(),
             form,
         })
     }
 
     fn with_form<R>(&mut self, visit: impl FnOnce(&mut Form<'_, WarningControl>) -> R) -> R {
-        let mut message = TextBlockControl::new(&mut self.text, " Warnings ", &self.content);
+        let mut message = TextBlockControl::new(&mut self.text, " Warnings ", &mut self.content);
         let mut continue_button = ButtonControl::new("Continue");
         visit(&mut Form::new(
             &mut self.form,
@@ -83,7 +84,7 @@ impl BootstrapWarningDialog {
     fn preferred_height(&mut self, width: u16) -> u16 {
         let bounds = Rect::new(0, 0, width, u16::MAX);
         let inner = Self::block().inner(bounds);
-        let message_height = TextBlockControl::new(&mut self.text, " Warnings ", &self.content)
+        let message_height = TextBlockControl::new(&mut self.text, " Warnings ", &mut self.content)
             .preferred_height(inner.width);
         self.with_form(|form| form.minimum_height())
             .saturating_add(message_height.saturating_sub(MESSAGE_MIN_HEIGHT))

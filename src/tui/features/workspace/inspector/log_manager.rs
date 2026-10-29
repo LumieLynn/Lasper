@@ -2,9 +2,10 @@ use crate::application::sessions::JournalSessionHandle;
 use crate::domain::session::SessionLifecycle;
 use std::collections::{HashMap, HashSet, VecDeque};
 
-pub struct LogBuffer {
+pub(crate) struct LogBuffer {
+    pub id: usize,
     pub lines: VecDeque<String>,
-    pub dirty: bool,
+    pub first: usize,
     pub stream: Option<JournalSessionHandle>,
     pub stream_failed: bool,
 }
@@ -12,6 +13,7 @@ pub struct LogBuffer {
 pub struct LogManager {
     buffers: HashMap<String, LogBuffer>,
     max_lines: usize,
+    next_buffer_id: usize,
 }
 
 impl LogManager {
@@ -19,6 +21,7 @@ impl LogManager {
         Self {
             buffers: HashMap::new(),
             max_lines: if max_lines == 0 { 5000 } else { max_lines },
+            next_buffer_id: 0,
         }
     }
 
@@ -26,16 +29,18 @@ impl LogManager {
         self.buffers.get_mut(name)
     }
 
-    pub fn get_or_create(&mut self, name: &str) -> &mut LogBuffer {
-        let capacity = self.max_lines;
-        self.buffers
-            .entry(name.to_string())
-            .or_insert_with(|| LogBuffer {
-                lines: VecDeque::with_capacity(capacity),
-                dirty: true,
+    pub(crate) fn get_or_create(&mut self, name: &str) -> &mut LogBuffer {
+        self.buffers.entry(name.to_string()).or_insert_with(|| {
+            let id = self.next_buffer_id;
+            self.next_buffer_id += 1;
+            LogBuffer {
+                id,
+                lines: VecDeque::new(),
+                first: 0,
                 stream: None,
                 stream_failed: false,
-            })
+            }
+        })
     }
 
     pub fn stream_is_active(&self, name: &str) -> bool {
@@ -83,10 +88,8 @@ impl LogManager {
             let Some(stream) = &mut buffer.stream else {
                 continue;
             };
-            let mut changed = false;
             while let Ok(line) = stream.try_recv() {
                 buffer.lines.push_back(line);
-                changed = true;
             }
 
             let failure = match stream.lifecycle() {
@@ -104,21 +107,16 @@ impl LogManager {
                 buffer.stream_failed = true;
                 if buffer.lines.back().map(String::as_str) != Some(message.as_str()) {
                     buffer.lines.push_back(message);
-                    changed = true;
                 }
             }
-            if changed {
-                trim_lines(&mut buffer.lines, self.max_lines);
-                buffer.dirty = true;
-            }
+            trim_lines(buffer, self.max_lines);
         }
     }
 
     pub fn push_line(&mut self, name: &str, text: impl Into<String>) {
         if let Some(buffer) = self.buffers.get_mut(name) {
             buffer.lines.push_back(text.into());
-            trim_lines(&mut buffer.lines, self.max_lines);
-            buffer.dirty = true;
+            trim_lines(buffer, self.max_lines);
         }
     }
 
@@ -144,9 +142,10 @@ impl LogManager {
     }
 }
 
-fn trim_lines(lines: &mut VecDeque<String>, maximum: usize) {
-    while lines.len() > maximum {
-        lines.pop_front();
+fn trim_lines(buffer: &mut LogBuffer, maximum: usize) {
+    while buffer.lines.len() > maximum {
+        buffer.lines.pop_front();
+        buffer.first += 1;
     }
 }
 
@@ -189,8 +188,19 @@ mod tests {
         manager.drain_all();
         let buffer = manager.buffers.get("machine").expect("buffer");
         assert_eq!(buffer.lines.len(), 2);
+        assert_eq!(buffer.first, 1);
         assert_eq!(buffer.lines.front().map(String::as_str), Some("two"));
         assert_eq!(buffer.lines.back().map(String::as_str), Some("three"));
+    }
+
+    #[test]
+    fn journal_retention_does_not_truncate_source_lines() {
+        let mut manager = LogManager::new(2);
+        manager.get_or_create("machine");
+        let line = "unicode 中文 ".repeat(10_000);
+        manager.push_line("machine", line.clone());
+        let buffer = manager.buffers.get("machine").unwrap();
+        assert_eq!(buffer.lines.back(), Some(&line));
     }
 
     #[test]

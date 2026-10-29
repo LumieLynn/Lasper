@@ -1532,15 +1532,16 @@ mod focus_and_modal_input {
         ] {
             let buffer = app.workspace.inspector.logs.get_or_create(name);
             buffer.lines.push_back(line);
-            // Neither buffer has new output when the visible target changes.
-            buffer.dirty = false;
         }
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        render_detail(&mut app, &mut terminal);
+        assert_eq!(app.workspace.inspector.panel.logs_len, 0);
+
         app.workspace.inspector.panel.handle_key(
             KeyEvent::new(KeyCode::Char('3'), KeyModifiers::ALT),
             &app.workspace.inspector.state.target,
         );
-        let mut terminal =
-            ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         assert!(render_detail(&mut app, &mut terminal).contains("first log"));
         assert_eq!(app.workspace.inspector.panel.logs_len, 1);
 
@@ -1551,16 +1552,22 @@ mod focus_and_modal_input {
         assert!(render_detail(&mut app, &mut terminal).contains("second"));
         assert!(app.workspace.inspector.panel.logs_len > 1);
 
+        // A new stream for the same machine starts its own source sequence.
+        // The previous layout must not survive just because the name matches.
+        app.workspace.inspector.logs.cleanup_all();
+        app.workspace
+            .inspector
+            .logs
+            .get_or_create("second")
+            .lines
+            .push_back("restarted log".into());
+        assert!(render_detail(&mut app, &mut terminal).contains("restarted log"));
+        assert_eq!(app.workspace.inspector.panel.logs_len, 1);
+
         app.workspace.replace_machines(Vec::new());
         assert!(!render_detail(&mut app, &mut terminal).contains("second"));
         assert_eq!(app.workspace.inspector.panel.logs_len, 0);
-        assert!(app
-            .workspace
-            .inspector
-            .panel
-            .log_cache
-            .offset_index
-            .is_empty());
+        assert_eq!(app.workspace.inspector.panel.log_scroll.max_offset(), 0);
     }
 
     #[tokio::test]

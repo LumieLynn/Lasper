@@ -1,81 +1,120 @@
-//! Scrollable text borrows its content; the containing form owns focus and hits.
+//! A borrowed text provider composed with scrolling, a border and input hints.
 use crate::tui::foundation::footer::FooterHint;
-use crate::tui::foundation::scrolling::{ScrollAction, ScrollState};
-use crate::tui::foundation::text::soft_wrap_text;
+use crate::tui::foundation::scrolling::{ScrollAction, ScrollState, SCROLL_HINTS};
 use crate::tui::foundation::widgets::control::{Control, ControlContext, ControlOutcome};
 use crate::tui::foundation::widgets::display::scrollbar::VerticalScrollbar;
+use crate::tui::foundation::widgets::display::text::TextContent;
 use crossterm::event::{KeyEvent, MouseEvent};
 use ratatui::{
     layout::Rect,
     style::Style,
-    widgets::{Block, BorderType, Borders, Paragraph},
+    widgets::{Block, BorderType, Borders},
     Frame,
 };
 
-const TEXT_HINTS: &[FooterHint] = &[
-    FooterHint::new("↑/↓ / j/k", "scroll").secondary(),
-    FooterHint::new("PgUp/PgDn", "page").secondary(),
-    FooterHint::new("Home/End", "top/bottom").secondary(),
-];
 #[derive(Default)]
 pub(crate) struct TextBlockState {
-    scroll: ScrollState,
+    pub(crate) scroll: ScrollState,
     scrollbar: VerticalScrollbar,
+    area: Rect,
 }
 
-pub(crate) struct TextBlockControl<'a> {
-    state: &'a mut TextBlockState,
-    label: &'a str,
-    content: &'a str,
+impl TextBlockState {
+    pub(crate) fn clear_mouse_area(&mut self) {
+        self.area = Rect::default();
+        self.scrollbar.clear_mouse_area();
+    }
+
+    fn render(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        content: &mut impl TextContent,
+        follow_tail: bool,
+    ) {
+        self.clear_mouse_area();
+        if area.is_empty() {
+            return;
+        }
+        let following = follow_tail && self.scroll.offset() == self.scroll.max_offset();
+        let layout = content.layout(area.width, self.scroll.offset());
+        self.scroll.update(layout.height, usize::from(area.height));
+        self.scroll.reset();
+        self.scroll.apply(ScrollAction::Down(layout.top_row));
+        if following {
+            self.scroll.apply(ScrollAction::Last);
+        }
+        content.render(frame, area, self.scroll.offset());
+        self.scrollbar.render(
+            frame,
+            Rect::new(area.right(), area.y, 1, area.height),
+            &self.scroll,
+        );
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> ControlOutcome {
+        if self.scrollbar.handle_mouse(mouse, &mut self.scroll)
+            == crate::tui::protocol::EventResult::Consumed
+        {
+            return ControlOutcome::Consumed;
+        }
+        if self.area.contains((mouse.column, mouse.row).into()) {
+            if let Some(action) = ScrollAction::from_mouse(mouse.kind) {
+                self.scroll.apply(action);
+                return ControlOutcome::Consumed;
+            }
+        }
+        ControlOutcome::Ignored
+    }
 }
-impl<'a> TextBlockControl<'a> {
-    pub(crate) fn new(state: &'a mut TextBlockState, label: &'a str, content: &'a str) -> Self {
+
+pub(crate) struct TextBlockControl<'a, C> {
+    state: &'a mut TextBlockState,
+    block: Block<'a>,
+    content: C,
+    follow_tail: bool,
+}
+
+impl<'a, C: TextContent> TextBlockControl<'a, C> {
+    pub(crate) fn new(state: &'a mut TextBlockState, label: &'a str, content: C) -> Self {
         Self {
             state,
-            label,
+            block: Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title(label),
             content,
+            follow_tail: false,
         }
     }
 
-    fn block(&self) -> Block<'a> {
-        Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .title(self.label)
+    pub(crate) fn with_block(mut self, block: Block<'a>) -> Self {
+        self.block = block;
+        self
     }
 
-    /// Include the control's borders and use the same wrapping as drawing.
-    pub(crate) fn preferred_height(&self, width: u16) -> u16 {
+    pub(crate) fn preferred_height(&mut self, width: u16) -> u16 {
         let bounds = Rect::new(0, 0, width, u16::MAX);
-        let inner = self.block().inner(bounds);
-        let rows = soft_wrap_text(self.content, usize::from(inner.width.max(1))).len();
+        let inner = self.block.inner(bounds);
+        let rows = self.content.layout(inner.width, 0).height;
         (rows.min(usize::from(u16::MAX)) as u16).saturating_add(bounds.height - inner.height)
     }
 }
-impl Control for TextBlockControl<'_> {
+
+impl<C: TextContent> Control for TextBlockControl<'_, C> {
     fn render(&mut self, frame: &mut Frame, area: Rect, context: ControlContext) {
-        let block = self.block().border_style(Style::default().fg(
+        let block = self.block.clone().border_style(Style::default().fg(
             crate::tui::foundation::theme::widget_border_color(context.focused, context.enabled),
         ));
         let inner = block.inner(area);
-        let lines = soft_wrap_text(self.content, usize::from(inner.width.max(1)));
-        self.state
-            .scroll
-            .update(lines.len(), usize::from(inner.height));
-        let visible: Vec<_> = lines
-            .into_iter()
-            .skip(self.state.scroll.offset())
-            .take(usize::from(inner.height))
-            .map(ratatui::text::Line::from)
-            .collect();
         frame.render_widget(block, area);
-        frame.render_widget(Paragraph::new(visible), inner);
-        self.state.scrollbar.render(
-            frame,
-            Rect::new(inner.right(), inner.y, 1, inner.height),
-            &self.state.scroll,
-        );
+        self.state
+            .render(frame, inner, &mut self.content, self.follow_tail);
+        if !inner.is_empty() {
+            self.state.area = area;
+        }
     }
+
     fn handle_key(&mut self, key: KeyEvent) -> ControlOutcome {
         if let Some(action) = ScrollAction::from_key(key) {
             self.state.scroll.apply(action);
@@ -84,31 +123,20 @@ impl Control for TextBlockControl<'_> {
             ControlOutcome::Ignored
         }
     }
-    fn handle_mouse(&mut self, mouse: MouseEvent, area: Rect) -> ControlOutcome {
-        if self
-            .state
-            .scrollbar
-            .handle_mouse(mouse, &mut self.state.scroll)
-            == crate::tui::protocol::EventResult::Consumed
-        {
-            return ControlOutcome::Consumed;
-        }
-        if area.contains((mouse.column, mouse.row).into()) {
-            if let Some(action) = ScrollAction::from_mouse(mouse.kind) {
-                self.state.scroll.apply(action);
-                return ControlOutcome::Consumed;
-            }
-        }
-        ControlOutcome::Ignored
+
+    fn handle_mouse(&mut self, mouse: MouseEvent, _area: Rect) -> ControlOutcome {
+        self.state.handle_mouse(mouse)
     }
+
     fn hints(&self) -> &'static [FooterHint] {
-        TEXT_HINTS
+        SCROLL_HINTS
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::foundation::widgets::display::text::PlainText;
     use ratatui::{backend::TestBackend, Terminal};
 
     #[test]
@@ -117,7 +145,8 @@ mod tests {
         let content = "中文与 emoji 🪐\nwords that wrap at narrow widths    \nEND";
         for width in [8, 20, 40] {
             let mut state = TextBlockState::default();
-            let mut control = TextBlockControl::new(&mut state, "Text", content);
+            let mut content = PlainText::new(content);
+            let mut control = TextBlockControl::new(&mut state, "Text", &mut content);
             let height = control.preferred_height(width);
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal

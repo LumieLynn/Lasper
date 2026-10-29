@@ -143,10 +143,16 @@ impl ScrollState {
     }
 }
 
+pub(crate) const SCROLL_HINTS: &[FooterHint] = &[
+    FooterHint::new("↑/↓ / j/k", "scroll"),
+    FooterHint::new("PgUp/PgDn", "page").secondary(),
+    FooterHint::new("Home/End", "top/bottom").secondary(),
+];
+
 pub(crate) fn register_scroll_hints(footer: &mut FooterRegistry) {
-    footer.register(FooterHint::new("↑/↓ / j/k", "scroll"));
-    footer.register(FooterHint::new("PgUp/PgDn", "page").secondary());
-    footer.register(FooterHint::new("Home/End", "top/bottom").secondary());
+    for hint in SCROLL_HINTS {
+        footer.register(*hint);
+    }
 }
 
 #[cfg(test)]

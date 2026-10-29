@@ -1,5 +1,6 @@
 //! One replaceable layout for the currently visible document pane.
 
+use crate::tui::foundation::widgets::display::text::TextLayoutCache;
 use ratatui::text::Line;
 
 use crate::tui::features::workspace::inspector::{DetailPane, DetailTarget};
@@ -7,13 +8,12 @@ use crate::tui::features::workspace::inspector::{DetailPane, DetailTarget};
 #[derive(Default)]
 pub(crate) struct DocumentCache {
     key: Option<DocumentKey>,
-    lines: Vec<Line<'static>>,
+    layout: TextLayoutCache,
 }
 
 struct DocumentKey {
     target: DetailTarget,
     pane: DetailPane,
-    width: usize,
 }
 
 impl DocumentCache {
@@ -25,31 +25,30 @@ impl DocumentCache {
         dirty: bool,
         build: impl FnOnce() -> Vec<Line<'static>>,
     ) {
-        if !dirty
-            && self
-                .key
-                .as_ref()
-                .is_some_and(|key| key.target == *target && key.pane == pane && key.width == width)
-        {
-            return;
+        let same_document = self
+            .key
+            .as_ref()
+            .is_some_and(|key| key.target == *target && key.pane == pane);
+        if dirty || !same_document {
+            self.layout.invalidate();
         }
-        // Release the previous document before allocating its replacement.
-        self.clear();
-        self.lines = build();
-        self.key = Some(DocumentKey {
-            target: target.clone(),
-            pane,
-            width,
-        });
+        self.layout
+            .update(u16::try_from(width).unwrap_or(u16::MAX), build);
+        if !same_document {
+            self.key = Some(DocumentKey {
+                target: target.clone(),
+                pane,
+            });
+        }
     }
 
     pub(crate) fn clear(&mut self) {
         self.key = None;
-        self.lines = Vec::new();
+        self.layout.invalidate();
     }
 
     pub(crate) fn lines(&self) -> &[Line<'static>] {
-        &self.lines
+        self.layout.rows()
     }
 }
 

@@ -6,45 +6,18 @@ mod footer;
 mod interaction;
 mod lifecycle;
 mod navigation;
+mod preview;
 mod render;
 
 use ratatui::layout::Rect;
-use ratatui::text::Line;
 
 use super::pages::{ConfigurationPageAction, ConfigurationPages};
 use crate::application::configuration::{
     ConfigurationDraft, ConfigurationEdit, ConfigurationPreview, ConfigurationTarget,
 };
 use crate::tui::features::configuration::page::{ConfigurationPane, InspectionState};
-use crate::tui::foundation::widgets::display::title_tabs::TitleTabHitbox;
 use navigation::ConfigurationNavigation;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PreviewTab {
-    Diff,
-    Checks,
-    Raw,
-}
-
-impl PreviewTab {
-    const ALL: [Self; 3] = [Self::Diff, Self::Raw, Self::Checks];
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Diff => " Diff ",
-            Self::Raw => " Raw ",
-            Self::Checks => " Checks ",
-        }
-    }
-
-    fn adjacent(self, forward: bool) -> Self {
-        let index = Self::ALL
-            .iter()
-            .position(|tab| *tab == self)
-            .expect("preview tab is listed");
-        Self::ALL[(index + if forward { 1 } else { Self::ALL.len() - 1 }) % Self::ALL.len()]
-    }
-}
+use preview::{PreviewPane, PreviewTab};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ConfigurationAction {
@@ -88,7 +61,6 @@ struct HitAreas {
     navigation: Rect,
     content: Rect,
     preview: Rect,
-    preview_tabs: Vec<TitleTabHitbox<PreviewTab>>,
 }
 
 pub(crate) struct ConfigurationView {
@@ -100,7 +72,6 @@ pub(crate) struct ConfigurationView {
     state: InspectionState,
     pane: ConfigurationPane,
     navigation: ConfigurationNavigation,
-    preview_tab: PreviewTab,
     draft_generation: u64,
     draft_preview: DraftPreviewState,
     discard: Option<DiscardIntent>,
@@ -110,10 +81,7 @@ pub(crate) struct ConfigurationView {
     apply_error: Option<String>,
     pages: ConfigurationPages,
     draft: ConfigurationDraft,
-    preview_scroll: crate::tui::foundation::scrolling::ScrollState,
-    preview_scrollbar: crate::tui::foundation::widgets::display::scrollbar::VerticalScrollbar,
-    preview_width: u16,
-    preview_cache: Option<Vec<Line<'static>>>,
+    preview: PreviewPane,
     hits: HitAreas,
 }
 
@@ -121,7 +89,7 @@ impl ConfigurationView {
     pub(crate) fn new(target: ConfigurationTarget) -> Self {
         let pages = ConfigurationPages::default();
         let navigation = ConfigurationNavigation::new(pages.descriptors());
-        Self {
+        let mut view = Self {
             target,
             query: 0,
             pending: None,
@@ -130,7 +98,6 @@ impl ConfigurationView {
             state: InspectionState::Loading,
             pane: ConfigurationPane::Content,
             navigation,
-            preview_tab: PreviewTab::Checks,
             draft_generation: 0,
             draft_preview: DraftPreviewState::Clean,
             discard: None,
@@ -140,12 +107,11 @@ impl ConfigurationView {
             apply_error: None,
             pages,
             draft: ConfigurationDraft::default(),
-            preview_scroll: crate::tui::foundation::scrolling::ScrollState::default(),
-            preview_scrollbar: Default::default(),
-            preview_width: 0,
-            preview_cache: None,
+            preview: PreviewPane::default(),
             hits: HitAreas::default(),
-        }
+        };
+        view.with_preview(|_| ());
+        view
     }
 }
 

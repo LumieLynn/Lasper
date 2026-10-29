@@ -12,11 +12,11 @@ use crate::tui::features::workspace::inspector::core::model::{
 };
 use crate::tui::features::workspace::inspector::core::scrolling;
 use crate::tui::features::workspace::inspector::panes;
-use crate::tui::features::workspace::inspector::presentation::viewport;
 use crate::tui::features::workspace::inspector::DetailRenderContext;
 use crate::tui::foundation::footer::{FooterHint, FooterRegistry};
 use crate::tui::foundation::scrolling::{register_scroll_hints, ScrollAction, ScrollState};
 use crate::tui::foundation::widgets::display::scrollbar::VerticalScrollbar;
+use crate::tui::foundation::widgets::display::text::{TextContent, TextEntryIndex, TextRows};
 use crate::tui::foundation::widgets::display::title_tabs::{
     clicked_title_tab, TitleTabHitbox, TitleTabViewport,
 };
@@ -38,9 +38,8 @@ pub struct DetailPanel {
     pub(crate) image_overview_len: usize,
     pub(crate) logs_len: usize,
     pub(crate) config_len: usize,
-    pub(crate) last_rendered_width: u16,
-    pub(crate) log_cache: panes::logs::LogRenderCache,
-    pub(crate) log_target: Option<String>,
+    pub(crate) log_index: TextEntryIndex,
+    pub(crate) log_source: Option<usize>,
     pub(crate) document_cache: DocumentCache,
     scroll_area: Rect,
     scrollbar: VerticalScrollbar,
@@ -66,9 +65,8 @@ impl DetailPanel {
             image_overview_len: 0,
             logs_len: 0,
             config_len: 0,
-            last_rendered_width: 0,
-            log_cache: panes::logs::LogRenderCache::default(),
-            log_target: None,
+            log_index: TextEntryIndex::default(),
+            log_source: None,
             document_cache: DocumentCache::default(),
             scroll_area: Rect::default(),
             scrollbar: VerticalScrollbar::default(),
@@ -164,9 +162,7 @@ impl DetailPanel {
         self.pane_height = inner_area.height;
 
         // The scrollbar sits on the border. Count the same width the panes render.
-        let pane_width = usize::from(inner_area.width);
-
-        scrolling::sync_viewport(self, data, pane_width);
+        scrolling::sync_viewport(self, data, inner_area);
 
         f.render_widget(Clear, area);
         f.render_widget(block, area);
@@ -178,7 +174,7 @@ impl DetailPanel {
                 data,
                 inner_area,
                 self.log_scroll.offset(),
-                &self.log_cache,
+                &mut self.log_index,
             ),
             DetailPane::Metrics => panes::metrics::render(f, data, inner_area),
             _ => {
@@ -186,7 +182,7 @@ impl DetailPanel {
                     .active_scroll_mut()
                     .map(|scroll| scroll.offset())
                     .unwrap_or(0);
-                viewport::render(f, self.document_cache.lines(), inner_area, scroll);
+                TextRows(self.document_cache.lines()).render(f, inner_area, scroll);
             }
         }
 

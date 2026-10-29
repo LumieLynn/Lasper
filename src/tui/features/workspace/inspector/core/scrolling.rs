@@ -2,15 +2,15 @@ use crate::tui::features::workspace::inspector::{
     panes, DetailPane, DetailPanel, DetailRenderContext,
 };
 use crate::tui::foundation::scrolling::ScrollAction;
+use crate::tui::foundation::widgets::display::text::{TextContent, TextEntryIndex, WrappedEntries};
+use ratatui::layout::Rect;
 
 pub(crate) fn sync_viewport(
     panel: &mut DetailPanel,
     data: &mut DetailRenderContext<'_>,
-    width: usize,
+    area: Rect,
 ) {
-    let follow_logs = panel.log_scroll.offset() == panel.log_scroll.max_offset();
-    let width_changed = panel.last_rendered_width != width as u16;
-    panel.last_rendered_width = width as u16;
+    let width = usize::from(area.width);
 
     // Document panes measure and paint the same cached rows. Only the visible
     // pane is retained, and scrolling/height changes do not rebuild its layout.
@@ -56,30 +56,35 @@ pub(crate) fn sync_viewport(
         panel.document_cache.clear();
     }
 
-    // Wrapped log offsets belong to one target and viewport width.
-    if let Some(buf) = data.logs.as_mut() {
-        let target_changed = panel.log_target.as_deref() != data.target.name();
-        if *buf.dirty || width_changed || target_changed {
-            let lines: Vec<&str> = buf.lines.iter().map(|s| s.as_str()).collect();
-            panel.log_cache =
-                panes::logs::LogRenderCache::compute(&lines, panel.last_rendered_width);
-            panel.logs_len = panel.log_cache.wrapped_height;
-            *buf.dirty = false;
-            if target_changed {
-                panel.log_target = data.target.name().map(str::to_owned);
+    // Retain one log index for the displayed source. The active pane owns
+    // follow-tail policy; layout only remaps the old top row.
+    if let Some(logs) = data.logs.as_ref() {
+        if panel.log_source != Some(logs.id) {
+            panel.log_index = TextEntryIndex::default();
+            panel.log_source = Some(logs.id);
+        }
+        if pane == DetailPane::Logs {
+            let following = panel.log_scroll.offset() == panel.log_scroll.max_offset();
+            let layout = WrappedEntries::new(logs.lines, logs.first, &mut panel.log_index)
+                .layout(area.width, panel.log_scroll.offset());
+            panel.logs_len = layout.height;
+            panel
+                .log_scroll
+                .update(layout.height, usize::from(area.height));
+            panel.log_scroll.reset();
+            panel.log_scroll.apply(ScrollAction::Down(layout.top_row));
+            if following {
+                panel.log_scroll.apply(ScrollAction::Last);
             }
         }
     } else {
         panel.logs_len = 0;
-        panel.log_cache = panes::logs::LogRenderCache::default();
-        panel.log_target = None;
+        panel.log_index = TextEntryIndex::default();
+        panel.log_source = None;
+        panel.log_scroll.update(0, usize::from(area.height));
     }
 
     let height = usize::from(panel.pane_height);
-    panel.log_scroll.update(panel.logs_len, height);
-    if follow_logs && panel.active_pane() == DetailPane::Logs {
-        panel.log_scroll.apply(ScrollAction::Last);
-    }
     panel.config_scroll.update(panel.config_len, height);
     let active_details_len = if panel.active_pane() == DetailPane::ImageOverview {
         panel.image_overview_len

@@ -9,7 +9,6 @@ mod execution;
 pub(crate) mod layout;
 pub(crate) mod property_document;
 pub(crate) mod style;
-pub(crate) mod viewport;
 
 use ratatui::{
     style::Style,

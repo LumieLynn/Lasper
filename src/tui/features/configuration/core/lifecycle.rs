@@ -23,7 +23,7 @@ impl ConfigurationView {
         self.apply_error = None;
         self.apply_requires_refresh = false;
         self.state = InspectionState::Loading;
-        self.preview_cache = None;
+        self.preview.invalidate();
     }
 
     pub(crate) fn track_query(&mut self, task: tokio::task::JoinHandle<()>) {
@@ -81,8 +81,7 @@ impl ConfigurationView {
             Ok(_) => InspectionState::Failed("Inspection returned a different resource".into()),
             Err(error) => InspectionState::Failed(error.to_string()),
         };
-        self.preview_scroll.reset();
-        self.preview_cache = None;
+        self.preview.reset();
     }
 
     pub(crate) fn finish_preview(
@@ -105,7 +104,7 @@ impl ConfigurationView {
                 message: error.to_string(),
             },
         };
-        self.preview_cache = None;
+        self.preview.invalidate();
     }
 
     pub(crate) fn finish_apply(
@@ -142,13 +141,13 @@ impl ConfigurationView {
                 | ConfigurationApplyReport::Busy { reason },
             ) => {
                 self.apply_error = Some(reason);
-                self.preview_cache = None;
+                self.preview.invalidate();
                 None
             }
             Err(error) => {
                 self.apply_requires_refresh = error.is_outcome_unknown();
                 self.apply_error = Some(error.to_string());
-                self.preview_cache = None;
+                self.preview.invalidate();
                 None
             }
         }

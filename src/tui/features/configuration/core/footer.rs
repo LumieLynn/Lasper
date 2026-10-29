@@ -7,7 +7,6 @@ use super::{ConfigurationPane, ConfigurationView, DraftPreviewState, InspectionS
 use crate::application::configuration::ConfigurationPreview;
 use crate::tui::features::configuration::page::PageInteractionContext;
 use crate::tui::foundation::footer::{FooterHint, FooterRegistry};
-use crate::tui::foundation::scrolling::register_scroll_hints;
 
 impl ConfigurationView {
     pub(crate) fn register_footer_hints(&self, footer: &mut FooterRegistry) {
@@ -42,7 +41,7 @@ impl ConfigurationView {
             ConfigurationPane::Navigation => self.navigation.register_footer_hints(footer),
             ConfigurationPane::Content => self.pages.register_footer_hints(page, footer, context),
             ConfigurationPane::Preview => {
-                register_scroll_hints(footer);
+                self.preview.register_footer_hints(footer);
             }
         }
         let ready_to_save = !self.apply_requires_refresh

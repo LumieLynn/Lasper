@@ -93,8 +93,9 @@ impl DetailState {
         let logs = machine
             .and_then(|entry| log_manager.buffer_mut(&entry.name))
             .map(|buffer| DetailLogData {
+                id: buffer.id,
                 lines: &buffer.lines,
-                dirty: &mut buffer.dirty,
+                first: buffer.first,
             });
         DetailRenderContext {
             target: &self.target,

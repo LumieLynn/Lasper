@@ -5,6 +5,7 @@ use crate::tui::foundation::components::{
     text_block::{TextBlockControl, TextBlockState},
 };
 use crate::tui::foundation::footer::{FooterHint, FooterRegistry};
+use crate::tui::foundation::widgets::display::text::PlainText;
 use crate::tui::protocol::{AppMessage, Component, EventResult, WizardMessage};
 use crossterm::event::{KeyCode, KeyEvent, MouseEvent};
 use ratatui::{
@@ -12,14 +13,14 @@ use ratatui::{
     Frame,
 };
 pub struct ReviewStepView {
-    content: String,
+    content: PlainText,
     preview: TextBlockState,
     form: FormState<()>,
 }
 impl ReviewStepView {
     pub fn new(content: String) -> Self {
         let mut view = Self {
-            content,
+            content: PlainText::new(content),
             preview: TextBlockState::default(),
             form: FormState::new(()),
         };
@@ -29,7 +30,7 @@ impl ReviewStepView {
     }
     fn with_form<R>(&mut self, visit: impl FnOnce(&mut Form<'_, ()>) -> R) -> R {
         let mut preview =
-            TextBlockControl::new(&mut self.preview, " Deployment Preview ", &self.content);
+            TextBlockControl::new(&mut self.preview, " Deployment Preview ", &mut self.content);
         visit(&mut Form::new(
             &mut self.form,
             [FormItem::field((), &mut preview).fill(4)],

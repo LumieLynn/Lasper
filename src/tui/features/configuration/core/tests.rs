@@ -341,8 +341,8 @@ fn narrow_view_can_reach_raw_and_close_without_losing_binding_selection() {
     assert_eq!(view.pane, ConfigurationPane::Preview);
     render(&mut view, 60, 15);
     let raw_tab = view
-        .hits
-        .preview_tabs
+        .preview
+        .tab_hits()
         .iter()
         .find(|tab| tab.value == PreviewTab::Raw)
         .unwrap()
@@ -397,8 +397,8 @@ fn refresh_failure_remains_visible_and_raw_scroll_is_bounded() {
         view.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
     }
     assert_eq!(
-        view.preview_scroll.offset(),
-        view.preview_scroll.max_offset()
+        view.preview.scroll().offset(),
+        view.preview.scroll().max_offset()
     );
     view.begin_query(4);
     view.finish_query(
@@ -423,7 +423,7 @@ fn preview_scrollbar_and_page_keys_follow_the_visible_viewport() {
     }
     view.select_tab(PreviewTab::Raw);
     let buffer = render_buffer(&mut view, 40, 10);
-    assert!(view.preview_scroll.max_offset() > 0);
+    assert!(view.preview.scroll().max_offset() > 0);
     let scrollbar_x = view.hits.preview.right() - 1;
     assert_eq!(buffer[(scrollbar_x, view.hits.preview.y + 1)].symbol(), "↑");
     assert_eq!(
@@ -433,17 +433,17 @@ fn preview_scrollbar_and_page_keys_follow_the_visible_viewport() {
 
     let step = usize::from(view.hits.preview.height - 3);
     view.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
-    assert_eq!(view.preview_scroll.offset(), step);
+    assert_eq!(view.preview.scroll().offset(), step);
     view.handle_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
-    assert_eq!(view.preview_scroll.offset(), 0);
+    assert_eq!(view.preview.scroll().offset(), 0);
 
     view.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
     assert_eq!(
-        view.preview_scroll.offset(),
-        view.preview_scroll.max_offset()
+        view.preview.scroll().offset(),
+        view.preview.scroll().max_offset()
     );
     view.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE));
-    assert_eq!(view.preview_scroll.offset(), 0);
+    assert_eq!(view.preview.scroll().offset(), 0);
 
     view.pane = ConfigurationPane::Content;
     view.handle_mouse(MouseEvent {
@@ -453,18 +453,18 @@ fn preview_scrollbar_and_page_keys_follow_the_visible_viewport() {
         modifiers: KeyModifiers::NONE,
     });
     assert_eq!(view.pane, ConfigurationPane::Preview);
-    assert_eq!(view.preview_scroll.offset(), 1);
+    assert_eq!(view.preview.scroll().offset(), 1);
     view.handle_mouse(MouseEvent {
         kind: MouseEventKind::Down(MouseButton::Left),
         column: scrollbar_x,
         row: view.hits.preview.y + 1,
         modifiers: KeyModifiers::NONE,
     });
-    assert_eq!(view.preview_scroll.offset(), 0);
+    assert_eq!(view.preview.scroll().offset(), 0);
 
     view.pane = ConfigurationPane::Content;
     view.handle_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
-    assert_eq!(view.preview_scroll.offset(), 0);
+    assert_eq!(view.preview.scroll().offset(), 0);
 }
 
 #[test]
@@ -813,22 +813,22 @@ fn preview_tabs_use_the_border_and_only_visible_titles_are_clickable() {
         view.pane = ConfigurationPane::Preview;
         let screen = render(&mut view, width, 18);
         assert!(!screen.contains("Source / Checks"));
-        for tab in view.hits.preview_tabs.clone() {
+        for tab in view.preview.tab_hits().to_vec() {
             assert_eq!(tab.area.y, view.hits.preview.y);
             assert!(tab.area.right() < view.hits.preview.right());
             view.handle_mouse(click(tab.area));
-            assert_eq!(view.preview_tab, tab.value);
+            assert_eq!(view.preview.tab(), tab.value);
         }
         if let Some(raw) = view
-            .hits
-            .preview_tabs
+            .preview
+            .tab_hits()
             .iter()
             .find(|tab| tab.value == PreviewTab::Raw)
             .map(|tab| tab.area)
         {
-            let before = view.preview_tab;
+            let before = view.preview.tab();
             view.handle_mouse(click(Rect::new(raw.right(), raw.y, 1, 1)));
-            assert_eq!(view.preview_tab, before);
+            assert_eq!(view.preview.tab(), before);
         }
     }
 }

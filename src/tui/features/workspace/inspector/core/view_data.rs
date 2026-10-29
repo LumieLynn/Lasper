@@ -30,8 +30,10 @@ pub(crate) struct DetailRenderContext<'a> {
     pub(crate) details_dirty: &'a mut bool,
 }
 
-/// Presentation can acknowledge new lines without controlling their stream.
+/// The source's local identity distinguishes replacement buffers of the same
+/// machine. Rendering borrows text without controlling the journal session.
 pub(crate) struct DetailLogData<'a> {
+    pub(crate) id: usize,
     pub(crate) lines: &'a VecDeque<String>,
-    pub(crate) dirty: &'a mut bool,
+    pub(crate) first: usize,
 }
