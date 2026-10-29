@@ -22,16 +22,7 @@ pub(crate) async fn wait_for_deployment_command(
     let stream_error = stream_result.and_then(std::result::Result::err);
 
     if cancelled || cancellation.is_requested() {
-        logs.message(format!("Stopping {label}..."));
-        let completion_wins = spawned.completion_wins_cancellation();
-        let status = spawned
-            .terminate_and_wait()
-            .await
-            .map_err(|error| OperationFailure::process_exit_unconfirmed(label, error))?;
-        if completion_wins && status.success() {
-            return Ok(status);
-        }
-        return Err(OperationFailure::Cancelled);
+        return stop_command(spawned, logs, label).await;
     }
 
     if let Some(error) = stream_error {
@@ -45,10 +36,33 @@ pub(crate) async fn wait_for_deployment_command(
         return Err(OperationFailure::Io(std::path::PathBuf::from(label), error));
     }
 
-    spawned
-        .wait()
+    // EOF is not process completion: providers may close output before their
+    // final work ends. Keep cancellation active without dropping their waiter.
+    tokio::select! {
+        biased;
+        result = spawned.wait_for_exit() => {
+            result.map_err(|error| OperationFailure::process_exit_unconfirmed(label, error))
+        }
+        _ = cancellation.cancelled() => stop_command(spawned, logs, label).await,
+    }
+}
+
+async fn stop_command(
+    spawned: SpawnedProcess,
+    logs: &DeploymentDiagnostics,
+    label: &str,
+) -> OperationResult<std::process::ExitStatus> {
+    logs.message(format!("Stopping {label}..."));
+    let completion_wins = spawned.completion_wins_cancellation();
+    let status = spawned
+        .terminate_and_wait()
         .await
-        .map_err(|error| OperationFailure::process_exit_unconfirmed(label, error))
+        .map_err(|error| OperationFailure::process_exit_unconfirmed(label, error))?;
+    if completion_wins && status.success() {
+        Ok(status)
+    } else {
+        Err(OperationFailure::Cancelled)
+    }
 }
 
 /// Drain the complete stream while bounding each retained line, including non-UTF-8 output.

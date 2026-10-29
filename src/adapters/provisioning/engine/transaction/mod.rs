@@ -54,3 +54,6 @@ pub(crate) async fn run_deployment(
     let result = apply::apply(source, configuration, secrets, &mut transaction).await;
     cleanup::finish(result, transaction).await
 }
+
+#[cfg(test)]
+mod tests;

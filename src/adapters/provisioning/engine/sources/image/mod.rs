@@ -7,6 +7,7 @@ mod raw;
 pub(crate) use acquisition::{ImageAcquisitionStore, ImageSource};
 pub(crate) use archive::{inspect_tar_runtime, TarRuntimeAssessment};
 
+use crate::adapters::process::CommandRunner;
 use crate::adapters::provisioning::engine::diagnostics::DeploymentDiagnostics;
 use crate::adapters::provisioning::engine::execution::check_deployment_cancellation;
 use crate::adapters::provisioning::engine::failure::{OperationFailure, OperationResult};
@@ -18,7 +19,8 @@ use crate::application::provisioning::{DeploymentCancellation, DeploymentResourc
 use crate::domain::machine::MachineName;
 use archive::{import_tar_image, ImageImportReport, ImportTarRequest, TarSourceOrigin};
 use async_trait::async_trait;
-use raw::import_raw_system_image;
+use raw::validate_raw_system_image;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ImageFormat {
@@ -62,8 +64,10 @@ impl Deployer for ImageDeployer {
                 logs.message("Importing typed RAW machine image...");
                 let machine = MachineName::new(name)
                     .map_err(|error| OperationFailure::InvalidInput(error.to_string()))?;
-                self.image_import.import_raw(machine, source).await?;
+                let path = self.image_import.import_raw(machine, source).await?;
                 report.record_created(AppliedResource::ExternalImage);
+                check_deployment_cancellation(cancellation)?;
+                self.image_import.validate_raw(&path).await?;
                 check_deployment_cancellation(cancellation)?;
             }
             ImageFormat::Tar => {
@@ -90,21 +94,29 @@ impl Deployer for ImageDeployer {
     }
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct ImageImportStore;
+#[derive(Clone)]
+pub struct ImageImportStore {
+    commands: Arc<dyn CommandRunner>,
+}
 
 impl ImageImportStore {
-    pub fn new() -> Self {
-        Self
+    pub fn new(commands: Arc<dyn CommandRunner>) -> Self {
+        Self { commands }
     }
 
     pub(crate) async fn import_raw(
         &self,
         machine: MachineName,
         source: std::fs::File,
-    ) -> OperationResult<()> {
+    ) -> OperationResult<std::path::PathBuf> {
         validate_source(&source)?;
-        import_raw_system_image(machine, source).await
+        crate::adapters::storage::image_ops::import_raw_image(&machine, source)
+            .await
+            .host_context("publish imported raw image")
+    }
+
+    async fn validate_raw(&self, path: &std::path::Path) -> OperationResult<()> {
+        validate_raw_system_image(path, self.commands.as_ref()).await
     }
 
     pub(crate) async fn import_tar(

@@ -84,7 +84,7 @@ fn install_parent_death_signal(command: &mut std::process::Command) {
 /// exit status retrievable via [`SpawnedProcess::wait`].
 pub struct SpawnedProcess {
     pub stdout: Box<dyn tokio::io::AsyncRead + Send + Unpin>,
-    wait_fn: Option<Pin<Box<dyn Future<Output = std::io::Result<ExitStatus>> + Send>>>,
+    wait_fn: Pin<Box<dyn Future<Output = std::io::Result<ExitStatus>> + Send>>,
     signal_fn: Option<SignalFn>,
     completion_wins_cancellation: bool,
 }
@@ -104,7 +104,7 @@ impl SpawnedProcess {
     ) -> Self {
         Self {
             stdout,
-            wait_fn: Some(Box::pin(wait_fn)),
+            wait_fn: Box::pin(wait_fn),
             signal_fn: Some(std::sync::Arc::new(signal_fn)),
             completion_wins_cancellation: false,
         }
@@ -121,6 +121,12 @@ impl SpawnedProcess {
         self.completion_wins_cancellation
     }
 
+    /// Wait after output has been drained. Cancelling this wait leaves the
+    /// completion future owned by the handle so termination can still reap it.
+    pub(crate) async fn wait_for_exit(&mut self) -> std::io::Result<ExitStatus> {
+        self.wait_fn.as_mut().await
+    }
+
     pub async fn wait(mut self) -> std::io::Result<ExitStatus> {
         // Drain any unread stdout before waiting — avoids pipe deadlocks.
         use tokio::io::AsyncReadExt;
@@ -128,7 +134,7 @@ impl SpawnedProcess {
         while self.stdout.read(&mut buf).await? > 0 {}
         drop(self.stdout);
 
-        self.wait_fn.take().unwrap().await
+        self.wait_fn.await
     }
 
     pub async fn terminate_and_wait(self) -> std::io::Result<ExitStatus> {

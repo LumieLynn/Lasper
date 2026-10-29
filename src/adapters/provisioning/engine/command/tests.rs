@@ -84,6 +84,52 @@ async fn deployment_cancellation_notifies_waiters_and_fails_checkpoints() {
 }
 
 #[tokio::test]
+async fn cancellation_after_output_eof_still_terminates_and_reaps_the_process() {
+    // Cancellation is requested only after the completion future is polled.
+    // Its continuation must survive cancellation of the first wait.
+    let (waiting, started_waiting) = tokio::sync::oneshot::channel();
+    let stopped = std::sync::Arc::new(tokio::sync::Notify::new());
+    let exited = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let wait_stopped = stopped.clone();
+    let wait_exited = exited.clone();
+    let spawned = SpawnedProcess::new_cancellable(
+        Box::new(tokio::io::empty()),
+        async move {
+            waiting.send(()).unwrap();
+            wait_stopped.notified().await;
+            wait_exited.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(std::process::ExitStatus::from_raw(libc::SIGTERM))
+        },
+        move |signal| {
+            assert_eq!(signal, libc::SIGTERM);
+            stopped.notify_one();
+            Box::pin(async { Ok(()) })
+        },
+    );
+    let (events, _receiver) = tokio::sync::mpsc::channel(4);
+    let diagnostics = DeploymentDiagnostics::new(
+        DeploymentId::from_u128(1),
+        MachineName::new("test").unwrap(),
+        events,
+    );
+    let cancellation = DeploymentCancellation::default();
+    let (result, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::join!(
+            wait_for_deployment_command(spawned, &diagnostics, &cancellation, "test command"),
+            async {
+                started_waiting.await.unwrap();
+                cancellation.request();
+            },
+        )
+    })
+    .await
+    .expect("output EOF disabled process cancellation");
+
+    assert!(matches!(result, Err(OperationFailure::Cancelled)));
+    assert!(exited.load(std::sync::atomic::Ordering::SeqCst));
+}
+
+#[tokio::test]
 async fn failed_process_wait_is_not_treated_as_a_rollback_safe_failure() {
     let spawned = crate::adapters::process::SpawnedProcess::new_cancellable(
         Box::new(tokio::io::empty()),
