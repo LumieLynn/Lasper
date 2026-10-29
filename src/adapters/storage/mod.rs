@@ -4,6 +4,7 @@ pub mod backends;
 pub mod detect;
 mod fs_type;
 pub(crate) mod image_ops;
+pub(crate) mod rootfs;
 pub mod store;
 pub(crate) mod subvolume_ops;
 

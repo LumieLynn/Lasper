@@ -1,5 +1,12 @@
 //! Command builder helpers.
 
+mod rootfs;
+#[cfg(test)]
+pub(crate) use rootfs::MockRootfsProcessRunner;
+pub(crate) use rootfs::{
+    nspawn_io_path, DefaultRootfsProcessRunner, RootfsProcessRunner, ROOTFS_COMMAND_TIMEOUT,
+};
+
 use crate::domain::secret::SecretBytes;
 use std::future::Future;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};

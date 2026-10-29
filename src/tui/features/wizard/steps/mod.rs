@@ -37,6 +37,10 @@ fn register_step_form<Id: Copy + Eq>(footer: &mut FooterRegistry, form: &FormSta
 }
 
 pub trait StepComponent: Component {
+    /// Accept buffered background updates before drawing, even while covered.
+    /// Implementations must keep this nonblocking and bound the work per visit.
+    fn poll_updates(&mut self) {}
+
     fn commit_to_draft(&self, ctx: &mut WizardDraft);
     fn render_step(
         &mut self,

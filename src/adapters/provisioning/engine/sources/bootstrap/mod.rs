@@ -11,7 +11,7 @@ use crate::adapters::provisioning::engine::failure::{OperationFailure, Operation
 use crate::adapters::provisioning::engine::host::HostResultExt;
 use crate::adapters::provisioning::engine::resources::ApplyReport;
 use crate::adapters::provisioning::engine::sources::Deployer;
-use crate::adapters::rootfs::RootfsTarget;
+use crate::adapters::storage::rootfs::RootfsTarget;
 use crate::application::provisioning::DeploymentCancellation;
 use crate::domain::provisioning::bootstrap::{
     BootstrapSpec, DebootstrapReleaseSignaturePolicy, Dnf5PackageSignaturePolicy,

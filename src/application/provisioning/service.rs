@@ -340,8 +340,8 @@ pub(crate) async fn run_deployment_executor(
     let execution = async { executor.run(plan, secrets, context).await };
     let result = std::panic::AssertUnwindSafe(execution).catch_unwind().await;
     let terminal = match result {
-        Ok(Ok(())) => DeploymentTerminal {
-            status: DeploymentStatus::Succeeded,
+        Ok(Ok(result)) => DeploymentTerminal {
+            status: DeploymentStatus::Succeeded(result),
             claim_status: DeploymentClaimStatus::Released,
         },
         Ok(Err(error)) if error.is_cancelled() => DeploymentTerminal {
@@ -387,7 +387,7 @@ mod tests {
         MemoryDeploymentRecoveryProbe, MemoryDeploymentStatePort,
     };
     use crate::application::provisioning::{
-        DeploymentEvent, DeploymentJobContext, DeploymentSecrets,
+        DeploymentEvent, DeploymentJobContext, DeploymentResult, DeploymentSecrets,
     };
     use crate::domain::machine::MachineConfig;
     use crate::domain::provisioning::DeploymentStorage;
@@ -396,7 +396,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct RecordingExecutor {
-        outcome: Mutex<Option<Result<(), DeploymentError>>>,
+        outcome: Mutex<Option<Result<DeploymentResult, DeploymentError>>>,
     }
 
     struct RecordingPreflight {
@@ -457,13 +457,16 @@ mod tests {
             _plan: DeploymentPlan,
             _secrets: DeploymentSecrets,
             context: DeploymentJobContext,
-        ) -> Result<(), DeploymentError> {
+        ) -> Result<DeploymentResult, DeploymentError> {
             context
                 .event_sender()
                 .send(DeploymentEvent::Line("started".into()))
                 .await
                 .unwrap();
-            self.outcome.lock().take().unwrap_or(Ok(()))
+            self.outcome
+                .lock()
+                .take()
+                .unwrap_or_else(|| Ok(DeploymentResult::default()))
         }
     }
 
@@ -474,7 +477,7 @@ mod tests {
             _plan: DeploymentPlan,
             _secrets: DeploymentSecrets,
             context: DeploymentJobContext,
-        ) -> Result<(), DeploymentError> {
+        ) -> Result<DeploymentResult, DeploymentError> {
             context.cancellation().cancelled().await;
             Err(DeploymentError::cancelled("cancelled"))
         }
@@ -487,7 +490,7 @@ mod tests {
             _plan: DeploymentPlan,
             _secrets: DeploymentSecrets,
             _context: DeploymentJobContext,
-        ) -> Result<(), DeploymentError> {
+        ) -> Result<DeploymentResult, DeploymentError> {
             panic!("executor panic")
         }
     }
@@ -535,7 +538,7 @@ mod tests {
 
     fn executor(outcome: Result<(), DeploymentError>) -> Arc<RecordingExecutor> {
         Arc::new(RecordingExecutor {
-            outcome: Mutex::new(Some(outcome)),
+            outcome: Mutex::new(Some(outcome.map(|()| DeploymentResult::default()))),
         })
     }
 
@@ -648,11 +651,41 @@ mod tests {
 
         wait_until_finished(&handle).await;
 
-        assert_eq!(handle.status(), DeploymentStatus::Succeeded);
+        assert_eq!(
+            *handle.status(),
+            DeploymentStatus::Succeeded(DeploymentResult::default())
+        );
         assert_eq!(
             handle.try_recv().unwrap(),
             DeploymentEvent::Line("started".into())
         );
+    }
+
+    #[tokio::test]
+    async fn local_accounts_reach_the_terminal_status_separately_from_log_events() {
+        let result = DeploymentResult {
+            local_accounts: Some(
+                crate::domain::machine::accounts::LocalAccountObservation::Missing,
+            ),
+        };
+        let executor = Arc::new(RecordingExecutor {
+            outcome: Mutex::new(Some(Ok(result.clone()))),
+        });
+        let service = ProvisioningService::new(
+            Arc::new(RecordingPreflight {
+                calls: AtomicUsize::new(0),
+                safety: RemoteTarSafety::Compatible,
+            }),
+            executor,
+            Arc::new(MemoryDeploymentStatePort::default()),
+            recovery(),
+            claim_control(),
+            OperationRegistry::new(),
+        );
+        let handle = service.start(submission()).unwrap();
+        wait_until_finished(&handle).await;
+        // No log events have been drained, but the final observation is available.
+        assert_eq!(*handle.status(), DeploymentStatus::Succeeded(result));
     }
 
     #[tokio::test]
@@ -674,7 +707,7 @@ mod tests {
         wait_until_finished(&handle).await;
 
         assert_eq!(
-            handle.status(),
+            *handle.status(),
             DeploymentStatus::Cancelled("cancelled".into())
         );
     }
@@ -735,7 +768,7 @@ mod tests {
         let handle = service.start(submission()).unwrap();
         wait_until_finished(&handle).await;
         assert!(matches!(
-            handle.status(),
+            *handle.status(),
             DeploymentStatus::ReconciliationRequired(_)
         ));
         assert_eq!(
@@ -771,7 +804,7 @@ mod tests {
             DeploymentClaimStatus::ReleasedUnresolved
         );
         assert!(matches!(
-            handle.status(),
+            *handle.status(),
             DeploymentStatus::ReconciliationRequired(_)
         ));
         assert!(service.unresolved_claims.lock().is_empty());
@@ -890,7 +923,7 @@ mod tests {
         let handle = service.start(submission()).unwrap();
         wait_until_finished(&handle).await;
         assert_eq!(
-            handle.status(),
+            *handle.status(),
             DeploymentStatus::ReconciliationRequired("historical outcome is unknown".into())
         );
         assert_eq!(handle.claim_status(), DeploymentClaimStatus::Reconciled);

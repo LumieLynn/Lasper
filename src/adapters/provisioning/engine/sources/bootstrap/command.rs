@@ -7,16 +7,14 @@ use super::arguments::{
 use crate::adapters::process::{CommandRunner, SpawnedProcess};
 use crate::adapters::provisioning::engine::failure::{OperationFailure, OperationResult};
 use crate::adapters::provisioning::engine::host::HostResultExt;
-use crate::adapters::rootfs::RootfsTarget;
+use crate::adapters::storage::rootfs::RootfsTarget;
 use crate::domain::provisioning::bootstrap::{BootstrapSpec, DebootstrapReleaseSignaturePolicy};
-use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 const BOOTSTRAP_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug)]
 pub(crate) struct BootstrapRequest {
     pub(crate) target: RootfsTarget,
     pub(crate) spec: BootstrapSpec,
@@ -81,10 +79,7 @@ pub(crate) fn build_command(
     request: &BootstrapRequest,
     signature_style: DebootstrapSignatureOptionStyle,
 ) -> OperationResult<(String, Vec<String>)> {
-    let target = request
-        .target
-        .path()
-        .host_context("resolve bootstrap target path")?;
+    let target = request.target.path();
     let args = match &request.spec {
         BootstrapSpec::Debootstrap(spec) => debootstrap_args_with_signature_style(
             spec,
@@ -136,18 +131,10 @@ fn signature_style_from_output(
 }
 
 pub(crate) async fn validate_target(target: &RootfsTarget) -> OperationResult<()> {
-    let path = target
-        .path()
-        .host_context("resolve bootstrap target path")?;
-    let metadata = tokio::fs::symlink_metadata(&path)
+    target
+        .required_directory()
         .await
-        .map_err(|error| OperationFailure::Io(path.clone(), error))?;
-    if !metadata.file_type().is_dir() {
-        return Err(OperationFailure::InvalidInput(format!(
-            "Bootstrap target is not a directory: {}",
-            path.display()
-        )));
-    }
+        .host_context("open bootstrap target")?;
     Ok(())
 }
 

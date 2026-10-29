@@ -99,6 +99,12 @@ impl Wizard {
         self.id
     }
 
+    pub(crate) fn poll_updates(&mut self) {
+        if let Some(view) = &mut self.active_view {
+            view.poll_updates();
+        }
+    }
+
     /// Build the current step view on demand.
     fn sync_view(&mut self) {
         if self.active_view.is_none() && self.step != WizardStep::Deploy {

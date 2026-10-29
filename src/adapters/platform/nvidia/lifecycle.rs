@@ -137,16 +137,19 @@ async fn inject_persistent_device_allow(
         .await
 }
 
-/// Assemble the NVIDIA-specific rootfs data and submit one typed mutation.
+/// Assemble and apply NVIDIA's offline guest configuration.
 pub(crate) async fn inject_env_once(
-    target: &crate::adapters::rootfs::RootfsTarget,
+    target: &crate::adapters::storage::rootfs::RootfsTarget,
     state: &NvidiaState,
-    rootfs: &crate::adapters::rootfs::RootfsStore,
 ) -> Result<Vec<String>> {
     let (ld_cache_folders, environment, write_environment) = nvidia_rootfs_config(state);
-    rootfs
-        .configure_nvidia(target, ld_cache_folders, environment, write_environment)
-        .await
+    crate::adapters::platform::nvidia::rootfs::configure(
+        target,
+        &ld_cache_folders,
+        &environment,
+        write_environment,
+    )
+    .await
 }
 
 fn nvidia_rootfs_config(state: &NvidiaState) -> (Vec<String>, Vec<(String, String)>, bool) {
@@ -184,7 +187,6 @@ pub(crate) async fn ensure_gpu_passthrough(
     nspawn: &crate::adapters::config::NspawnConfigStore,
     systemd_unit: &crate::adapters::config::SystemdUnitStore,
     state_store: &crate::adapters::platform::nvidia::NvidiaStateStore,
-    rootfs: &crate::adapters::rootfs::RootfsStore,
     cdi_source: &crate::domain::nvidia::NvidiaCdiSource,
 ) -> Result<NvidiaPreparationOutcome> {
     // 1. Check if GPU passthrough is enabled in .nspawn config
@@ -296,7 +298,7 @@ pub(crate) async fn ensure_gpu_passthrough(
     )?;
 
     // 4. Cleanup stale files in rootfs
-    for warning in rootfs.cleanup_nvidia(name, &death_list).await? {
+    for warning in crate::adapters::platform::nvidia::rootfs::cleanup(name, &death_list).await? {
         log::warn!("{}", warning);
     }
 

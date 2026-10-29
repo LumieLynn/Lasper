@@ -4,6 +4,29 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::{Component, Path};
 
+/// An observed local account, without credentials or assumptions about login access.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LocalAccount {
+    pub username: String,
+    pub uid: u32,
+    pub gid: u32,
+    pub home: String,
+    pub shell: String,
+}
+
+/// A bounded snapshot of the guest's local passwd file, not its complete NSS database.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "observation", content = "data", rename_all = "snake_case")]
+pub enum LocalAccountObservation {
+    Read {
+        accounts: Vec<LocalAccount>,
+        rejected_lines: Vec<usize>,
+    },
+    Missing,
+    Invalid(String),
+    Unavailable(String),
+}
+
 /// User account requested during rootfs provisioning.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CreateUser {

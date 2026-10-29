@@ -3,7 +3,7 @@
 use crate::adapters::elevated::{pipe_reader_owned, ElevatedDaemon};
 use crate::application::provisioning::{
     DeploymentError, DeploymentExecutor, DeploymentJobContext, DeploymentPlan, DeploymentRequestId,
-    DeploymentSecrets, DeploymentStatus,
+    DeploymentResult, DeploymentSecrets, DeploymentStatus,
 };
 use crate::domain::provisioning::DeploymentSpec;
 use crate::ipc::protocol::deployment::{
@@ -129,7 +129,7 @@ impl ElevatedProvisioningExecutor {
         request_id: DeploymentRequestId,
         deployment_id: crate::application::provisioning::DeploymentId,
         context: &DeploymentJobContext,
-    ) -> Result<(), DeploymentError> {
+    ) -> Result<DeploymentResult, DeploymentError> {
         loop {
             let snapshot = self
                 .daemon
@@ -226,7 +226,7 @@ impl ElevatedProvisioningExecutor {
         &self,
         request_id: DeploymentRequestId,
         snapshot: DeploymentJobSnapshot,
-    ) -> Result<(), DeploymentError> {
+    ) -> Result<DeploymentResult, DeploymentError> {
         self.acknowledge_submission(request_id).await;
         if snapshot.claim == DeploymentClaimState::ReconciliationRequired {
             let historical_message = match &snapshot.status {
@@ -290,7 +290,7 @@ impl DeploymentExecutor for ElevatedProvisioningExecutor {
         plan: DeploymentPlan,
         secrets: DeploymentSecrets,
         context: DeploymentJobContext,
-    ) -> Result<(), DeploymentError> {
+    ) -> Result<DeploymentResult, DeploymentError> {
         let deployment_id = context.id();
         let request_id = DeploymentRequestId::new();
         let request = plan.into_spec();
@@ -378,7 +378,7 @@ pub(super) fn validate_snapshot(
                 | DeploymentClaimState::Reconciled
                 | DeploymentClaimState::ReleasedUnresolved
         ),
-        DeploymentStatus::Succeeded
+        DeploymentStatus::Succeeded(_)
         | DeploymentStatus::Failed(_)
         | DeploymentStatus::Cancelled(_) => snapshot.claim == DeploymentClaimState::Released,
     };
@@ -394,9 +394,9 @@ pub(super) fn validate_snapshot(
 fn status_into_result(
     status: DeploymentStatus,
     claim: DeploymentClaimState,
-) -> Result<(), DeploymentError> {
+) -> Result<DeploymentResult, DeploymentError> {
     match status {
-        DeploymentStatus::Succeeded => Ok(()),
+        DeploymentStatus::Succeeded(result) => Ok(result),
         DeploymentStatus::Failed(message) => Err(DeploymentError::failed(message)),
         DeploymentStatus::Cancelled(message) => Err(DeploymentError::cancelled(message)),
         DeploymentStatus::ReconciliationRequired(message)
@@ -424,8 +424,27 @@ mod tests {
 
     #[test]
     fn terminal_statuses_preserve_their_application_meaning() {
-        assert!(
-            status_into_result(DeploymentStatus::Succeeded, DeploymentClaimState::Released).is_ok()
+        let result = DeploymentResult {
+            local_accounts: Some(
+                crate::domain::machine::accounts::LocalAccountObservation::Read {
+                    accounts: vec![crate::domain::machine::accounts::LocalAccount {
+                        username: "existing-user".into(),
+                        uid: 501,
+                        gid: 20,
+                        home: "/home/existing-user".into(),
+                        shell: "/bin/sh".into(),
+                    }],
+                    rejected_lines: vec![3],
+                },
+            ),
+        };
+        assert_eq!(
+            status_into_result(
+                DeploymentStatus::Succeeded(result.clone()),
+                DeploymentClaimState::Released
+            )
+            .unwrap(),
+            result
         );
         assert!(status_into_result(
             DeploymentStatus::Failed("failed".into()),

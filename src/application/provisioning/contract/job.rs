@@ -6,6 +6,7 @@ use tokio::sync::{mpsc, watch};
 
 use super::identity::DeploymentId;
 use super::secrets::DeploymentSecrets;
+use super::DeploymentResult;
 use crate::application::provisioning::state::{DeploymentPlan, DeploymentStateSession};
 
 pub(crate) const DEPLOYMENT_EVENT_CAPACITY: usize = 256;
@@ -67,7 +68,7 @@ pub enum DeploymentEvent {
 pub enum DeploymentStatus {
     Running,
     RollingBack,
-    Succeeded,
+    Succeeded(DeploymentResult),
     Failed(String),
     Cancelled(String),
     ReconciliationRequired(String),
@@ -77,7 +78,7 @@ impl DeploymentStatus {
     pub fn is_finished(&self) -> bool {
         matches!(
             self,
-            Self::Succeeded
+            Self::Succeeded(_)
                 | Self::Failed(_)
                 | Self::Cancelled(_)
                 | Self::ReconciliationRequired(_)
@@ -268,8 +269,8 @@ impl DeploymentJobHandle {
         self.events.try_recv()
     }
 
-    pub fn status(&self) -> DeploymentStatus {
-        self.status.borrow().clone()
+    pub fn status(&self) -> watch::Ref<'_, DeploymentStatus> {
+        self.status.borrow()
     }
 
     pub fn claim_status(&self) -> DeploymentClaimStatus {
@@ -343,7 +344,7 @@ pub trait DeploymentExecutor: Send + Sync + 'static {
         plan: DeploymentPlan,
         secrets: DeploymentSecrets,
         context: DeploymentJobContext,
-    ) -> Result<(), DeploymentError>;
+    ) -> Result<DeploymentResult, DeploymentError>;
 }
 
 #[async_trait]

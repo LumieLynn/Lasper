@@ -4,7 +4,7 @@ use crate::adapters::config::{NspawnConfigStore, SystemdUnitStore};
 use crate::adapters::platform::nvidia::NvidiaStateStore;
 use crate::adapters::process::CommandRunner;
 use crate::adapters::provisioning::engine::failure::{OperationFailure, OperationResult};
-use crate::adapters::rootfs::RootfsStore;
+use crate::adapters::provisioning::engine::guest::GuestInitializer;
 use crate::adapters::system_operation::SystemOperationStore;
 use crate::adapters::trusted_state::TrustedStateRoot;
 
@@ -32,7 +32,8 @@ pub(crate) struct DirectProvisioningCapabilities {
     pub(super) system_operations: SystemOperationStore,
     pub(super) nspawn: NspawnConfigStore,
     pub(super) systemd_unit: SystemdUnitStore,
-    pub(super) rootfs: RootfsStore,
+    pub(super) guest: GuestInitializer,
+    pub(super) commands: std::sync::Arc<dyn CommandRunner>,
     pub(super) nvidia_state: NvidiaStateStore,
 }
 
@@ -42,10 +43,11 @@ impl DirectProvisioningCapabilities {
         state_root: TrustedStateRoot,
     ) -> Self {
         Self {
-            system_operations: SystemOperationStore::direct(command_runner),
+            system_operations: SystemOperationStore::direct(command_runner.clone()),
             nspawn: NspawnConfigStore::direct(),
             systemd_unit: SystemdUnitStore::direct(),
-            rootfs: RootfsStore::direct(),
+            guest: GuestInitializer::new(command_runner.clone()),
+            commands: command_runner,
             nvidia_state: NvidiaStateStore::direct(state_root),
         }
     }

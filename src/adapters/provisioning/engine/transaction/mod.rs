@@ -11,8 +11,8 @@ use crate::adapters::provisioning::engine::execution::{DeploymentExecution, Stor
 use crate::adapters::provisioning::engine::failure::DeploymentFailure;
 use crate::adapters::provisioning::engine::host::DirectProvisioningCapabilities;
 use crate::adapters::provisioning::engine::resources::ApplyReport;
-use crate::adapters::rootfs::RootfsTarget;
-use crate::application::provisioning::{DeploymentJobContext, DeploymentSecrets};
+use crate::adapters::storage::rootfs::RawRootfsMount;
+use crate::application::provisioning::{DeploymentJobContext, DeploymentResult, DeploymentSecrets};
 
 /// State held from the first attempted effect through cleanup and durable finalization.
 struct Transaction<'a> {
@@ -21,7 +21,8 @@ struct Transaction<'a> {
     job: DeploymentJobContext,
     logs: &'a mut DeploymentDiagnostics,
     report: ApplyReport,
-    raw_mount_target: Option<RootfsTarget>,
+    output: DeploymentResult,
+    raw_mount: Option<RawRootfsMount>,
     storage_mount_attempted: bool,
     external_provider_started: bool,
 }
@@ -32,7 +33,7 @@ pub(crate) async fn run_deployment(
     secrets: DeploymentSecrets,
     job: DeploymentJobContext,
     logs: &mut DeploymentDiagnostics,
-) -> Result<(), DeploymentFailure> {
+) -> Result<DeploymentResult, DeploymentFailure> {
     let DeploymentExecution {
         target,
         source,
@@ -45,7 +46,8 @@ pub(crate) async fn run_deployment(
         job,
         logs,
         report: ApplyReport::new(target),
-        raw_mount_target: None,
+        output: DeploymentResult::default(),
+        raw_mount: None,
         storage_mount_attempted: false,
         external_provider_started: false,
     };

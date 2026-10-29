@@ -13,7 +13,7 @@ use crate::adapters::provisioning::engine::failure::{OperationFailure, Operation
 use crate::adapters::provisioning::engine::host::HostResultExt;
 use crate::adapters::provisioning::engine::resources::{AppliedResource, ApplyReport};
 use crate::adapters::provisioning::engine::sources::Deployer;
-use crate::adapters::rootfs::RootfsTarget;
+use crate::adapters::storage::rootfs::RootfsTarget;
 use crate::application::provisioning::{DeploymentCancellation, DeploymentResource};
 use crate::domain::machine::MachineName;
 use archive::{import_tar_image, ImageImportReport, ImportTarRequest, TarSourceOrigin};

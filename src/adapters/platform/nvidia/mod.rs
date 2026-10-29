@@ -5,6 +5,7 @@ pub mod classify;
 pub mod discovery;
 pub mod lifecycle;
 pub mod resolve;
+mod rootfs;
 pub mod state;
 
 pub(crate) use discovery::get_nvidia_state_from;

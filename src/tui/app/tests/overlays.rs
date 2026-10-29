@@ -54,6 +54,55 @@ async fn press(app: &mut App, code: KeyCode) {
 }
 
 #[tokio::test]
+async fn deployment_updates_follow_the_wizard_lifetime_even_when_covered() {
+    use crate::application::provisioning::{
+        deployment_job_channel, DeploymentEvent, DeploymentId, DeploymentStatus,
+    };
+
+    let mut app = app_with_wizard();
+    let (handle, context) = deployment_job_channel(DeploymentId::from_u128(5));
+    app.ui
+        .overlays
+        .wizard
+        .as_mut()
+        .unwrap()
+        .start_deployment(handle);
+    app.ui.overlays.open_help();
+    context
+        .event_sender()
+        .try_send(DeploymentEvent::Line(
+            "deployment output while covered".into(),
+        ))
+        .unwrap();
+    context
+        .status_sender()
+        .send_replace(DeploymentStatus::Failed("background failure".into()));
+
+    let (detail_tx, _detail_rx) = tokio::sync::mpsc::channel(1);
+    app.prepare_frame(&detail_tx);
+    assert_eq!(app.ui.modal_layer(), Some(ModalLayer::Help));
+
+    // Revealing the wizard only paints the already accepted update.
+    app.ui.overlays.help = None;
+    let mut terminal = Terminal::new(TestBackend::new(100, 40)).unwrap();
+    let screen = render(&mut app, &mut terminal).join("\n");
+    assert!(screen.contains("FAILED: background failure"));
+    assert!(screen.contains("deployment output while covered"));
+
+    let events = context.event_sender();
+    assert_eq!(events.capacity(), events.max_capacity());
+    // Closing also discards output that has not reached the next frame yet.
+    events
+        .try_send(DeploymentEvent::Line("queued before closing".into()))
+        .unwrap();
+    app.close_wizard().await;
+    assert!(app.ui.overlays.wizard.is_none());
+    assert!(events.is_closed());
+    assert!(context.status_sender().is_closed());
+    assert!(context.claim_status_sender().is_closed());
+}
+
+#[tokio::test]
 async fn opening_wizard_explains_ignored_profiles_without_blocking_valid_sources() {
     use crate::application::provisioning::{
         DeploymentError, ImagePartitionProbe, InterfaceValidation, ProvisioningHostSnapshot,

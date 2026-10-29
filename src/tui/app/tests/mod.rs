@@ -694,8 +694,8 @@ mod tar_risk_confirmation {
     use super::*;
     use crate::application::provisioning::{
         DeploymentError, DeploymentExecutor, DeploymentJobContext, DeploymentPlan,
-        DeploymentPreflight, DeploymentSecrets, ProvisioningService, RemoteTarSafety,
-        SourcePreflight,
+        DeploymentPreflight, DeploymentResult, DeploymentSecrets, ProvisioningService,
+        RemoteTarSafety, SourcePreflight,
     };
     use crate::composition::PermissionLevel;
     use crate::tui::features::wizard::{Wizard, WizardStep};
@@ -717,9 +717,9 @@ mod tar_risk_confirmation {
             _plan: DeploymentPlan,
             secrets: DeploymentSecrets,
             _context: DeploymentJobContext,
-        ) -> Result<(), DeploymentError> {
+        ) -> Result<DeploymentResult, DeploymentError> {
             self.accepted.lock().take().unwrap().send(secrets).unwrap();
-            Ok(())
+            Ok(DeploymentResult::default())
         }
     }
 
@@ -739,7 +739,7 @@ mod tar_risk_confirmation {
             _plan: DeploymentPlan,
             _secrets: DeploymentSecrets,
             _context: DeploymentJobContext,
-        ) -> Result<(), DeploymentError> {
+        ) -> Result<DeploymentResult, DeploymentError> {
             std::future::pending().await
         }
     }

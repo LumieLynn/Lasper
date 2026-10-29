@@ -6,7 +6,6 @@ use crate::adapters::error::NspawnError;
 use crate::adapters::platform::nvidia::{
     ensure_gpu_passthrough, NvidiaPreparationOutcome, NvidiaStateStore,
 };
-use crate::adapters::rootfs::RootfsStore;
 use crate::adapters::system_operation::SystemOperationStore;
 use crate::adapters::trusted_state::TrustedStateRoot;
 use crate::application::machine_lifecycle::{
@@ -72,7 +71,6 @@ pub(crate) struct DirectStartPreparation {
     nspawn: NspawnConfigStore,
     systemd_unit: SystemdUnitStore,
     nvidia_state: NvidiaStateStore,
-    rootfs: RootfsStore,
     nvidia_cdi_source: NvidiaCdiSource,
     skip_permission_denied: bool,
 }
@@ -87,7 +85,6 @@ impl DirectStartPreparation {
             nspawn: NspawnConfigStore::direct(),
             systemd_unit: SystemdUnitStore::direct(),
             nvidia_state: NvidiaStateStore::direct(state_root),
-            rootfs: RootfsStore::direct(),
             nvidia_cdi_source,
             skip_permission_denied,
         }
@@ -111,7 +108,6 @@ impl DirectStartPreparation {
             &self.nspawn,
             &self.systemd_unit,
             &self.nvidia_state,
-            &self.rootfs,
             &self.nvidia_cdi_source,
         )
         .await;

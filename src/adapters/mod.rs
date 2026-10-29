@@ -9,7 +9,6 @@ pub(crate) mod platform;
 pub(crate) mod process;
 pub(crate) mod process_identity;
 pub(crate) mod provisioning;
-pub mod rootfs;
 pub(crate) mod runtime;
 pub(crate) mod session;
 pub mod storage;

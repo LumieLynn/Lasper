@@ -1,6 +1,7 @@
 mod identity;
 mod job;
 mod resource;
+mod result;
 mod secrets;
 
 pub use identity::DeploymentId;
@@ -14,6 +15,7 @@ pub use job::{
     RemoteTarSafety, SourcePreflight,
 };
 pub(crate) use resource::ResourceApplyStatus;
+pub use result::DeploymentResult;
 pub(crate) use secrets::DeploymentSecretsWire;
 pub use secrets::{DeploymentSecrets, DeploymentStartError, DeploymentSubmission, UserSecret};
 

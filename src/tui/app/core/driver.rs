@@ -58,7 +58,7 @@ pub(super) async fn run(
             }
         }
 
-        app.prepare_workspace_frame(&detail_refresh_tx);
+        app.prepare_frame(&detail_refresh_tx);
 
         // Render a frame
         let render_started = Instant::now();

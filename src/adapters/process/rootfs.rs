@@ -6,7 +6,7 @@ use std::process::Output;
 pub(crate) const ROOTFS_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const MAX_ROOTFS_COMMAND_OUTPUT_BYTES: usize = 1024 * 1024;
 
-/// Runs a fixed `systemd-nspawn` executable for typed rootfs operations.
+/// Execute an offline guest command through systemd-nspawn with bounded output and lifetime.
 #[cfg_attr(test, mockall::automock)]
 #[async_trait::async_trait]
 pub(crate) trait RootfsProcessRunner: Send + Sync {

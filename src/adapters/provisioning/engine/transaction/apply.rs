@@ -5,6 +5,7 @@ use super::{
     preflight::inspect_deployment_sidecars,
     Transaction,
 };
+use crate::adapters::inspection::accounts::local_accounts;
 use crate::adapters::provisioning::engine::execution::{
     check_deployment_cancellation, StoragePreparation, SystemConfiguration,
 };
@@ -12,10 +13,12 @@ use crate::adapters::provisioning::engine::failure::{OperationFailure, Operation
 use crate::adapters::provisioning::engine::host::HostResultExt;
 use crate::adapters::provisioning::engine::resources::AppliedResource;
 use crate::adapters::provisioning::engine::sources::Deployer;
+use crate::adapters::storage::rootfs::{RawRootfsMount, RootfsTarget};
 use crate::application::provisioning::{
     DeploymentResource, DeploymentSecrets, DeploymentStage, ResourceApplyStatus,
     ResourceDisposition,
 };
+use crate::domain::machine::accounts::LocalAccountObservation;
 use crate::domain::machine::PrivateUsersMode;
 
 pub(super) async fn apply(
@@ -30,7 +33,8 @@ pub(super) async fn apply(
         job,
         logs,
         report,
-        raw_mount_target,
+        output,
+        raw_mount,
         storage_mount_attempted,
         external_provider_started,
     } = transaction;
@@ -142,29 +146,24 @@ pub(super) async fn apply(
     let nvidia_cdi_source = integration.nvidia_cdi_source;
 
     logs.enter_stage(DeploymentStage::RootfsMutation);
-    let mut actual_rootfs_target =
-        crate::adapters::rootfs::RootfsTarget::from_provisioned_path(&name, &rootfs)
-            .host_context("resolve deployment rootfs")?;
-    let rootfs_exists = host
-        .rootfs
-        .has_os_release(&actual_rootfs_target)
-        .await
-        .host_context("inspect rootfs OS layout")?;
+    let mut actual_rootfs_target = RootfsTarget::from_provisioned_path(&name, &rootfs)
+        .host_context("resolve deployment rootfs")?;
+    let rootfs_exists = host.guest.has_os_release(&actual_rootfs_target).await?;
     if !rootfs_exists && actual_rootfs_target.supports_raw_fallback() {
         logs.message("Mounting raw image for configuration...".to_string());
-        let raw_mount = DeploymentResource::RawConfigurationMount(target.clone());
+        let mount_resource = DeploymentResource::RawConfigurationMount(target.clone());
         persist_applying(
             job,
             DeploymentStage::RootfsMutation,
-            vec![raw_mount.clone()],
+            vec![mount_resource.clone()],
             report,
         )
         .await?;
-        match host.rootfs.mount_managed_raw(&name).await {
-            Ok(Some(target)) => {
-                actual_rootfs_target = target.clone();
-                *raw_mount_target = Some(target);
-                report.record_typed(raw_mount, ResourceDisposition::Created);
+        match RawRootfsMount::mount(&target, host.commands.as_ref()).await {
+            Ok(Some(mount)) => {
+                actual_rootfs_target = mount.target();
+                *raw_mount = Some(mount);
+                report.record_typed(mount_resource, ResourceDisposition::Created);
             }
             Ok(None) => {}
             Err(error) => {
@@ -178,17 +177,12 @@ pub(super) async fn apply(
         check_deployment_cancellation(&cancellation)?;
     }
 
-    let has_os_layout = host
-        .rootfs
-        .has_os_release(&actual_rootfs_target)
-        .await
-        .host_context("inspect rootfs OS layout")?;
+    let has_os_layout = host.guest.has_os_release(&actual_rootfs_target).await?;
     let supports_offline_commands = has_os_layout
         && host
-            .rootfs
+            .guest
             .supports_nspawn_commands(&actual_rootfs_target)
-            .await
-            .host_context("inspect rootfs command support")?;
+            .await?;
 
     let has_account_changes = secrets.has_account_changes();
     if has_account_changes && !supports_offline_commands {
@@ -210,10 +204,9 @@ pub(super) async fn apply(
             report,
         )
         .await?;
-        host.rootfs
+        host.guest
             .configure_hostname(&actual_rootfs_target, &guest_hostname)
-            .await
-            .host_context("configure guest hostname")?;
+            .await?;
         report.record_typed(rootfs_hostname, ResourceDisposition::Committed);
         persist_committed(job, DeploymentStage::RootfsMutation, report).await?;
         check_deployment_cancellation(&cancellation)?;
@@ -231,10 +224,9 @@ pub(super) async fn apply(
         }
         if let Some(password) = secrets.take_root_password() {
             logs.message("Setting root password...".to_string());
-            host.rootfs
+            host.guest
                 .set_root_password(&actual_rootfs_target, password)
-                .await
-                .host_context("initialize root password")?;
+                .await?;
             check_deployment_cancellation(&cancellation)?;
         }
 
@@ -245,10 +237,9 @@ pub(super) async fn apply(
             let password = secrets
                 .take_user_password(&user.username)
                 .map_err(|error| OperationFailure::InvalidInput(error.to_string()))?;
-            host.rootfs
+            host.guest
                 .create_user(&actual_rootfs_target, user, password)
-                .await
-                .host_context("initialize guest user")?;
+                .await?;
             check_deployment_cancellation(&cancellation)?;
         }
     } else if !has_os_layout {
@@ -257,6 +248,31 @@ pub(super) async fn apply(
                 .to_string(),
         );
     }
+
+    check_deployment_cancellation(&cancellation)?;
+    let accounts = local_accounts(&actual_rootfs_target).await;
+    match &accounts {
+        LocalAccountObservation::Read {
+            accounts,
+            rejected_lines,
+        } => {
+            logs.message(format!(
+                "Observed {} local account(s) in /etc/passwd.",
+                accounts.len()
+            ));
+            if !rejected_lines.is_empty() {
+                logs.message(format!(
+                    "WARNING: {} malformed passwd record(s) were skipped.",
+                    rejected_lines.len()
+                ));
+            }
+        }
+        _ => logs.message(
+            "WARNING: Local accounts could not be read; see the deployment result for details.",
+        ),
+    }
+    output.local_accounts = Some(accounts);
+    check_deployment_cancellation(&cancellation)?;
 
     let mut resolved_wayland = Vec::with_capacity(wayland_intents.len());
     for intent in wayland_intents {
@@ -278,10 +294,9 @@ pub(super) async fn apply(
             user.username
         ));
         let identity = host
-            .rootfs
+            .guest
             .resolve_user_identity(&actual_rootfs_target, &user.username)
-            .await
-            .host_context("resolve guest Wayland identity")?;
+            .await?;
         let grant = crate::domain::provisioning::wayland::resolve_wayland_grant(
             intent,
             identity,
@@ -319,12 +334,7 @@ pub(super) async fn apply(
                     report,
                 )
                 .await?;
-                for warning in host
-                    .rootfs
-                    .configure_network(&actual_rootfs_target)
-                    .await
-                    .host_context("configure guest network services")?
-                {
+                for warning in host.guest.configure_network(&actual_rootfs_target).await? {
                     logs.message(warning);
                 }
                 report.record_typed(rootfs_network, ResourceDisposition::Committed);
@@ -362,7 +372,6 @@ pub(super) async fn apply(
             for warning in crate::adapters::platform::nvidia::lifecycle::inject_env_once(
                 &actual_rootfs_target,
                 &state,
-                &host.rootfs,
             )
             .await
             .host_context("initialize guest NVIDIA environment")?

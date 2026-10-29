@@ -557,7 +557,7 @@ fn terminal_claim_state(
             claim,
             DeploymentClaimState::ReconciliationRequired | DeploymentClaimState::Reconciled
         ),
-        DeploymentStatus::Succeeded
+        DeploymentStatus::Succeeded(_)
         | DeploymentStatus::Failed(_)
         | DeploymentStatus::Cancelled(_) => claim == DeploymentClaimState::Released,
         DeploymentStatus::Running | DeploymentStatus::RollingBack => false,
@@ -983,7 +983,7 @@ fn stream_pipe() -> std::io::Result<(OwnedFd, std::fs::File)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::provisioning::DeploymentEvent;
+    use crate::application::provisioning::{DeploymentEvent, DeploymentResult};
     use crate::domain::machine::MachineName;
     use crate::domain::provisioning::DeploymentSpec;
     use std::pin::Pin;
@@ -1136,7 +1136,11 @@ mod tests {
         let target = MachineName::new("test").unwrap();
         let request_id = DeploymentRequestId::from_u128(13);
         register_job(&registry, &operations, request_id, id, &target).unwrap();
-        finalize_job(&registry, id, DeploymentStatus::Succeeded);
+        finalize_job(
+            &registry,
+            id,
+            DeploymentStatus::Succeeded(DeploymentResult::default()),
+        );
         registry.acknowledge_submission(request_id).unwrap();
         registry.acknowledge(id).unwrap();
         register_job(
@@ -1360,7 +1364,11 @@ mod tests {
             let deployment_id = DeploymentId::from_u128(value + 100);
             let target = MachineName::new(format!("evict-{value}")).unwrap();
             register_job(&registry, &operations, request_id, deployment_id, &target).unwrap();
-            finalize_job(&registry, deployment_id, DeploymentStatus::Succeeded);
+            finalize_job(
+                &registry,
+                deployment_id,
+                DeploymentStatus::Succeeded(DeploymentResult::default()),
+            );
             registry.acknowledge_submission(request_id).unwrap();
             registry.acknowledge(deployment_id).unwrap();
         }
@@ -1389,7 +1397,11 @@ mod tests {
             let target = MachineName::new(format!("leased-evict-{value}"))
                 .expect("test target is a valid machine name");
             register_job(&registry, &operations, request_id, deployment_id, &target).unwrap();
-            finalize_job(&registry, deployment_id, DeploymentStatus::Succeeded);
+            finalize_job(
+                &registry,
+                deployment_id,
+                DeploymentStatus::Succeeded(DeploymentResult::default()),
+            );
             registry.acknowledge_submission(request_id).unwrap();
             registry.acknowledge(deployment_id).unwrap();
         }

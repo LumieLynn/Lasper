@@ -116,6 +116,21 @@ fn is_permission_dbus_error(error: &zbus::Error) -> bool {
 
 pub type Result<T> = std::result::Result<T, NspawnError>;
 
+impl From<crate::adapters::storage::rootfs::RootfsError> for NspawnError {
+    fn from(error: crate::adapters::storage::rootfs::RootfsError) -> Self {
+        use crate::adapters::storage::rootfs::RootfsError;
+        match error {
+            RootfsError::InvalidTarget(message) => Self::Validation(message),
+            RootfsError::Io(path, source) => Self::Io(path, source),
+            RootfsError::CommandFailed {
+                operation,
+                command,
+                diagnostic,
+            } => Self::CommandFailed(operation.into(), command, diagnostic),
+        }
+    }
+}
+
 impl From<crate::adapters::trusted_state::TrustedStateError> for NspawnError {
     fn from(error: crate::adapters::trusted_state::TrustedStateError) -> Self {
         use crate::adapters::trusted_state::TrustedStateError;

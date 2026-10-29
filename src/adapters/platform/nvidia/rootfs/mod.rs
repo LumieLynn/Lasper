@@ -1,6 +1,8 @@
 use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::log_output;
-use crate::adapters::rootfs::process::{nspawn_io_path, RootfsProcessRunner};
+use crate::adapters::process::{nspawn_io_path, DefaultRootfsProcessRunner, RootfsProcessRunner};
+use crate::adapters::storage::rootfs::RootfsTarget;
+use crate::domain::machine::MachineName;
 use crate::domain::secret::SecretBytes;
 use std::collections::HashSet;
 use std::path::{Component, Path};
@@ -14,7 +16,39 @@ const MAX_ENV_VALUE_BYTES: usize = 8192;
 const MAX_MUTATION_BYTES: usize = 1024 * 1024;
 const CLEANUP_BATCH_SIZE: usize = 128;
 
-pub(crate) async fn configure_nvidia_rootfs(
+/// Apply NVIDIA's guest configuration after validating its managed rootfs target.
+pub(super) async fn configure(
+    target: &RootfsTarget,
+    ld_cache_folders: &[String],
+    environment: &[(String, String)],
+    write_environment: bool,
+) -> Result<Vec<String>> {
+    validate_nvidia_config(ld_cache_folders, environment, write_environment)?;
+    let path = target.required_directory().await?;
+    configure_nvidia_rootfs(
+        &path,
+        ld_cache_folders,
+        environment,
+        write_environment,
+        &DefaultRootfsProcessRunner,
+    )
+    .await
+}
+
+pub(super) async fn cleanup(machine: &str, paths: &[String]) -> Result<Vec<String>> {
+    validate_cleanup_paths(paths)?;
+    let machine =
+        MachineName::new(machine).map_err(|error| NspawnError::Validation(error.to_string()))?;
+    let Some(path) = (RootfsTarget::Machine { machine })
+        .existing_directory()
+        .await?
+    else {
+        return Ok(Vec::new());
+    };
+    cleanup_nvidia_files(&path, paths, &DefaultRootfsProcessRunner).await
+}
+
+async fn configure_nvidia_rootfs(
     rootfs: &Path,
     ld_cache_folders: &[String],
     environment: &[(String, String)],
@@ -91,7 +125,7 @@ pub(crate) async fn configure_nvidia_rootfs(
     Ok(warnings)
 }
 
-pub(crate) async fn cleanup_nvidia_files(
+async fn cleanup_nvidia_files(
     rootfs: &Path,
     paths: &[String],
     runner: &dyn RootfsProcessRunner,
@@ -169,7 +203,7 @@ async fn write_system_file(
     Ok(output)
 }
 
-pub(crate) fn validate_nvidia_config(
+fn validate_nvidia_config(
     folders: &[String],
     environment: &[(String, String)],
     write_environment: bool,
@@ -206,7 +240,7 @@ pub(crate) fn validate_nvidia_config(
     Ok(())
 }
 
-pub(crate) fn validate_cleanup_paths(paths: &[String]) -> Result<()> {
+fn validate_cleanup_paths(paths: &[String]) -> Result<()> {
     if paths.len() > MAX_CLEANUP_PATHS {
         return Err(NspawnError::Validation(
             "Too many NVIDIA cleanup paths".into(),
@@ -276,83 +310,4 @@ fn command_error(output: &std::process::Output) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::adapters::rootfs::process::MockRootfsProcessRunner;
-    use std::os::unix::process::ExitStatusExt;
-    use std::process::Output;
-    use std::sync::{Arc, Mutex};
-
-    fn success_output(stdout: &[u8]) -> Output {
-        Output {
-            status: std::process::ExitStatus::from_raw(0),
-            stdout: stdout.to_vec(),
-            stderr: Vec::new(),
-        }
-    }
-
-    #[test]
-    fn mutation_validation_rejects_path_and_environment_injection() {
-        assert!(validate_nvidia_config(&["../../host".into()], &[], false).is_err());
-        assert!(
-            validate_nvidia_config(&[], &[("LD_PRELOAD\nEVIL".into(), "/tmp/x".into())], true,)
-                .is_err()
-        );
-        assert!(validate_cleanup_paths(&["/usr/lib/../etc/shadow".into()]).is_err());
-    }
-
-    #[tokio::test]
-    async fn environment_update_preserves_unmanaged_lines() {
-        let calls = Arc::new(Mutex::new(Vec::new()));
-        let mut runner = MockRootfsProcessRunner::new();
-        let captured = calls.clone();
-        runner
-            .expect_run()
-            .times(2)
-            .returning(move |_, command, stdin| {
-                captured.lock().unwrap().push((command.clone(), stdin));
-                if command.first().is_some_and(|arg| arg == "cat") {
-                    Ok(success_output(b"LANG=C\nNVIDIA_VISIBLE_DEVICES=old\n"))
-                } else {
-                    Ok(success_output(&[]))
-                }
-            });
-
-        configure_nvidia_rootfs(
-            Path::new("/tmp/rootfs"),
-            &[],
-            &[("NVIDIA_VISIBLE_DEVICES".into(), "void".into())],
-            true,
-            &runner,
-        )
-        .await
-        .unwrap();
-
-        let calls = calls.lock().unwrap();
-        let content = std::str::from_utf8(calls[1].1.as_ref().unwrap().as_slice()).unwrap();
-        assert_eq!(content, "LANG=C\nNVIDIA_VISIBLE_DEVICES=void\n");
-    }
-
-    #[tokio::test]
-    async fn cleanup_paths_are_data_arguments_not_shell_source() {
-        let mut runner = MockRootfsProcessRunner::new();
-        runner.expect_run().once().returning(|_, command, stdin| {
-            assert!(stdin.is_none());
-            let script = command
-                .iter()
-                .find(|arg| arg.contains("for path do"))
-                .unwrap();
-            assert!(!script.contains("odd'path"));
-            assert!(command.iter().any(|arg| arg == "/usr/lib/odd'path.so"));
-            Ok(success_output(&[]))
-        });
-
-        cleanup_nvidia_files(
-            Path::new("/tmp/rootfs"),
-            &["/usr/lib/odd'path.so".into()],
-            &runner,
-        )
-        .await
-        .unwrap();
-    }
-}
+mod tests;

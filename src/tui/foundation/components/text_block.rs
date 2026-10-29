@@ -93,6 +93,12 @@ impl<'a, C: TextContent> TextBlockControl<'a, C> {
         self
     }
 
+    /// The containing view chooses this behavior; text layout does not scroll.
+    pub(crate) fn follow_tail(mut self) -> Self {
+        self.follow_tail = true;
+        self
+    }
+
     pub(crate) fn preferred_height(&mut self, width: u16) -> u16 {
         let bounds = Rect::new(0, 0, width, u16::MAX);
         let inner = self.block.inner(bounds);

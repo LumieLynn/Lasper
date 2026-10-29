@@ -6,9 +6,22 @@
 use crate::tui::app::core::overlay::OverlayState;
 use crate::tui::app::core::OverlayCommand;
 use crate::tui::app::App;
+use crate::tui::features::workspace::inspector::refresh::DetailRefreshCompletion;
 use crate::tui::protocol::events::AppEvent;
 
 impl App {
+    /// Accept buffered feature updates once per frame, independently of which
+    /// overlays will be painted or receive input.
+    pub(in crate::tui::app) fn prepare_frame(
+        &mut self,
+        detail_tx: &tokio::sync::mpsc::Sender<DetailRefreshCompletion>,
+    ) {
+        self.prepare_workspace_frame(detail_tx);
+        if let Some(wizard) = &mut self.ui.overlays.wizard {
+            wizard.poll_updates();
+        }
+    }
+
     pub(in crate::tui::app) async fn dispatch_event(&mut self, event: AppEvent) {
         match event {
             AppEvent::Key(key) => self.handle_key(key).await,

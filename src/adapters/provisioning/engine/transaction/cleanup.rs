@@ -12,19 +12,22 @@ use crate::adapters::provisioning::engine::failure::{
     DeploymentFailure, OperationFailure, OperationResult,
 };
 use crate::adapters::provisioning::engine::resources::AppliedResource;
-use crate::application::provisioning::{DeploymentResource, DeploymentStage, ResourceDisposition};
+use crate::application::provisioning::{
+    DeploymentResource, DeploymentResult, DeploymentStage, ResourceDisposition,
+};
 
 pub(super) async fn finish(
     result: OperationResult<()>,
     transaction: Transaction<'_>,
-) -> Result<(), DeploymentFailure> {
+) -> Result<DeploymentResult, DeploymentFailure> {
     let Transaction {
         host,
         storage,
         job,
         logs,
         mut report,
-        raw_mount_target,
+        output,
+        raw_mount,
         storage_mount_attempted,
         external_provider_started,
     } = transaction;
@@ -58,7 +61,7 @@ pub(super) async fn finish(
     logs.enter_stage(DeploymentStage::Cleanup);
     let mut cleanup_errors = Vec::new();
     let mut durable_cleanup_failed = false;
-    if let Some(target) = raw_mount_target {
+    if let Some(mount) = raw_mount {
         logs.message("Unmounting raw image...".to_string());
         let resource = DeploymentResource::RawConfigurationMount(report.target.clone());
         match persist_applying(
@@ -69,7 +72,7 @@ pub(super) async fn finish(
         )
         .await
         {
-            Ok(()) => match host.rootfs.unmount_managed_raw(&target).await {
+            Ok(()) => match mount.unmount(host.commands.as_ref()).await {
                 Ok(()) => {
                     report.remove_typed(&resource);
                     if let Err(error) =
@@ -216,5 +219,5 @@ pub(super) async fn finish(
             vec!["durable deployment state could not be finalized".into()],
         )
     })?;
-    Ok(())
+    Ok(output)
 }

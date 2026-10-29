@@ -6,9 +6,9 @@ mod state;
 
 pub use contract::{
     DeploymentClaimStatus, DeploymentError, DeploymentEvent, DeploymentExecutor, DeploymentId,
-    DeploymentJobHandle, DeploymentPreflight, DeploymentProgress, DeploymentSecrets,
-    DeploymentStartError, DeploymentStatus, DeploymentSubmission, RemoteTarSafety, SourcePreflight,
-    UserSecret,
+    DeploymentJobHandle, DeploymentPreflight, DeploymentProgress, DeploymentResult,
+    DeploymentSecrets, DeploymentStartError, DeploymentStatus, DeploymentSubmission,
+    RemoteTarSafety, SourcePreflight, UserSecret,
 };
 pub use preparation::{
     HostCapability, HostGpuDevice, HostHardwareSnapshot, ImagePartitionInfo, ImagePartitionProbe,

@@ -15,8 +15,8 @@ use crate::adapters::storage::{
 };
 use crate::adapters::trusted_state::TrustedStateRoot;
 use crate::application::provisioning::{
-    DeploymentError, DeploymentExecutor, DeploymentJobContext, DeploymentPlan, DeploymentSecrets,
-    DeploymentStage, DeploymentStatePort, DeploymentStateSession,
+    DeploymentError, DeploymentExecutor, DeploymentJobContext, DeploymentPlan, DeploymentResult,
+    DeploymentSecrets, DeploymentStage, DeploymentStatePort, DeploymentStateSession,
 };
 use crate::application::HostOperationTracker;
 use crate::domain::machine::MachineName;
@@ -217,7 +217,7 @@ impl DeploymentExecutor for DirectProvisioningExecutor {
         plan: DeploymentPlan,
         secrets: DeploymentSecrets,
         job: DeploymentJobContext,
-    ) -> Result<(), DeploymentError> {
+    ) -> Result<DeploymentResult, DeploymentError> {
         let mut diagnostics =
             DeploymentDiagnostics::new(job.id(), plan.target().clone(), job.event_sender());
         let result = async {

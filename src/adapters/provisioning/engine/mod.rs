@@ -5,6 +5,7 @@
 //! and artifact handling together.
 //!
 //! `host` supplies host operations; `resources` records their ownership.
+//! `guest` initializes the deployed OS without owning its storage or mount lifetime.
 //! `command` waits for provider completion; `diagnostics` logs and publishes events.
 //! `failure` retains primary failures and cleanup errors separately.
 
@@ -12,6 +13,7 @@ mod command;
 mod diagnostics;
 mod execution;
 mod failure;
+mod guest;
 mod host;
 mod resources;
 pub(super) mod sources;

@@ -7,7 +7,7 @@ use crate::adapters::process::{read_bounded_stream, terminate_child_process_grou
 use crate::adapters::provisioning::engine::execution::check_deployment_cancellation;
 use crate::adapters::provisioning::engine::failure::{OperationFailure, OperationResult};
 use crate::adapters::provisioning::engine::host::HostResultExt;
-use crate::adapters::rootfs::RootfsTarget;
+use crate::adapters::storage::rootfs::RootfsTarget;
 use crate::application::provisioning::DeploymentCancellation;
 use serde::{Deserialize, Serialize};
 use std::os::unix::process::CommandExt;
@@ -17,16 +17,14 @@ use std::process::Stdio;
 const MAX_TAR_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 const TAR_RUNTIME_QUERY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Clone, Debug)]
 pub(crate) struct ImportTarRequest {
     pub(crate) target: RootfsTarget,
     pub(crate) source_origin: TarSourceOrigin,
     pub(crate) allow_unsafe_remote: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TarSourceOrigin {
     Local,
     Remote,
@@ -50,10 +48,7 @@ pub(crate) async fn import_tar_image(
 ) -> OperationResult<ImageImportReport> {
     validate_source(&source)?;
     validate_tar_target(&request.target).await?;
-    let target = request
-        .target
-        .path()
-        .host_context("resolve archive extraction path")?;
+    let target = request.target.path();
     let source_origin = request.source_origin;
     let allow_unsafe_remote = request.allow_unsafe_remote;
 
@@ -251,18 +246,10 @@ fn tar_runtime_policy(
 }
 
 async fn validate_tar_target(target: &RootfsTarget) -> OperationResult<()> {
-    let path = target
-        .path()
-        .host_context("resolve archive extraction path")?;
-    let metadata = tokio::fs::symlink_metadata(&path)
+    target
+        .required_directory()
         .await
-        .map_err(|error| OperationFailure::Io(path.clone(), error))?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(OperationFailure::InvalidInput(format!(
-            "Tar import target is not a managed directory: {}",
-            path.display()
-        )));
-    }
+        .host_context("open archive extraction target")?;
     Ok(())
 }
 
@@ -272,46 +259,6 @@ mod tests {
     use crate::application::provisioning::DeploymentCancellation;
     use crate::domain::machine::MachineName;
     use std::io::{Seek, SeekFrom};
-
-    #[test]
-    fn tar_request_rejects_untyped_target_fields() {
-        let request = r#"{
-            "target": {
-                "kind": "machine",
-                "machine": "../escape"
-            }
-        }"#;
-        assert!(serde_json::from_str::<ImportTarRequest>(request).is_err());
-
-        let missing_origin = r#"{
-            "target": {
-                "kind": "machine",
-                "machine": "valid-machine"
-            }
-        }"#;
-        assert!(serde_json::from_str::<ImportTarRequest>(missing_origin).is_err());
-
-        let valid = r#"{
-            "target": {
-                "kind": "machine",
-                "machine": "valid-machine"
-            },
-            "source_origin": "remote",
-            "allow_unsafe_remote": true
-        }"#;
-        let request = serde_json::from_str::<ImportTarRequest>(valid).unwrap();
-        assert_eq!(request.source_origin, TarSourceOrigin::Remote);
-        assert!(request.allow_unsafe_remote);
-
-        let request = r#"{
-            "target": {
-                "kind": "machine",
-                "machine": "valid-machine",
-                "path": "/tmp/escape"
-            }
-        }"#;
-        assert!(serde_json::from_str::<ImportTarRequest>(request).is_err());
-    }
 
     #[tokio::test]
     async fn tar_target_validation_rejects_missing_managed_target() {

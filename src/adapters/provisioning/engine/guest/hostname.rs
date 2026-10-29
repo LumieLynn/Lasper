@@ -1,15 +1,15 @@
-use crate::adapters::error::{NspawnError, Result};
+use crate::adapters::process::ROOTFS_COMMAND_TIMEOUT;
 use crate::adapters::process::{log_output, CommandRunner};
-use crate::adapters::rootfs::process::ROOTFS_COMMAND_TIMEOUT;
+use crate::adapters::provisioning::engine::failure::{OperationFailure, OperationResult};
 use crate::domain::machine::GuestHostname;
 use std::path::{Path, PathBuf};
 
 /// Persist the guest's static hostname using systemd's own offline writer.
-pub(crate) async fn configure_hostname_at(
+pub(super) async fn configure_hostname_at(
     rootfs: &Path,
     hostname: &GuestHostname,
     runner: &dyn CommandRunner,
-) -> Result<()> {
+) -> OperationResult<()> {
     let args = vec![
         format!("--root={}", rootfs.display()),
         format!("--hostname={}", hostname.as_str()),
@@ -18,10 +18,10 @@ pub(crate) async fn configure_hostname_at(
     let output = runner
         .run_bounded("systemd-firstboot", args, ROOTFS_COMMAND_TIMEOUT)
         .await
-        .map_err(|error| NspawnError::Io(PathBuf::from("systemd-firstboot"), error))?;
+        .map_err(|error| OperationFailure::Io(PathBuf::from("systemd-firstboot"), error))?;
     log_output("systemd-firstboot hostname", &output);
     if !output.status.success() {
-        return Err(NspawnError::cmd_failed(
+        return Err(OperationFailure::command_failed(
             "configure guest hostname",
             "systemd-firstboot",
             &output,
@@ -92,7 +92,7 @@ mod tests {
 
         assert!(matches!(
             error,
-            NspawnError::CommandFailed(_, _, output) if output.contains("read-only rootfs")
+            OperationFailure::CommandFailed { diagnostic, .. } if diagnostic.contains("read-only rootfs")
         ));
     }
 }

@@ -1,14 +1,14 @@
-use crate::adapters::error::{NspawnError, Result};
 use crate::adapters::process::log_output;
-use crate::adapters::rootfs::process::{nspawn_io_path, RootfsProcessRunner};
+use crate::adapters::process::{nspawn_io_path, RootfsProcessRunner};
+use crate::adapters::provisioning::engine::failure::{OperationFailure, OperationResult};
 use std::path::Path;
 use std::process::Output;
 
 /// Enable the guest services used by Lasper's veth and bridge network setup.
-pub(crate) async fn configure_network_at(
+pub(super) async fn configure_network_at(
     rootfs: &Path,
     runner: &dyn RootfsProcessRunner,
-) -> Result<Vec<String>> {
+) -> OperationResult<Vec<String>> {
     let systemctl_probe = runner
         .run(
             rootfs,
@@ -16,7 +16,7 @@ pub(crate) async fn configure_network_at(
             None,
         )
         .await
-        .map_err(|error| NspawnError::Io(nspawn_io_path(), error))?;
+        .map_err(|error| OperationFailure::Io(nspawn_io_path(), error))?;
     log_output("systemctl probe", &systemctl_probe);
     if !systemctl_probe.status.success() {
         return Ok(vec![
@@ -51,7 +51,7 @@ async fn enable_systemd_unit(
     rootfs: &Path,
     unit: &str,
     runner: &dyn RootfsProcessRunner,
-) -> Result<Output> {
+) -> OperationResult<Output> {
     let out = runner
         .run(
             rootfs,
@@ -59,7 +59,7 @@ async fn enable_systemd_unit(
             None,
         )
         .await
-        .map_err(|error| NspawnError::Io(nspawn_io_path(), error))?;
+        .map_err(|error| OperationFailure::Io(nspawn_io_path(), error))?;
     log_output(&format!("systemctl enable {unit}"), &out);
     if !out.status.success() {
         log::warn!("Failed to enable {} inside {}", unit, rootfs.display());
@@ -70,7 +70,7 @@ async fn enable_systemd_unit(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapters::rootfs::process::MockRootfsProcessRunner;
+    use crate::adapters::process::MockRootfsProcessRunner;
     use std::os::unix::process::ExitStatusExt;
     use std::sync::{Arc, Mutex};
 

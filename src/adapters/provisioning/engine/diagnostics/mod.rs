@@ -1,7 +1,8 @@
 //! Execution logs and best-effort delivery of frontend events.
 
 use crate::application::provisioning::{
-    DeploymentError, DeploymentEvent, DeploymentId, DeploymentProgress, DeploymentStage,
+    DeploymentError, DeploymentEvent, DeploymentId, DeploymentProgress, DeploymentResult,
+    DeploymentStage,
 };
 use crate::domain::machine::MachineName;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -58,9 +59,9 @@ impl DeploymentDiagnostics {
             )));
     }
 
-    pub(crate) fn finish(&self, result: &Result<(), DeploymentError>) {
+    pub(crate) fn finish(&self, result: &Result<DeploymentResult, DeploymentError>) {
         match result {
-            Ok(()) => self.write(log::Level::Info, "Deployment complete.".into()),
+            Ok(_) => self.write(log::Level::Info, "Deployment complete.".into()),
             Err(error) if error.is_cancelled() => self.message(error.to_string()),
             Err(error) => self.error(format!("Deployment failed: {error}")),
         }
