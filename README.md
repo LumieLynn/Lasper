@@ -9,7 +9,7 @@ Lasper provides a guided interface over native systemd resources. It organizes m
 ## Features
 
 - **Machine and image management**: Running machines and persistent systemd images are shown as separate resources. Start images, control machine lifecycles, and inspect properties, journal logs, and image metadata without treating cached backing layers as stopped containers.
-- **Integrated terminal**: Open multiple terminal tabs per container, use Lasper's selected-user shell prompt with Wayland/X11 integrations, or attach to the native login prompt. Root and elevated login attachments can fall back to `nsenter` for containers without a system bus.
+- **Integrated terminal**: Open multiple terminal tabs per container, use Lasper's selected-user shell prompt with Wayland/X11 integrations, or attach to the native login prompt.
 - **Shell and desktop commands**: Enter a container with `lasper shell user@machine`, run a guest command, or use `lasper launch` from a desktop entry.
 - **Image provisioning**:
   - Bootstrap native Debian, Ubuntu, Arch, or Fedora systems with `debootstrap`, `pacstrap`, or `dnf5`.
@@ -26,7 +26,6 @@ Lasper is in an early functional stage. The current workflow focuses on containe
 Required:
 
 - `systemd-container`: provides `machinectl` and `systemd-nspawn`.
-- `util-linux`: provides `nsenter` for terminal attachment to containers without a system bus.
 - Permission to perform privileged container operations.
 
 Optional:
@@ -105,7 +104,7 @@ Press `a` or `n` to open the creation wizard.
 
 Press `t` to open Lasper's selected-user shell prompt for the current running container. Wayland is probed automatically when the current display has a configured bind; X11 remains an explicit opt-in.
 
-When the machine list or image list is focused, press `Space` to open the available terminal actions, including X11-enabled selected-user shells and the native login interface. If a container has no system bus, the login action can use a fixed `nsenter` shell through the machined leader PID in root or elevated mode.
+When the machine list or image list is focused, press `Space` to open the available terminal actions, including X11-enabled selected-user shells and the native login interface. These actions require the corresponding systemd guest services.
 
 Lasper also provides process-level selected-user shell commands that follow `machinectl shell` and can run a specific guest executable with its arguments:
 

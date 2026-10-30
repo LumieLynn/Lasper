@@ -39,7 +39,7 @@ The elevated daemon does not expose arbitrary host `program + argv` execution or
 
 The daemon still carries broad host authority by design. A compromised TUI process can request any typed operation that Lasper itself is allowed to perform. The typed protocol is a boundary-hardening measure, not a trust boundary against compromised application code.
 
-The namespace shell fallback is available only when Lasper itself is root or uses the authenticated elevated daemon. It uses a fixed `nsenter` argument set and a discovered `/bin/bash` or `/bin/sh`; no caller-supplied PID, host executable, fallback shell path, or `nsenter` argument crosses the daemon protocol. It snapshots the leader start time, namespace identities, and root identity, then rechecks them immediately before spawn. This closes ordinary PID reuse and replacement cases, but a narrow post-check/pre-exec race remains; eliminating that race requires a descriptor-preserving launcher or cgroup-based ownership and is not claimed here.
+Terminal sessions use systemd's native guest interfaces. Lasper does not start a guest shell or control command by running a host `nsenter` process. Entering namespaces alone would not apply the capability, seccomp, and cgroup restrictions that nspawn applied when it started the container.
 
 ## Display Access
 

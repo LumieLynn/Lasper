@@ -7,7 +7,7 @@ use crate::adapters::runtime::dbus::DbusBackend;
 use crate::adapters::runtime::source::RuntimeSource;
 use crate::adapters::system_operation::{
     execute_dbus_system_operation_with_runner, execute_system_operation_with_runner,
-    SystemOperation, SystemOperationError,
+    SystemOperation,
 };
 use crate::application::machine_lifecycle::{
     MachineControl, MachineControlOutcome, MachineControlTransport, MachineRuntimeAction,
@@ -287,11 +287,6 @@ async fn execute_systemd_tools_machine_control_with_runner(
 ) -> MachineControlOutcome {
     match execute_system_operation_with_runner(system_operation(machine, intent), runner).await {
         Ok(()) => MachineControlOutcome::Succeeded,
-        Err(SystemOperationError::Io { source: error, .. }) => {
-            MachineControlOutcome::NotAttempted {
-                reason: format!("failed to launch machine control command: {error}"),
-            }
-        }
         Err(error) => map_system_operation_machine_error(error),
     }
 }
@@ -350,6 +345,32 @@ mod tests {
             MachineControlIntent::Launch {
                 image: ImageName::new("test").unwrap(),
             },
+            &runner,
+        )
+        .await;
+
+        assert_eq!(outcome, MachineControlOutcome::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn poweroff_uses_the_native_machine_control_request() {
+        let mut runner = MockCommandRunner::new();
+        runner
+            .expect_run_bounded()
+            .withf(|program, args, timeout| {
+                program == "machinectl"
+                    && args
+                        .iter()
+                        .map(String::as_str)
+                        .eq(["--", "poweroff", "test"])
+                    && *timeout == std::time::Duration::from_secs(60)
+            })
+            .once()
+            .returning(|_, _, _| Ok(success()));
+
+        let outcome = execute_systemd_tools_machine_control_with_runner(
+            MachineName::new("test").unwrap(),
+            MachineControlIntent::Runtime(MachineRuntimeAction::Poweroff),
             &runner,
         )
         .await;

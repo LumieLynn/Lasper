@@ -4,8 +4,8 @@
 //! guest requests share `probe` for framing, collection, and filesystem
 //! observations; `machine` is the route-fixed execution boundary. The latter
 //! produces either a native D-Bus PTY (`runtime::dbus`) or a `machinectl`
-//! command (`runtime::systemd_tools`).  `terminal_attach` is only the default
-//! login/namespace selector; `terminal_io` owns the process-level I/O bridges.
+//! command (`runtime::systemd_tools`). `terminal_attach` builds machinectl PTY
+//! commands; `terminal_io` owns the process-level I/O bridges.
 
 mod direct;
 mod elevated;
@@ -23,7 +23,7 @@ mod x11_probe;
 use crate::application::sessions::{SessionPort, SessionService};
 use std::sync::Arc;
 
-pub(crate) use direct::{DirectSessionAdapter, DirectTerminalPolicy};
+pub(crate) use direct::DirectSessionAdapter;
 pub(crate) use elevated::ElevatedSessionAdapter;
 pub(crate) use machine::{
     MachinePty, MachineSessionOpening, MachineSessionRequest, MachineSessionTransport,
@@ -63,7 +63,6 @@ impl crate::application::x11::X11ProjectionPort for X11ProjectionAdapter {
 
 pub(crate) enum SessionRoute {
     Direct {
-        policy: DirectTerminalPolicy,
         machine: MachineSessionTransport,
         nspawn: crate::adapters::config::NspawnConfigStore,
     },
@@ -74,11 +73,9 @@ pub(crate) enum SessionRoute {
 
 pub(crate) fn compose_session_service(route: SessionRoute) -> Arc<SessionService> {
     let port: Arc<dyn SessionPort> = match route {
-        SessionRoute::Direct {
-            policy,
-            machine,
-            nspawn,
-        } => Arc::new(DirectSessionAdapter::new(policy, machine, nspawn)),
+        SessionRoute::Direct { machine, nspawn } => {
+            Arc::new(DirectSessionAdapter::new(machine, nspawn))
+        }
         SessionRoute::Elevated { daemon } => Arc::new(ElevatedSessionAdapter::new(daemon)),
     };
     Arc::new(SessionService::new(port))

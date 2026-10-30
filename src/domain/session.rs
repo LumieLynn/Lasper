@@ -72,7 +72,6 @@ impl std::error::Error for SessionSizeError {}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TerminalAttachmentKind {
     Login,
-    Namespace,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

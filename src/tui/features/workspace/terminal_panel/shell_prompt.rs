@@ -360,13 +360,12 @@ async fn send_output(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapters::session::{DirectSessionAdapter, DirectTerminalPolicy};
+    use crate::adapters::session::DirectSessionAdapter;
     use crate::application::sessions::{terminal_session_channel, SessionSendStatus};
     use crate::domain::session::{SessionId, TerminalAttachmentKind};
 
     fn prompt_service() -> Arc<SessionService> {
         Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
-            DirectTerminalPolicy::LoginOnly,
             crate::adapters::session::MachineSessionTransport::SystemdTools,
             crate::adapters::config::NspawnConfigStore::direct(),
         ))))

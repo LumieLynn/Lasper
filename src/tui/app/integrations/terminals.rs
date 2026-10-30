@@ -108,9 +108,6 @@ impl App {
                     crate::domain::session::TerminalAttachmentKind::Login => {
                         format!("Logged into {}", entry.name)
                     }
-                    crate::domain::session::TerminalAttachmentKind::Namespace => {
-                        format!("Attached to {} through its namespaces", entry.name)
-                    }
                 };
                 self.set_status(message, crate::tui::foundation::status::StatusLevel::Info);
             }

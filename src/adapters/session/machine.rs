@@ -272,9 +272,7 @@ impl MachineSessionTransport {
         match opening {
             MachineSessionOpening::Dbus(pty) => super::pty::spawn_machine_terminal(pty, id, size),
             MachineSessionOpening::SystemdTools(command) => super::pty::spawn_direct_terminal(
-                (*command).into_pty_command().map_err(|error| {
-                    SessionError::new(format!("validate machinectl session command: {error}"))
-                })?,
+                (*command).into_pty_command(),
                 id,
                 TerminalAttachmentKind::Login,
                 size,

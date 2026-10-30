@@ -98,7 +98,6 @@ pub(crate) fn compose_process_shell_services(
                 crate::adapters::runtime::dbus::DbusBackend::new(),
             );
             crate::adapters::session::SessionRoute::Direct {
-                policy: crate::adapters::session::DirectTerminalPolicy::LoginOnly,
                 machine,
                 nspawn: crate::adapters::config::NspawnConfigStore::direct(),
             }
@@ -168,12 +167,10 @@ pub(crate) fn compose_application_services(
     };
     let session_route = match level {
         PermissionLevel::User => crate::adapters::session::SessionRoute::Direct {
-            policy: crate::adapters::session::DirectTerminalPolicy::LoginOnly,
             machine: select_machine_session_transport(systemd_tools, direct_dbus.clone()),
             nspawn: nspawn.clone(),
         },
         PermissionLevel::Root => crate::adapters::session::SessionRoute::Direct {
-            policy: crate::adapters::session::DirectTerminalPolicy::Automatic,
             machine: select_machine_session_transport(systemd_tools, direct_dbus.clone()),
             nspawn: nspawn.clone(),
         },

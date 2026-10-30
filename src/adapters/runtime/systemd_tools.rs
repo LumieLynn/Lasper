@@ -595,7 +595,7 @@ mod tests {
                 "alice@test-machine",
             ]
         );
-        let command = command.into_pty_command().unwrap();
+        let command = command.into_pty_command();
         assert_eq!(
             command.get_env("TERM"),
             Some(std::ffi::OsStr::new("xterm-kitty"))
@@ -641,7 +641,7 @@ mod tests {
             command.args().last().map(String::as_str),
             Some("/run/lasper/wayland/1000/wayland-1")
         );
-        let command = command.into_pty_command().unwrap();
+        let command = command.into_pty_command();
         assert_eq!(command.get_env("TERM"), Some(std::ffi::OsStr::new("dumb")));
         assert_eq!(command.get_env("COLORTERM"), None);
         assert_eq!(command.get_env("NO_COLOR"), None);
@@ -674,7 +674,7 @@ mod tests {
             &command.args()[command.args().len() - 2..],
             ["/mnt/x11/X0", "/tmp/.X11-unix/X0"]
         );
-        let command = command.into_pty_command().unwrap();
+        let command = command.into_pty_command();
         assert_eq!(command.get_env("TERM"), Some(std::ffi::OsStr::new("dumb")));
     }
 

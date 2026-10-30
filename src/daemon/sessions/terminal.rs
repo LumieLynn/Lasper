@@ -1,6 +1,6 @@
 //! Terminal launch planning and delivery of machine or process PTYs.
 
-use crate::adapters::session::terminal_attach::{self, TerminalAttachCommand};
+use crate::adapters::session::terminal_attach::TerminalAttachCommand;
 use crate::adapters::session::{
     MachinePty, MachineSessionOpening, MachineSessionRequest, MachineSessionTransport,
     MachineShellEnvironment, MachineShellRequest, WaylandSessionResolver,
@@ -9,7 +9,7 @@ use crate::application::sessions::{GuestCommand, SessionError, ShellTarget, Term
 use crate::daemon::sessions::process::{self, SessionChild};
 use crate::daemon::sessions::{handoff, lifecycle, SessionRegistry};
 use crate::domain::machine::MachineName;
-use crate::domain::session::{SessionId, TerminalAttachmentKind};
+use crate::domain::session::SessionId;
 use crate::ipc::protocol::session::{
     SpawnTerminalParams, SpawnTerminalResponse, WireSessionId, WireTerminalAttachmentKind,
     WireTerminalLaunch, WireTerminalLifecycleSource, WireTerminalSize, WireTerminalStartupError,
@@ -63,25 +63,10 @@ async fn prepare(
     probe_id: SessionId,
 ) -> Result<MachineSessionOpening, TerminalOpenError> {
     match launch {
-        WireTerminalLaunch::DefaultAttachment => {
-            let command = terminal_attach::select(name).map_err(|error| {
-                SessionError::new(format!("terminal attach planning failed: {error}"))
-            })?;
-            Ok(MachineSessionOpening::SystemdTools(Box::new(command)))
-        }
-        WireTerminalLaunch::LoginPrompt => {
-            let attachment = terminal_attach::select(name).map_err(|error| {
-                SessionError::new(format!("terminal attach planning failed: {error}"))
-            })?;
-            if attachment.kind() == TerminalAttachmentKind::Namespace {
-                Ok(MachineSessionOpening::SystemdTools(Box::new(attachment)))
-            } else {
-                machine
-                    .open(MachineSessionRequest::login_prompt(name.clone()))
-                    .await
-                    .map_err(Into::into)
-            }
-        }
+        WireTerminalLaunch::LoginPrompt => machine
+            .open(MachineSessionRequest::login_prompt(name.clone()))
+            .await
+            .map_err(Into::into),
         WireTerminalLaunch::SelectedUserShell {
             user,
             terminal,
@@ -149,9 +134,7 @@ fn spawn_process_terminal(
         .context("open terminal PTY")?;
     let master_fd = pair.master.as_raw_fd().context("PTY master has no fd")?;
     let kind = attachment.kind();
-    let command = attachment
-        .into_pty_command()
-        .context("terminal attachment validation failed")?;
+    let command = attachment.into_pty_command();
     let response = serde_json::to_vec(&SpawnTerminalResponse {
         attach_kind: WireTerminalAttachmentKind::from(kind),
         lifecycle: WireTerminalLifecycleSource::DaemonStatus,
@@ -209,6 +192,25 @@ mod tests {
     use crate::domain::session::SessionSize;
     use crate::domain::wayland::{HostWaylandSocket, SocketRevision, WaylandDisplay};
     use sendfd::RecvWithFd;
+
+    #[tokio::test]
+    async fn login_prompt_uses_the_selected_native_transport_without_a_leader_probe() {
+        let opening = prepare(
+            &MachineName::new("test-machine").unwrap(),
+            WireTerminalLaunch::LoginPrompt,
+            MachineSessionTransport::SystemdTools,
+            uzers::get_current_uid(),
+            SessionId::new(1).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let MachineSessionOpening::SystemdTools(command) = opening else {
+            panic!("expected the selected systemd-tools transport");
+        };
+        assert_eq!(command.program(), "machinectl");
+        assert_eq!(command.args(), ["--", "login", "test-machine"]);
+    }
 
     #[tokio::test]
     async fn rejected_wayland_preparation_returns_a_typed_failure_without_terminal_fds() {

@@ -102,7 +102,6 @@ impl TryFrom<WireGuestCommand> for GuestCommand {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "launch", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum WireTerminalLaunch {
-    DefaultAttachment,
     LoginPrompt,
     SelectedUserShell {
         user: ValidatedGuestUserName,
@@ -319,14 +318,12 @@ pub(crate) enum WireTerminalLifecycleSource {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum WireTerminalAttachmentKind {
     Login,
-    Namespace,
 }
 
 impl From<TerminalAttachmentKind> for WireTerminalAttachmentKind {
     fn from(value: TerminalAttachmentKind) -> Self {
         match value {
             TerminalAttachmentKind::Login => Self::Login,
-            TerminalAttachmentKind::Namespace => Self::Namespace,
         }
     }
 }
@@ -335,7 +332,6 @@ impl From<WireTerminalAttachmentKind> for TerminalAttachmentKind {
     fn from(value: WireTerminalAttachmentKind) -> Self {
         match value {
             WireTerminalAttachmentKind::Login => Self::Login,
-            WireTerminalAttachmentKind::Namespace => Self::Namespace,
         }
     }
 }

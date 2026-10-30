@@ -296,7 +296,9 @@ enum MachineTransitionKind {
 #[derive(Clone, Debug)]
 struct MachineTransition {
     kind: MachineTransitionKind,
-    started_at: Instant,
+    /// None while the operation owns the transition. Its observation window
+    /// starts when the request finishes, rather than while it is still running.
+    completed_at: Option<Instant>,
 }
 
 pub struct MachineLifecycleService {
@@ -405,7 +407,7 @@ impl MachineLifecycleService {
                 machine.as_str().to_string(),
                 MachineTransition {
                     kind,
-                    started_at: Instant::now(),
+                    completed_at: None,
                 },
             );
         }
@@ -444,17 +446,23 @@ impl MachineLifecycleService {
     /// Expire optimistic states independently of backend snapshot publication.
     /// Return whether the display needs to be rebuilt from the last observation.
     pub fn expire_transitions(&self) -> bool {
-        let now = Instant::now();
+        self.expire_transitions_at(Instant::now())
+    }
+
+    fn expire_transitions_at(&self, now: Instant) -> bool {
         let mut transitions = self.transitions.lock();
         let previous_len = transitions.len();
         transitions.retain(|_, transition| {
+            let Some(completed_at) = transition.completed_at else {
+                return true;
+            };
             let timeout = match transition.kind {
                 MachineTransitionKind::Starting => START_TRANSITION_TIMEOUT,
                 MachineTransitionKind::Stopping | MachineTransitionKind::Rebooting { .. } => {
                     OTHER_TRANSITION_TIMEOUT
                 }
             };
-            now.duration_since(transition.started_at) < timeout
+            now.duration_since(completed_at) < timeout
         });
         previous_len != transitions.len()
     }
@@ -483,8 +491,15 @@ impl MachineLifecycleService {
         entries
     }
 
-    fn clear_transition(&self, machine: &MachineName) {
-        self.transitions.lock().remove(machine.as_str());
+    fn finish_transition(&self, machine: &MachineName, retain: bool) {
+        let mut transitions = self.transitions.lock();
+        if retain {
+            if let Some(transition) = transitions.get_mut(machine.as_str()) {
+                transition.completed_at = Some(Instant::now());
+            }
+        } else {
+            transitions.remove(machine.as_str());
+        }
     }
 
     async fn confirm_start(&self, machine: &MachineName) -> StartConfirmation {
@@ -741,8 +756,9 @@ impl MachineOperation {
 
 impl Drop for MachineOperation {
     fn drop(&mut self) {
-        if self.transition.is_some() && !self.retain_transition {
-            self.service.clear_transition(&self.machine);
+        if self.transition.is_some() {
+            self.service
+                .finish_transition(&self.machine, self.retain_transition);
         }
     }
 }
@@ -890,15 +906,18 @@ mod tests {
     fn expired_optimism_returns_to_the_observed_state() {
         let service = service(MockMachineControl::new(), MockMachineObservation::new());
         let running = [entry("test", MachineState::Running)];
-        let operation = service
+        let mut operation = service
             .begin_runtime(&running[0], MachineRuntimeAction::Poweroff)
             .unwrap();
+        operation.retain_transition = true;
+        drop(operation);
         service
             .transitions
             .lock()
             .get_mut("test")
             .unwrap()
-            .started_at = Instant::now() - OTHER_TRANSITION_TIMEOUT - Duration::from_secs(1);
+            .completed_at =
+            Some(Instant::now() - OTHER_TRANSITION_TIMEOUT - Duration::from_secs(1));
 
         assert_eq!(
             service.project_machines(&running)[0].state,
@@ -907,7 +926,6 @@ mod tests {
         assert!(service.expire_transitions());
         assert_eq!(service.project_machines(&running), running);
         assert!(!service.expire_transitions());
-        drop(operation);
     }
 
     #[test]
@@ -961,6 +979,63 @@ mod tests {
 
         assert_eq!(outcome.result, MachineLifecycleResult::Succeeded);
         assert_eq!(outcome.route, Some(ExecutionRoute::DirectDbus));
+    }
+
+    #[tokio::test]
+    async fn poweroff_observation_window_starts_after_the_control_request_finishes() {
+        let mut control = MockMachineControl::new();
+        control
+            .expect_execute_runtime()
+            .withf(|machine, action| {
+                machine.as_str() == "test" && *action == MachineRuntimeAction::Poweroff
+            })
+            .once()
+            .returning(|_, _| RoutedMachineControlOutcome {
+                outcome: MachineControlOutcome::Succeeded,
+                route: ExecutionRoute::DirectDbus,
+                fallback: None,
+            });
+        let mut observation = MockMachineObservation::new();
+        observation.expect_invalidate().once().return_const(());
+        let service = service(control, observation);
+        let operation = service
+            .begin_runtime(
+                &entry("test", MachineState::Running),
+                MachineRuntimeAction::Poweroff,
+            )
+            .unwrap();
+        assert!(!service.expire_transitions_at(Instant::now() + Duration::from_secs(120)));
+
+        let outcome = operation.run().await;
+
+        assert_eq!(outcome.result, MachineLifecycleResult::Succeeded);
+        assert!(service.transitions.lock()["test"].completed_at.is_some());
+        assert!(!service.expire_transitions());
+        assert!(service.expire_transitions_at(Instant::now() + OTHER_TRANSITION_TIMEOUT));
+    }
+
+    #[test]
+    fn in_flight_poweroff_does_not_expire_its_transition() {
+        let service = service(MockMachineControl::new(), MockMachineObservation::new());
+        let machine = entry("test", MachineState::Running);
+        let operation = service
+            .begin_runtime(&machine, MachineRuntimeAction::Poweroff)
+            .unwrap();
+        assert!(!service.expire_transitions_at(Instant::now() + Duration::from_secs(120)));
+        assert_eq!(
+            service.project_machines(std::slice::from_ref(&machine))[0].state,
+            MachineState::Exiting
+        );
+        assert!(service.transitions.lock()["test"].completed_at.is_none());
+
+        drop(operation);
+        assert_eq!(
+            service.project_machines(std::slice::from_ref(&machine)),
+            std::slice::from_ref(&machine)
+        );
+        assert!(service
+            .begin_runtime(&machine, MachineRuntimeAction::Terminate)
+            .is_ok());
     }
 
     #[tokio::test]

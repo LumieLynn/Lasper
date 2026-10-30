@@ -10,14 +10,7 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 
 const MAX_JOURNAL_DIAGNOSTICS: usize = 64 * 1024;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum DirectTerminalPolicy {
-    LoginOnly,
-    Automatic,
-}
-
 pub(crate) struct DirectSessionAdapter {
-    terminal_policy: DirectTerminalPolicy,
     machine: super::MachineSessionTransport,
     wayland: super::wayland::WaylandSessionResolver,
     x11: super::x11::X11SessionResolver,
@@ -25,12 +18,10 @@ pub(crate) struct DirectSessionAdapter {
 
 impl DirectSessionAdapter {
     pub(crate) fn new(
-        terminal_policy: DirectTerminalPolicy,
         machine: super::MachineSessionTransport,
         nspawn: crate::adapters::config::NspawnConfigStore,
     ) -> Self {
         Self {
-            terminal_policy,
             machine: machine.clone(),
             wayland: super::wayland::WaylandSessionResolver::new(machine.clone(), nspawn.clone()),
             x11: super::x11::X11SessionResolver::new(machine, nspawn),
@@ -111,42 +102,15 @@ impl SessionPort for DirectSessionAdapter {
                     .await
                     .map_err(Into::into)
             }
-            // Root may attach by namespace when the guest has no bus. Native
-            // login prompts otherwise use the selected D-Bus/systemd tools route.
-            TerminalLaunch::LoginPrompt => match self.terminal_policy {
-                DirectTerminalPolicy::LoginOnly => self
-                    .machine
-                    .open_local(
-                        super::MachineSessionRequest::login_prompt(machine),
-                        id,
-                        size,
-                    )
-                    .await
-                    .map_err(Into::into),
-                DirectTerminalPolicy::Automatic => {
-                    let attachment = crate::adapters::session::terminal_attach::select(&machine)
-                        .map_err(|error| {
-                            SessionError::new(format!("plan terminal attachment: {error}"))
-                        })?;
-                    let kind = attachment.kind();
-                    if kind != crate::domain::session::TerminalAttachmentKind::Namespace {
-                        return self
-                            .machine
-                            .open_local(
-                                super::MachineSessionRequest::login_prompt(machine),
-                                id,
-                                size,
-                            )
-                            .await
-                            .map_err(Into::into);
-                    }
-                    let command = attachment.into_pty_command().map_err(|error| {
-                        SessionError::new(format!("validate terminal attachment: {error}"))
-                    })?;
-                    crate::adapters::session::pty::spawn_direct_terminal(command, id, kind, size)
-                        .map_err(Into::into)
-                }
-            },
+            TerminalLaunch::LoginPrompt => self
+                .machine
+                .open_local(
+                    super::MachineSessionRequest::login_prompt(machine),
+                    id,
+                    size,
+                )
+                .await
+                .map_err(Into::into),
         }
     }
 

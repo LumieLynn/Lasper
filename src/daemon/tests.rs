@@ -819,7 +819,7 @@ fn fd_request_round_trip_uses_typed_terminal_parameters() {
             session_id: session::WireSessionId::new(7).unwrap(),
             name: MachineName::new("test-machine").unwrap(),
             size: SessionSize::new(120, 40).unwrap().into(),
-            launch: session::WireTerminalLaunch::DefaultAttachment,
+            launch: session::WireTerminalLaunch::LoginPrompt,
         }),
     };
 
@@ -829,7 +829,7 @@ fn fd_request_round_trip_uses_typed_terminal_parameters() {
     assert_eq!(json["params"]["name"], "test-machine");
     assert_eq!(json["params"]["size"]["cols"], 120);
     assert_eq!(json["params"]["size"]["rows"], 40);
-    assert_eq!(json["params"]["launch"]["launch"], "default_attachment");
+    assert_eq!(json["params"]["launch"]["launch"], "login_prompt");
 
     let parsed: FdRequest = serde_json::from_value(json).unwrap();
     match parsed.operation {

@@ -78,9 +78,7 @@ OCI registry signatures are not verified by Lasper yet. Use trusted registries a
 
 ## What happens when a container has no system bus?
 
-The native login path (`Space` then `l`) normally uses systemd's machine login interface. In root mode or `lasper -e`, a running container without a usable system bus can use a fixed `nsenter` fallback through the machined leader PID. This opens a root shell inside the container's namespaces and bypasses the container's normal login authentication. It does not install a shell, repair image ownership, configure networking, or make a read-only filesystem writable.
-
-Plain unprivileged mode does not use this fallback.
+The native login path (`Space` then `l`) uses systemd's machine login interface. Selected-user shells use the guest systemd manager. If the required guest service is unavailable, Lasper reports the failure through that native path. Root and elevated mode do not replace it with a host process that enters the container and executes a guest shell. Support for other guest execution channels is still being developed.
 
 ## Why does Veth or bridge networking not work?
 

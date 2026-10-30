@@ -335,7 +335,7 @@ mod tests {
             size: crate::domain::session::SessionSize::new(80, 24)
                 .unwrap()
                 .into(),
-            launch: crate::ipc::protocol::session::WireTerminalLaunch::DefaultAttachment,
+            launch: crate::ipc::protocol::session::WireTerminalLaunch::LoginPrompt,
         });
         assert_eq!(terminal.wire_name(), "spawn_terminal");
         assert_eq!(terminal.family(), RpcFamily::Session);

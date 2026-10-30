@@ -1138,7 +1138,7 @@ mod tests {
         queue_input, queue_resize, QueueResizeResult, TerminalInputStatus, TerminalKeyOutcome,
         TerminalManager, TerminalSession, TextSelection,
     };
-    use crate::adapters::session::{DirectSessionAdapter, DirectTerminalPolicy};
+    use crate::adapters::session::DirectSessionAdapter;
     use crate::application::sessions::{
         journal_session_channel, terminal_session_channel, JournalSessionHandle,
         JournalSessionRequest, SessionError, SessionPort, SessionService, TerminalSessionHandle,
@@ -1352,7 +1352,6 @@ mod tests {
     #[tokio::test]
     async fn spawn_rejects_transitional_machine_states() {
         let service = Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
-            DirectTerminalPolicy::LoginOnly,
             crate::adapters::session::MachineSessionTransport::SystemdTools,
             crate::adapters::config::NspawnConfigStore::direct(),
         ))));
@@ -1412,7 +1411,6 @@ mod tests {
     #[tokio::test]
     async fn browser_mode_keeps_navigation_local_and_visual_selection_is_native() {
         let service = Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
-            DirectTerminalPolicy::LoginOnly,
             crate::adapters::session::MachineSessionTransport::SystemdTools,
             crate::adapters::config::NspawnConfigStore::direct(),
         ))));
@@ -1460,7 +1458,6 @@ mod tests {
     #[tokio::test]
     async fn normal_mouse_drag_enters_visual_with_the_clicked_scrollback_anchor() {
         let service = Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
-            DirectTerminalPolicy::LoginOnly,
             crate::adapters::session::MachineSessionTransport::SystemdTools,
             crate::adapters::config::NspawnConfigStore::direct(),
         ))));
@@ -1547,7 +1544,6 @@ mod tests {
     async fn insert_mouse_scroll_keeps_cursor_position_and_follows_accepted_input() {
         crate::tui::foundation::theme::init_theme(crate::tui::foundation::theme::Theme::dark());
         let service = Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
-            DirectTerminalPolicy::LoginOnly,
             crate::adapters::session::MachineSessionTransport::SystemdTools,
             crate::adapters::config::NspawnConfigStore::direct(),
         ))));
@@ -1606,7 +1602,6 @@ mod tests {
     #[tokio::test]
     async fn finished_hidden_terminals_release_both_screens_without_touching_live_history() {
         let service = Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
-            DirectTerminalPolicy::LoginOnly,
             crate::adapters::session::MachineSessionTransport::SystemdTools,
             crate::adapters::config::NspawnConfigStore::direct(),
         ))));
@@ -1653,7 +1648,6 @@ mod tests {
     #[tokio::test]
     async fn duplicate_terminal_tabs_receive_stable_ordinals() {
         let service = Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
-            DirectTerminalPolicy::LoginOnly,
             crate::adapters::session::MachineSessionTransport::SystemdTools,
             crate::adapters::config::NspawnConfigStore::direct(),
         ))));
@@ -1688,7 +1682,6 @@ mod tests {
 
         crate::tui::foundation::theme::init_theme(crate::tui::foundation::theme::Theme::dark());
         let service = Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
-            DirectTerminalPolicy::LoginOnly,
             crate::adapters::session::MachineSessionTransport::SystemdTools,
             crate::adapters::config::NspawnConfigStore::direct(),
         ))));
@@ -1760,7 +1753,6 @@ mod tests {
     async fn terminal_tabs_follow_the_active_session_and_reset_after_widening() {
         crate::tui::foundation::theme::init_theme(crate::tui::foundation::theme::Theme::dark());
         let service = Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
-            DirectTerminalPolicy::LoginOnly,
             crate::adapters::session::MachineSessionTransport::SystemdTools,
             crate::adapters::config::NspawnConfigStore::direct(),
         ))));
@@ -1830,7 +1822,6 @@ mod tests {
     #[tokio::test]
     async fn terminal_tab_click_selects_the_session_and_machine() {
         let service = Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
-            DirectTerminalPolicy::LoginOnly,
             crate::adapters::session::MachineSessionTransport::SystemdTools,
             crate::adapters::config::NspawnConfigStore::direct(),
         ))));
@@ -1857,7 +1848,6 @@ mod tests {
     #[tokio::test]
     async fn closing_active_tab_reports_the_new_active_session() {
         let service = Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
-            DirectTerminalPolicy::LoginOnly,
             crate::adapters::session::MachineSessionTransport::SystemdTools,
             crate::adapters::config::NspawnConfigStore::direct(),
         ))));
