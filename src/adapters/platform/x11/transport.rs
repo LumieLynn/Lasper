@@ -27,6 +27,56 @@ use super::common::{ENDPOINT_IO_TIMEOUT, MAX_ACL_BYTES, MAX_ACL_ENTRIES};
 type X11Connection = RustConnection<EndpointStream>;
 type AuthenticatedX11Connection = (X11Connection, X11PeerIdentity);
 
+/// One connected server generation for a revoke/reconcile operation. Endpoint
+/// and process checks stay in the transport; ownership decisions stay above it.
+pub(super) trait DesktopAcl {
+    fn server_start_time(&self) -> u64;
+    fn snapshot(&self) -> Result<X11AclSnapshot, String>;
+    fn remove(&self, uid: u32) -> (Result<(), String>, Result<X11AclSnapshot, String>);
+    fn verify(&self) -> Result<(), String>;
+}
+
+pub(super) struct ConnectedDesktopAcl {
+    socket: HostX11Socket,
+    connection: X11Connection,
+    server_start_time: u64,
+}
+
+impl ConnectedDesktopAcl {
+    pub(super) fn connect(socket: &HostX11Socket) -> Result<Self, String> {
+        let connection = connect_current_socket(socket)?;
+        Ok(Self {
+            socket: socket.clone(),
+            connection,
+            server_start_time: x11_peer_start_time(socket)?,
+        })
+    }
+}
+
+impl DesktopAcl for ConnectedDesktopAcl {
+    fn server_start_time(&self) -> u64 {
+        self.server_start_time
+    }
+
+    fn snapshot(&self) -> Result<X11AclSnapshot, String> {
+        let snapshot = read_acl(&self.connection, self.socket.display())?;
+        self.verify()?;
+        Ok(snapshot)
+    }
+
+    fn remove(&self, uid: u32) -> (Result<(), String>, Result<X11AclSnapshot, String>) {
+        remove_and_observe(&self.connection, self.socket.display(), uid)
+    }
+
+    fn verify(&self) -> Result<(), String> {
+        require_current_socket(&self.socket, "during X11 ACL operation")?;
+        if x11_peer_start_time(&self.socket)? != self.server_start_time {
+            return Err("X11 server process changed during ACL operation".into());
+        }
+        Ok(())
+    }
+}
+
 /// x11rb makes its stream nonblocking and waits through `Stream::poll`, so
 /// socket read/write timeouts do not limit setup or reply waits. Keep its
 /// wire/FD handling and give each setup/query/change an absolute deadline.

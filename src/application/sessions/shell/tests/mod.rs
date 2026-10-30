@@ -138,7 +138,7 @@ impl SessionPort for FallbackSessionPort {
             if let Some(host_socket) = environment.wayland_socket() {
                 self.prepare_wayland(WaylandPreparationRequest {
                     probe_id: request.id,
-                    target: ShellTarget::new(request.machine.clone(), user.clone()),
+                    target: GuestTarget::new(request.machine.clone(), user.clone()),
                     host_socket: host_socket.clone(),
                 })
                 .await
@@ -193,7 +193,7 @@ impl SessionPort for FallbackSessionPort {
 
 fn shell_intent(wayland: WaylandShellRequest) -> ShellOpenIntent {
     ShellOpenIntent::new(
-        ShellTarget::new(
+        GuestTarget::new(
             MachineName::new("demo").unwrap(),
             ValidatedGuestUserName::new("alice").unwrap(),
         ),
@@ -205,7 +205,7 @@ fn shell_intent(wayland: WaylandShellRequest) -> ShellOpenIntent {
 
 #[derive(Default)]
 struct RecordingX11Preparation {
-    calls: parking_lot::Mutex<Vec<(ShellTarget, X11SessionSelection)>>,
+    calls: parking_lot::Mutex<Vec<(GuestTarget, X11SessionSelection)>>,
     fail_projection: bool,
     fail_authorization: bool,
 }
@@ -250,7 +250,7 @@ fn x11_projection(display: u16) -> X11ProjectionContext {
 impl X11SessionPreparationPort for RecordingX11Preparation {
     async fn prepare_session(
         &self,
-        target: ShellTarget,
+        target: GuestTarget,
         selection: X11SessionSelection,
     ) -> Result<X11SessionPreparation, X11AccessError> {
         self.calls.lock().push((target.clone(), selection));

@@ -1,6 +1,6 @@
 use super::{
-    GuestCommand, JournalSessionHandle, JournalSessionRequest, SessionError, SessionPort,
-    ShellTarget, TerminalOpenError, TerminalSessionHandle, TerminalSessionRequest,
+    GuestCommand, GuestTarget, JournalSessionHandle, JournalSessionRequest, SessionError,
+    SessionPort, TerminalOpenError, TerminalSessionHandle, TerminalSessionRequest,
     TypedSessionEnvironment, WaylandPreparationRequest, WaylandSessionContext,
     X11ProjectionContext, X11ProjectionProbeRequest,
 };
@@ -52,7 +52,7 @@ impl SessionService {
 
     pub async fn test_wayland(
         &self,
-        target: ShellTarget,
+        target: GuestTarget,
         host_socket: crate::domain::wayland::HostWaylandSocket,
     ) -> Result<WaylandSessionContext, SessionError> {
         self.prepare_wayland(target, host_socket).await
@@ -60,7 +60,7 @@ impl SessionService {
 
     pub async fn test_x11_projection(
         &self,
-        target: ShellTarget,
+        target: GuestTarget,
         host_socket: crate::domain::x11::HostX11Socket,
     ) -> Result<X11ProjectionContext, SessionError> {
         self.port
@@ -86,7 +86,7 @@ impl SessionService {
 
     pub(super) async fn open_selected_user_terminal(
         &self,
-        target: &ShellTarget,
+        target: &GuestTarget,
         environment: TypedSessionEnvironment,
         command: Option<GuestCommand>,
         size: SessionSize,
@@ -114,7 +114,7 @@ impl SessionService {
 
     async fn prepare_wayland(
         &self,
-        target: ShellTarget,
+        target: GuestTarget,
         host_socket: crate::domain::wayland::HostWaylandSocket,
     ) -> Result<WaylandSessionContext, SessionError> {
         self.port

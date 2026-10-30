@@ -10,7 +10,7 @@ mod session;
 use std::path::PathBuf;
 
 use crate::adapters::elevated::ElevationMethod;
-use crate::application::sessions::{GuestCommand, ShellTarget, WaylandShellRequest};
+use crate::application::sessions::{GuestCommand, GuestTarget, WaylandShellRequest};
 
 pub(crate) use session::{report_command_error, run_launch, run_shell};
 
@@ -51,7 +51,7 @@ pub(crate) enum ShellIoMode {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ShellCommand {
     io_mode: ShellIoMode,
-    target: ShellTarget,
+    target: GuestTarget,
     wayland: WaylandShellRequest,
     x11: ShellX11Selection,
     command: Option<GuestCommand>,
@@ -60,7 +60,7 @@ pub(crate) struct ShellCommand {
 }
 
 impl ShellCommand {
-    pub(crate) fn target(&self) -> &ShellTarget {
+    pub(crate) fn target(&self) -> &GuestTarget {
         &self.target
     }
 

@@ -6,7 +6,7 @@ use ratatui::{
     Frame,
 };
 
-use crate::application::sessions::{ShellTarget, ValidatedGuestUserName};
+use crate::application::sessions::{GuestTarget, ValidatedGuestUserName};
 use crate::application::x11::{
     X11AccessCheck, X11AccessError, X11Authorization, X11GrantAssessmentStatus,
     X11MappedUidAclStatus,
@@ -43,17 +43,17 @@ pub(crate) enum X11AuthorizationDialogAction {
     Close,
     Check {
         generation: u64,
-        target: ShellTarget,
+        target: GuestTarget,
         host_socket: HostX11Socket,
     },
     Authorize {
         generation: u64,
-        target: ShellTarget,
+        target: GuestTarget,
         host_socket: HostX11Socket,
     },
     Revoke {
         generation: u64,
-        target: ShellTarget,
+        target: GuestTarget,
         host_socket: HostX11Socket,
         record_id: String,
     },
@@ -133,7 +133,14 @@ struct GrantAssessment {
     status: GrantStatus,
     history: Vec<GrantHistory>,
     diagnostics: Vec<String>,
-    records_complete: bool,
+    management_state_complete: bool,
+    revocation: RevocationAvailability,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RevocationAvailability {
+    Available { record_id: String },
+    Blocked { reason: String },
 }
 
 impl GrantAssessment {
@@ -175,21 +182,33 @@ impl GrantAssessment {
                 })
                 .collect(),
             diagnostics: assessment.diagnostics().to_vec(),
-            records_complete: assessment.records_complete(),
+            management_state_complete: assessment.management_state_complete(),
+            revocation: match assessment.revocation() {
+                crate::application::x11::X11RevocationAssessment::Available { record_id } => {
+                    RevocationAvailability::Available {
+                        record_id: record_id.clone(),
+                    }
+                }
+                crate::application::x11::X11RevocationAssessment::Blocked { reason } => {
+                    RevocationAvailability::Blocked {
+                        reason: reason.clone(),
+                    }
+                }
+            },
         }
     }
 }
 
 #[derive(Clone, Debug)]
 struct PendingAuthorization {
-    target: ShellTarget,
+    target: GuestTarget,
     host_socket: HostX11Socket,
     host_uid: u32,
 }
 
 #[derive(Clone, Debug)]
 struct PendingRevocation {
-    target: ShellTarget,
+    target: GuestTarget,
     host_socket: HostX11Socket,
     record_id: String,
     host_uid: u32,
@@ -537,13 +556,13 @@ impl X11AuthorizationDialog {
             .cloned()
     }
 
-    fn target(&mut self) -> Result<ShellTarget, String> {
+    fn target(&mut self) -> Result<GuestTarget, String> {
         let result = validate_guest_user(self.guest_user.value());
         self.user_error = result.as_ref().err().cloned();
         result?;
         let user = ValidatedGuestUserName::new(self.guest_user.value())
             .map_err(|error| error.to_string())?;
-        Ok(ShellTarget::new(self.machine.clone(), user))
+        Ok(GuestTarget::new(self.machine.clone(), user))
     }
 
     fn request_check(&mut self) -> X11AuthorizationDialogAction {
@@ -583,7 +602,7 @@ impl X11AuthorizationDialog {
             CheckState::Ready { check, assessment, .. }
                 if check.mapped_uid_status() == X11MappedUidAclStatus::ExactNumericEntryAbsent
                     && check.server_identity_trackable()
-                    && assessment.records_complete
+                    && assessment.management_state_complete
         ) && self.pending_authorization.is_none()
     }
 
@@ -591,7 +610,7 @@ impl X11AuthorizationDialog {
         matches!(
             &self.state,
             CheckState::Ready { assessment, .. }
-                if matches!(assessment.status, GrantStatus::Managed { .. })
+                if matches!(assessment.revocation, RevocationAvailability::Available { .. })
         ) && self.pending_revocation.is_none()
     }
 
@@ -632,7 +651,7 @@ impl X11AuthorizationDialog {
             check,
             assessment:
                 GrantAssessment {
-                    status: GrantStatus::Managed { record_id },
+                    revocation: RevocationAvailability::Available { record_id },
                     ..
                 },
             ..
@@ -774,7 +793,7 @@ impl X11AuthorizationDialog {
                         short_record_id(record_id)
                     ),
                     (_, Some(RevocationPresentation::AlreadyAbsent { record_id })) => format!(
-                        " Last action finalized already-absent record {}.",
+                        " Last action found the ACL entry for record {} already absent.",
                         short_record_id(record_id)
                     ),
                     (Some(AuthorizationPresentation::Added { record_id }), _) => format!(
@@ -931,10 +950,13 @@ fn grant_status(
         _ if !server_identity_trackable => {
             "X server peer is external to this PID namespace; Lasper will not manage ACL lifecycle for this display.".to_owned()
         }
-        GrantStatus::Managed { record_id } => format!(
-            "Exact localuser:#{host_uid} entry is managed by Lasper record {}.",
-            short_record_id(record_id)
-        ),
+        GrantStatus::Managed { record_id } => {
+            let availability = match &assessment.revocation {
+                RevocationAvailability::Available { .. } => "Revoke is available for this consumer.".to_owned(),
+                RevocationAvailability::Blocked { reason } => format!("Revoke unavailable: {reason}"),
+            };
+            format!("Exact localuser:#{host_uid} entry is managed by Lasper record {}. {availability}", short_record_id(record_id))
+        },
         GrantStatus::PreExisting => {
             format!("Exact localuser:#{host_uid} entry is present but is external/unmanaged.")
         }

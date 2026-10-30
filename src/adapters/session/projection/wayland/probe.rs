@@ -1,13 +1,15 @@
 //! Fixed Wayland identity/access probe using the shared guest probe core.
 
+use crate::application::sessions::execution::{GuestEnvironment, GuestExecutionRequest};
 use std::path::Path;
 
 use crate::application::sessions::{
-    ObservedGuestIdentity, SessionError, TerminalSessionHandle, ValidatedGuestUserName,
+    GuestCommand, GuestTarget, ObservedGuestIdentity, SessionError, TerminalSessionHandle,
+    ValidatedGuestUserName,
 };
 use crate::domain::machine::MachineName;
 
-use super::probe::{
+use crate::adapters::session::projection::probe::{
     guest_script, validate_absolute_path, ProbePathError, ProbeProtocol, SocketObservation,
 };
 
@@ -50,26 +52,26 @@ impl WaylandProbeRequest {
         })
     }
 
-    pub(crate) fn machine(&self) -> &MachineName {
-        &self.machine
+    pub(crate) fn execution_request(&self) -> Result<GuestExecutionRequest, SessionError> {
+        let command = self.command()?;
+        Ok(GuestExecutionRequest::command(
+            GuestTarget::new(self.machine.clone(), self.user.clone()),
+            GuestEnvironment::Probe,
+            command,
+        ))
     }
 
-    pub(crate) fn user(&self) -> &ValidatedGuestUserName {
-        &self.user
-    }
-
-    pub(crate) fn path(&self) -> &'static str {
-        "/bin/sh"
-    }
-
-    pub(crate) fn args(&self) -> Vec<String> {
-        vec![
-            "/bin/sh".into(),
-            "-c".into(),
-            guest_script(PROTOCOL.magic, WAYLAND_PROBE_BODY),
-            "lasper-wayland-probe".into(),
-            self.target.clone(),
-        ]
+    fn command(&self) -> Result<GuestCommand, SessionError> {
+        GuestCommand::new(
+            "/bin/sh",
+            vec![
+                "-c".into(),
+                guest_script(PROTOCOL.magic, WAYLAND_PROBE_BODY),
+                "lasper-wayland-probe".into(),
+                self.target.clone(),
+            ],
+        )
+        .map_err(|error| SessionError::new(format!("build Wayland probe command: {error}")))
     }
 }
 
@@ -96,7 +98,7 @@ fn parse_wayland_probe(bytes: &[u8]) -> Result<WaylandProbeObservation, SessionE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapters::session::probe::SocketAccess;
+    use crate::adapters::session::projection::probe::SocketAccess;
     use crate::application::sessions::terminal_session_channel;
     use crate::domain::session::{SessionId, TerminalAttachmentKind};
     use std::os::unix::fs::MetadataExt;
@@ -131,8 +133,16 @@ mod tests {
         let path = runtime.path().join("custom.sock");
         let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         let request = WaylandProbeRequest::target(machine(), user(), &path).unwrap();
-        let output = std::process::Command::new(request.path())
-            .args(&request.args()[1..])
+        let execution = request.execution_request().unwrap();
+        assert_eq!(execution.target(), &GuestTarget::new(machine(), user()));
+        assert_eq!(execution.environment(), &GuestEnvironment::Probe);
+        let crate::application::sessions::execution::GuestProcess::Command(command) =
+            execution.process()
+        else {
+            panic!("a probe must execute its fixed command");
+        };
+        let output = std::process::Command::new(command.program())
+            .args(command.args())
             .output()
             .unwrap();
         assert!(
@@ -156,12 +166,13 @@ mod tests {
         let path = runtime.path().join("socket");
         let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         let request = WaylandProbeRequest::target(machine(), user(), &path).unwrap();
-        let mut args = request.args();
+        let command = request.command().unwrap();
+        let mut args = command.args().to_vec();
         // The socket exists and is writable, but its metadata becomes
         // unavailable at the syscall boundary (for example during an unmount).
-        args[2] = format!("stat() {{ return 1; }}\n{}", args[2]);
-        let output = std::process::Command::new(request.path())
-            .args(&args[1..])
+        args[1] = format!("stat() {{ return 1; }}\n{}", args[1]);
+        let output = std::process::Command::new(command.program())
+            .args(&args)
             .output()
             .unwrap();
         assert!(output.status.success());
@@ -203,12 +214,13 @@ mod tests {
             Path::new("/run/lasper/wayland/1000/wayland-0"),
         )
         .unwrap();
-        assert_eq!(target.path(), "/bin/sh");
-        assert_eq!(target.args().len(), 5);
-        assert_eq!(&target.args()[..2], ["/bin/sh", "-c"]);
-        assert!(target.args()[2].contains("/proc/self/status"));
+        let command = target.command().unwrap();
+        assert_eq!(command.program(), "/bin/sh");
+        assert_eq!(command.args().len(), 4);
+        assert_eq!(command.args()[0], "-c");
+        assert!(command.args()[1].contains("/proc/self/status"));
         assert_eq!(
-            target.args().last().map(String::as_str),
+            command.args().last().map(String::as_str),
             Some("/run/lasper/wayland/1000/wayland-0")
         );
     }

@@ -1,16 +1,21 @@
 mod contract;
+pub(crate) mod execution;
 mod service;
 mod shell;
 
 #[allow(unused_imports)]
 pub use contract::{
-    GuestCommand, GuestCommandError, GuestUserNameError, InteractiveShellEnvironment,
-    InteractiveShellEnvironmentError, JournalSessionHandle, JournalSessionRequest,
-    MappedGuestIdentity, ObservedGuestIdentity, ObservedMachineInstance, ObservedNamespaceIdentity,
-    SessionError, SessionPort, SessionSendStatus, ShellOpenError, ShellOpenIntent, ShellTarget,
-    TerminalOpenError, TerminalSessionHandle, TerminalSessionInput, TerminalSessionRequest,
-    ValidatedGuestUserName, WaylandPreparationRequest, WaylandSessionContext, WaylandShellRequest,
-    X11FilesystemAccess, X11ProjectionContext, X11ProjectionProbeRequest, X11SessionContext,
+    JournalSessionHandle, JournalSessionRequest, SessionError, SessionPort, SessionSendStatus,
+    ShellOpenError, ShellOpenIntent, TerminalOpenError, TerminalSessionHandle,
+    TerminalSessionInput, TerminalSessionRequest, WaylandPreparationRequest, WaylandSessionContext,
+    WaylandShellRequest, X11FilesystemAccess, X11ProjectionContext, X11ProjectionProbeRequest,
+    X11SessionContext,
+};
+#[allow(unused_imports)]
+pub use execution::{
+    GuestCommand, GuestCommandError, GuestTarget, GuestUserNameError, InteractiveShellEnvironment,
+    InteractiveShellEnvironmentError, MappedGuestIdentity, ObservedGuestIdentity,
+    ObservedMachineInstance, ObservedNamespaceIdentity, ValidatedGuestUserName,
 };
 pub use service::SessionService;
 #[allow(unused_imports)]

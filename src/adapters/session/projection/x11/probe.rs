@@ -3,15 +3,16 @@
 //! Host UID mapping and X server ACL inspection stay outside the guest.
 //! Framing, socket observations, and PTY collection use the shared probe core.
 
+use crate::application::sessions::execution::{GuestEnvironment, GuestExecutionRequest};
 use std::path::Path;
 
 use crate::application::sessions::{
-    ObservedGuestIdentity, ObservedNamespaceIdentity, SessionError, TerminalSessionHandle,
-    ValidatedGuestUserName,
+    GuestCommand, GuestTarget, ObservedGuestIdentity, ObservedNamespaceIdentity, SessionError,
+    TerminalSessionHandle, ValidatedGuestUserName,
 };
 use crate::domain::machine::MachineName;
 
-use super::probe::{
+use crate::adapters::session::projection::probe::{
     guest_script, validate_absolute_path, ProbePathError, ProbeProtocol, SocketObservation,
 };
 
@@ -65,27 +66,27 @@ impl X11ProjectionProbeRequest {
         })
     }
 
-    pub(crate) fn machine(&self) -> &MachineName {
-        &self.machine
+    pub(crate) fn execution_request(&self) -> Result<GuestExecutionRequest, SessionError> {
+        let command = self.command()?;
+        Ok(GuestExecutionRequest::command(
+            GuestTarget::new(self.machine.clone(), self.user.clone()),
+            GuestEnvironment::Probe,
+            command,
+        ))
     }
 
-    pub(crate) fn user(&self) -> &ValidatedGuestUserName {
-        &self.user
-    }
-
-    pub(crate) fn path(&self) -> &'static str {
-        "/bin/sh"
-    }
-
-    pub(crate) fn args(&self) -> Vec<String> {
-        vec![
-            "/bin/sh".into(),
-            "-c".into(),
-            guest_script(PROTOCOL.magic, X11_PROBE_BODY),
-            "lasper-x11-projection-probe".into(),
-            self.mount_target.clone(),
-            self.client_path.clone(),
-        ]
+    fn command(&self) -> Result<GuestCommand, SessionError> {
+        GuestCommand::new(
+            "/bin/sh",
+            vec![
+                "-c".into(),
+                guest_script(PROTOCOL.magic, X11_PROBE_BODY),
+                "lasper-x11-projection-probe".into(),
+                self.mount_target.clone(),
+                self.client_path.clone(),
+            ],
+        )
+        .map_err(|error| SessionError::new(format!("build X11 projection probe command: {error}")))
     }
 }
 
@@ -123,7 +124,7 @@ fn parse_x11_probe(bytes: &[u8]) -> Result<X11ProjectionProbeObservation, Sessio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapters::session::probe::SocketAccess;
+    use crate::adapters::session::projection::probe::SocketAccess;
     use crate::domain::session::{SessionId, TerminalAttachmentKind};
     use std::os::unix::fs::MetadataExt;
     use std::time::Duration;
@@ -144,8 +145,16 @@ mod tests {
         let _mount_listener = std::os::unix::net::UnixListener::bind(&mount).unwrap();
         std::os::unix::fs::symlink(&mount, &client).unwrap();
         let request = X11ProjectionProbeRequest::new(machine(), user(), &mount, &client).unwrap();
-        let output = std::process::Command::new(request.path())
-            .args(&request.args()[1..])
+        let execution = request.execution_request().unwrap();
+        assert_eq!(execution.target(), &GuestTarget::new(machine(), user()));
+        assert_eq!(execution.environment(), &GuestEnvironment::Probe);
+        let crate::application::sessions::execution::GuestProcess::Command(command) =
+            execution.process()
+        else {
+            panic!("a probe must execute its fixed command");
+        };
+        let output = std::process::Command::new(command.program())
+            .args(command.args())
             .output()
             .unwrap();
         assert!(output.status.success());
@@ -186,8 +195,9 @@ mod tests {
             (0o600, SocketAccess::Accessible),
         ] {
             std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(mode)).unwrap();
-            let output = std::process::Command::new(request.path())
-                .args(&request.args()[1..])
+            let command = request.command().unwrap();
+            let output = std::process::Command::new(command.program())
+                .args(command.args())
                 .output()
                 .unwrap();
             assert!(output.status.success());
@@ -273,13 +283,14 @@ mod tests {
         let path = runtime.path().join("socket");
         let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         let request = X11ProjectionProbeRequest::new(machine(), user(), &path, &path).unwrap();
-        let mut args = request.args();
-        args[2] = format!(
+        let command = request.command().unwrap();
+        let mut args = command.args().to_vec();
+        args[1] = format!(
             "probe_test_path=$1\nstat() {{\n    if [ \"$4\" = \"$probe_test_path\" ]; then return 1; fi\n    command stat \"$@\"\n}}\n{}",
-            args[2]
+            args[1]
         );
-        let output = std::process::Command::new(request.path())
-            .args(&args[1..])
+        let output = std::process::Command::new(command.program())
+            .args(&args)
             .output()
             .unwrap();
         assert!(output.status.success());
@@ -299,10 +310,11 @@ mod tests {
             Path::new("/tmp/.X11-unix/X0"),
         )
         .unwrap();
-        let mut args = request.args();
-        args[2] = format!("stat() {{ return 1; }}\n{}", args[2]);
-        let output = std::process::Command::new(request.path())
-            .args(&args[1..])
+        let command = request.command().unwrap();
+        let mut args = command.args().to_vec();
+        args[1] = format!("stat() {{ return 1; }}\n{}", args[1]);
+        let output = std::process::Command::new(command.program())
+            .args(&args)
             .output()
             .unwrap();
         assert!(output.status.success());
@@ -322,10 +334,11 @@ mod tests {
             Path::new("/tmp/.X11-unix/X0"),
         )
         .unwrap();
-        assert_eq!(request.path(), "/bin/sh");
-        assert_eq!(request.args().len(), 6);
-        assert_eq!(request.args()[4], "/mnt/x11/X0");
-        assert_eq!(request.args()[5], "/tmp/.X11-unix/X0");
+        let command = request.command().unwrap();
+        assert_eq!(command.program(), "/bin/sh");
+        assert_eq!(command.args().len(), 5);
+        assert_eq!(command.args()[3], "/mnt/x11/X0");
+        assert_eq!(command.args()[4], "/tmp/.X11-unix/X0");
         assert!(X11ProjectionProbeRequest::new(
             machine(),
             user(),

@@ -21,7 +21,7 @@ use std::sync::Arc;
 pub(crate) struct SessionContext {
     pub(super) params: Value,
     pub(super) sessions: Arc<SessionRegistry>,
-    pub(super) machine: crate::adapters::session::MachineSessionTransport,
+    pub(super) machine: crate::adapters::session::NativeExecution,
     pub(super) invoking_uid: u32,
 }
 
@@ -53,7 +53,7 @@ pub(crate) async fn handle(method: RpcMethod, context: SessionContext) -> Handle
                 .prepare(crate::application::sessions::WaylandPreparationRequest {
                     probe_id: crate::domain::session::SessionId::new(params.probe_id.get())
                         .expect("wire session id is non-zero"),
-                    target: crate::application::sessions::ShellTarget::new(
+                    target: crate::application::sessions::GuestTarget::new(
                         params.machine,
                         params.user,
                     ),
@@ -83,7 +83,7 @@ pub(crate) async fn handle(method: RpcMethod, context: SessionContext) -> Handle
                 .probe(crate::application::sessions::X11ProjectionProbeRequest {
                     probe_id: crate::domain::session::SessionId::new(params.probe_id.get())
                         .expect("wire session id is non-zero"),
-                    target: crate::application::sessions::ShellTarget::new(
+                    target: crate::application::sessions::GuestTarget::new(
                         params.machine,
                         params.user,
                     ),

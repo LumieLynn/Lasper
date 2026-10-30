@@ -1,38 +1,26 @@
-//! Session adapter graph.
+//! Session delivery, guest execution, and startup-bind validation.
 //!
-//! `wayland` and `x11` resolve startup-configured projections. Their fixed
-//! guest requests share `probe` for framing, collection, and filesystem
-//! observations; `machine` is the route-fixed execution boundary. The latter
-//! produces either a native D-Bus PTY (`runtime::dbus`) or a `machinectl`
-//! command (`runtime::systemd_tools`). `terminal_attach` builds machinectl PTY
-//! commands; `terminal_io` owns the process-level I/O bridges.
+//! Direct and elevated adapters implement the application session port. Shell
+//! preparation combines display projections before execution; [`execution`]
+//! selects the native provider, and [`io`] owns PTY and caller-terminal bridges.
+//! [`projection`] validates existing X11/Wayland binds with shared guest probes.
 
 mod direct;
 mod elevated;
-mod instance;
-mod machine;
-mod probe;
-mod pty;
-pub(crate) mod terminal_attach;
-pub(crate) mod terminal_io;
-mod wayland;
-mod wayland_probe;
-mod x11;
-mod x11_probe;
+mod execution;
+pub(crate) mod io;
+mod projection;
+mod shell;
 
 use crate::application::sessions::{SessionPort, SessionService};
 use std::sync::Arc;
 
 pub(crate) use direct::DirectSessionAdapter;
 pub(crate) use elevated::ElevatedSessionAdapter;
-pub(crate) use machine::{
-    MachinePty, MachineSessionOpening, MachineSessionRequest, MachineSessionTransport,
-    MachineShellEnvironment, MachineShellRequest,
-};
-pub(crate) use wayland::WaylandSessionResolver;
-pub(crate) use wayland_probe::WaylandProbeRequest;
-pub(crate) use x11::X11SessionResolver;
-pub(crate) use x11_probe::X11ProjectionProbeRequest;
+pub(crate) use execution::{NativeExecution, NativeSession};
+pub(crate) use io::MachinePty;
+pub(crate) use projection::{WaylandSessionResolver, X11SessionResolver};
+pub(crate) use shell::SelectedUserShell;
 
 /// Adapts the selected session transport to the narrow projection capability
 /// consumed by X11 access management. Keeping this adapter in composition
@@ -51,7 +39,7 @@ impl X11ProjectionAdapter {
 impl crate::application::x11::X11ProjectionPort for X11ProjectionAdapter {
     async fn probe(
         &self,
-        target: crate::application::sessions::ShellTarget,
+        target: crate::application::sessions::GuestTarget,
         host_socket: crate::domain::x11::HostX11Socket,
     ) -> Result<
         crate::application::sessions::X11ProjectionContext,
@@ -63,7 +51,7 @@ impl crate::application::x11::X11ProjectionPort for X11ProjectionAdapter {
 
 pub(crate) enum SessionRoute {
     Direct {
-        machine: MachineSessionTransport,
+        machine: NativeExecution,
         nspawn: crate::adapters::config::NspawnConfigStore,
     },
     Elevated {

@@ -1,7 +1,7 @@
 //! Embedded selected-user shell prompt and terminal bridge.
 
 use crate::application::sessions::{
-    InteractiveShellEnvironment, SessionService, ShellLaunchError, ShellLaunchRequest, ShellTarget,
+    GuestTarget, InteractiveShellEnvironment, SessionService, ShellLaunchError, ShellLaunchRequest,
     TerminalCommand, TerminalSessionEndpoint, TerminalSessionHandle, ValidatedGuestUserName,
     WaylandShellRequest,
 };
@@ -108,7 +108,7 @@ pub(super) async fn run_builtin_shell_prompt(
                                         &service,
                                         &mode,
                                         ShellEntryRequest {
-                                            target: ShellTarget::new(machine.clone(), user),
+                                            target: GuestTarget::new(machine.clone(), user),
                                             size,
                                         },
                                         ShellBridge {
@@ -168,7 +168,7 @@ enum ShellEntryResult {
 }
 
 struct ShellEntryRequest {
-    target: ShellTarget,
+    target: GuestTarget,
     size: SessionSize,
 }
 
@@ -366,7 +366,7 @@ mod tests {
 
     fn prompt_service() -> Arc<SessionService> {
         Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
-            crate::adapters::session::MachineSessionTransport::SystemdTools,
+            crate::adapters::session::NativeExecution::SystemdTools,
             crate::adapters::config::NspawnConfigStore::direct(),
         ))))
     }

@@ -209,7 +209,7 @@ fn x11_check_with_access(
             .collect(),
     );
     crate::application::x11::X11AccessCheck::from_observations(
-        crate::application::sessions::ShellTarget::new(
+        crate::application::sessions::GuestTarget::new(
             MachineName::new("archlinux").unwrap(),
             crate::application::sessions::ValidatedGuestUserName::new("alice").unwrap(),
         ),
@@ -267,7 +267,7 @@ fn begin_x11_access_check(
     guest_user: &str,
 ) -> (
     u64,
-    crate::application::sessions::ShellTarget,
+    crate::application::sessions::GuestTarget,
     HostX11Socket,
 ) {
     assert_eq!(

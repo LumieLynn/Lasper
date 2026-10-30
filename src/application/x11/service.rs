@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::application::sessions::{SessionError, ShellTarget, X11ProjectionContext};
+use crate::application::sessions::{GuestTarget, SessionError, X11ProjectionContext};
 use crate::domain::x11::HostX11Socket;
 
 use super::access::{
@@ -27,7 +27,7 @@ const MACHINE_LIFECYCLE_RECONCILE_ATTEMPTS: usize = 3;
 pub(crate) trait X11ProjectionPort: Send + Sync {
     async fn probe(
         &self,
-        target: ShellTarget,
+        target: GuestTarget,
         host_socket: HostX11Socket,
     ) -> Result<X11ProjectionContext, SessionError>;
 }
@@ -45,7 +45,7 @@ pub struct X11AccessService {
 impl X11SessionPreparationPort for X11AccessService {
     async fn prepare_session(
         &self,
-        target: ShellTarget,
+        target: GuestTarget,
         selection: X11SessionSelection,
     ) -> Result<X11SessionPreparation, X11AccessError> {
         X11AccessService::prepare_session(self, target, selection).await
@@ -67,15 +67,21 @@ impl X11AccessService {
 
     pub async fn check(
         &self,
-        target: ShellTarget,
+        target: GuestTarget,
         socket: HostX11Socket,
     ) -> Result<X11AccessCheck, X11AccessError> {
-        let (projection, observation) = tokio::join!(
-            self.projection.probe(target.clone(), socket.clone()),
-            self.desktop.snapshot(&socket),
-        );
-        let projection = projection.map_err(X11AccessError::Projection)?;
-        let observation = observation.map_err(X11AccessError::Desktop)?;
+        let projection = self
+            .projection
+            .probe(target.clone(), socket)
+            .await
+            .map_err(X11AccessError::Projection)?;
+        // The desktop read also assesses revocation for this exact consumer;
+        // it therefore needs the verified projection, not only a host socket.
+        let observation = self
+            .desktop
+            .snapshot(&target, &projection)
+            .await
+            .map_err(X11AccessError::Desktop)?;
         Ok(X11AccessCheck::from_desktop_observation(
             target,
             projection,
@@ -85,7 +91,7 @@ impl X11AccessService {
 
     pub async fn authorize(
         &self,
-        target: ShellTarget,
+        target: GuestTarget,
         socket: HostX11Socket,
     ) -> Result<X11Authorization, X11AccessError> {
         let projection = self
@@ -117,7 +123,7 @@ impl X11AccessService {
     /// only after one startup-configured projection has been proven usable.
     pub async fn prepare_session(
         &self,
-        target: ShellTarget,
+        target: GuestTarget,
         selection: X11SessionSelection,
     ) -> Result<X11SessionPreparation, X11AccessError> {
         let projection = self
@@ -129,7 +135,7 @@ impl X11AccessService {
 
     async fn prepare_resolved_session(
         &self,
-        target: ShellTarget,
+        target: GuestTarget,
         projection: X11ProjectionContext,
     ) -> Result<X11SessionPreparation, X11AccessError> {
         let request =
@@ -158,7 +164,7 @@ impl X11AccessService {
 
     async fn resolve_session_projection(
         &self,
-        target: ShellTarget,
+        target: GuestTarget,
         selection: X11SessionSelection,
     ) -> Result<X11ProjectionContext, X11AccessError> {
         let catalog = self.endpoints.discover(&[]).await;
@@ -189,7 +195,7 @@ impl X11AccessService {
 
     pub async fn revoke(
         &self,
-        target: ShellTarget,
+        target: GuestTarget,
         socket: HostX11Socket,
         record_id: String,
     ) -> Result<X11Revocation, X11AccessError> {

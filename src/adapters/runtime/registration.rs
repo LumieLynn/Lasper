@@ -31,35 +31,27 @@ pub(crate) fn leader_pid_at(path: &Path, expected_name: &str) -> std::io::Result
     parse_leader_pid(&fields)
 }
 
-/// Read the kernel identity of the machine currently registered under a name.
-/// The registration supplies the leader PID; procfs supplies its start time
-/// and, when permitted, namespace identities. A PID alone is not a revision.
+/// Pin a registration to the leader's process generation. Re-read both sides
+/// so a restart during observation is retried instead of attributed to either
+/// instance. Namespace identities are optional when procfs denies access.
 pub(crate) fn machine_instance_at(
     path: &Path,
     expected_name: &str,
 ) -> std::io::Result<ObservedMachineInstance> {
-    let fields = read_runtime_state(path, expected_name)?;
-    let leader = parse_leader_pid(&fields)?;
+    let leader = leader_pid_at(path, expected_name)?;
     let before = observe_machine_instance(leader)?;
-
-    // Read the registration again after procfs inspection. A replacement can
-    // reuse a PID, so the process identity and the registration leader must
-    // both remain stable across the observation.
-    let current_fields = read_runtime_state(path, expected_name)?;
-    if parse_leader_pid(&current_fields)? != leader {
+    if leader_pid_at(path, expected_name)? != leader {
         return Err(std::io::Error::new(
             ErrorKind::NotFound,
             "machine leader changed during registration inspection",
         ));
     }
-    let after = observe_machine_instance(leader)?;
-    if before != after {
+    if observe_machine_instance(leader)? != before {
         return Err(std::io::Error::new(
             ErrorKind::NotFound,
             "machine process identity changed during registration inspection",
         ));
     }
-
     Ok(before)
 }
 

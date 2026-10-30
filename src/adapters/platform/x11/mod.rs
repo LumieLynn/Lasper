@@ -12,6 +12,7 @@ mod activation;
 mod common;
 mod discovery;
 mod lifecycle;
+mod ownership;
 mod state;
 mod transport;
 
@@ -20,6 +21,7 @@ mod lifecycle_tests;
 #[cfg(test)]
 mod tests;
 
+use crate::application::sessions::{GuestTarget, X11ProjectionContext};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -118,10 +120,12 @@ impl X11DesktopAccessPort for HostX11DesktopAccess {
 
     async fn snapshot(
         &self,
-        socket: &HostX11Socket,
+        target: &GuestTarget,
+        projection: &X11ProjectionContext,
     ) -> Result<X11DesktopObservation, X11DesktopAccessError> {
-        let socket = socket.clone();
-        tokio::task::spawn_blocking(move || access::snapshot_desktop_sync(&socket))
+        let target = target.clone();
+        let projection = projection.clone();
+        tokio::task::spawn_blocking(move || access::snapshot_desktop_sync(&target, &projection))
             .await
             .map_err(|error| {
                 X11DesktopAccessError::new(format!("X11 ACL query task failed: {error}"))

@@ -11,7 +11,7 @@ pub(crate) mod query;
 
 pub(super) use connection::run_rpc_request_pump;
 
-use crate::adapters::session::MachineSessionTransport;
+use crate::adapters::session::NativeExecution;
 use crate::adapters::trusted_state::TrustedStateRoot;
 use crate::daemon::dispatch::backend::{DaemonRuntimeQueries, DaemonSystemExecutor};
 use crate::daemon::server::DaemonServerState;
@@ -29,7 +29,7 @@ pub(super) struct Dispatcher<B> {
     pub(super) invoking_uid: u32,
     pub(super) server_state: Arc<DaemonServerState>,
     pub(super) trusted_state_root: TrustedStateRoot,
-    pub(super) machine_sessions: MachineSessionTransport,
+    pub(super) machine_sessions: NativeExecution,
 }
 
 impl<B: DaemonRuntimeQueries + DaemonSystemExecutor> Dispatcher<B> {

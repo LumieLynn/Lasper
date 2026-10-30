@@ -4,28 +4,27 @@
 //! desktop user. This resolver runs only the bounded guest observation and
 //! host-side machine-instance mapping needed by either runtime route.
 
-use super::instance::MachineInstanceSnapshot;
-use super::probe::SocketAccess;
-use super::x11_probe::{
-    X11ProjectionProbeObservation, X11ProjectionProbeRequest as MachineX11ProbeRequest,
-};
-use super::{MachineSessionRequest, MachineSessionTransport};
+mod probe;
+
 use crate::adapters::config::NspawnConfigStore;
+use crate::adapters::session::execution::{MachineInstanceSnapshot, NativeExecution};
+use crate::adapters::session::projection::probe::SocketAccess;
 use crate::application::sessions::{
     SessionError, TerminalSessionHandle, X11FilesystemAccess, X11ProjectionContext,
     X11ProjectionProbeRequest,
 };
 use crate::domain::session::SessionSize;
+use probe::{X11ProjectionProbeObservation, X11ProjectionProbeRequest as MachineX11ProbeRequest};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone)]
 pub(crate) struct X11SessionResolver {
-    machine: MachineSessionTransport,
+    machine: NativeExecution,
     nspawn: NspawnConfigStore,
 }
 
 impl X11SessionResolver {
-    pub(crate) fn new(machine: MachineSessionTransport, nspawn: NspawnConfigStore) -> Self {
+    pub(crate) fn new(machine: NativeExecution, nspawn: NspawnConfigStore) -> Self {
         Self { machine, nspawn }
     }
 
@@ -165,21 +164,18 @@ fn validate_socket_access(
 }
 
 async fn run_probe(
-    machine: &MachineSessionTransport,
+    machine: &NativeExecution,
     request: MachineX11ProbeRequest,
     id: crate::domain::session::SessionId,
 ) -> Result<X11ProjectionProbeObservation, SessionError> {
     let size = SessionSize::new(80, 24).expect("fixed probe PTY size is valid");
     let mut handle: TerminalSessionHandle = machine
-        .open_local(
-            MachineSessionRequest::x11_projection_probe(request),
-            id,
-            size,
-        )
-        .await?;
-    super::x11_probe::collect_x11_probe(&mut handle)
+        .open_local(request.execution_request()?, id, size)
         .await
-        .map_err(|error| SessionError::new(format!("X11 projection probe failed: {error}")))
+        .map_err(|error| error.context("open X11 projection probe"))?;
+    probe::collect_x11_probe(&mut handle)
+        .await
+        .map_err(|error| error.context("X11 projection probe failed"))
 }
 
 fn projection_not_configured() -> SessionError {
@@ -192,7 +188,7 @@ fn projection_not_configured() -> SessionError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapters::session::probe::SocketObservation;
+    use crate::adapters::session::projection::probe::SocketObservation;
 
     fn observation(
         mount: SocketObservation,

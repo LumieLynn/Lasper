@@ -64,18 +64,16 @@ pub(crate) async fn run_shell(
     } = command;
     let uses_wayland = !matches!(&wayland, WaylandShellRequest::Disabled);
     let size = match io_mode {
-        ShellIoMode::Interactive => {
-            match crate::adapters::session::terminal_io::inherited_terminal_size() {
-                Ok(size) => size,
-                Err(error) => {
-                    return Err(ShellCommandError::Terminal {
-                        context: "cannot attach the interactive terminal",
-                        error,
-                    })
-                }
+        ShellIoMode::Interactive => match crate::adapters::session::io::inherited_terminal_size() {
+            Ok(size) => size,
+            Err(error) => {
+                return Err(ShellCommandError::Terminal {
+                    context: "cannot attach the interactive terminal",
+                    error,
+                })
             }
-        }
-        ShellIoMode::Launcher => crate::adapters::session::terminal_io::launcher_terminal_size(),
+        },
+        ShellIoMode::Launcher => crate::adapters::session::io::launcher_terminal_size(),
     };
     let x11 = match x11 {
         ShellX11Selection::Disabled => None,
@@ -116,11 +114,9 @@ pub(crate) async fn run_shell(
     };
     let result = match io_mode {
         ShellIoMode::Interactive => {
-            crate::adapters::session::terminal_io::run_inherited_terminal(handle, !quiet).await
+            crate::adapters::session::io::run_inherited_terminal(handle, !quiet).await
         }
-        ShellIoMode::Launcher => {
-            crate::adapters::session::terminal_io::run_launcher_terminal(handle).await
-        }
+        ShellIoMode::Launcher => crate::adapters::session::io::run_launcher_terminal(handle).await,
     };
     result.map_err(|error| ShellCommandError::Terminal {
         context: match io_mode {
@@ -228,7 +224,7 @@ fn wayland_fallback_notice(quiet: bool, fallback_used: bool) -> Option<&'static 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::application::sessions::{GuestCommand, ShellTarget};
+    use crate::application::sessions::{GuestCommand, GuestTarget};
     use crate::cli::parse::{parse, Invocation};
     use crate::cli::CliDispatch;
     use crate::domain::machine::MachineName;
@@ -333,7 +329,7 @@ mod tests {
     impl X11SessionPreparationPort for UnusedX11Preparation {
         async fn prepare_session(
             &self,
-            _target: ShellTarget,
+            _target: GuestTarget,
             _selection: X11SessionSelection,
         ) -> Result<X11SessionPreparation, X11AccessError> {
             panic!("launch must not authorize X11 before machine readiness")

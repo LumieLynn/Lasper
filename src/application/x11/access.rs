@@ -1,14 +1,13 @@
 //! Requests, results, and the caller-owned desktop ACL port.
 
 use super::lifecycle::{X11ReconcileReport, X11ReconcileTarget};
-use crate::application::sessions::{SessionError, ShellTarget, X11ProjectionContext};
-use crate::domain::x11::HostX11Socket;
+use crate::application::sessions::{GuestTarget, SessionError, X11ProjectionContext};
 
 use super::grants::{X11AccessCheck, X11DesktopObservation};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct X11AuthorizationRequest {
-    target: ShellTarget,
+    target: GuestTarget,
     projection: X11ProjectionContext,
     purpose: X11AuthorizationPurpose,
 }
@@ -21,14 +20,14 @@ pub(crate) enum X11AuthorizationPurpose {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct X11RevokeRequest {
-    target: ShellTarget,
+    target: GuestTarget,
     projection: X11ProjectionContext,
     record_id: String,
 }
 
 impl X11RevokeRequest {
     pub(crate) fn new(
-        target: ShellTarget,
+        target: GuestTarget,
         projection: X11ProjectionContext,
         record_id: String,
     ) -> Self {
@@ -39,7 +38,7 @@ impl X11RevokeRequest {
         }
     }
 
-    pub(crate) fn target(&self) -> &ShellTarget {
+    pub(crate) fn target(&self) -> &GuestTarget {
         &self.target
     }
 
@@ -53,7 +52,7 @@ impl X11RevokeRequest {
 }
 
 impl X11AuthorizationRequest {
-    pub(crate) fn new(target: ShellTarget, projection: X11ProjectionContext) -> Self {
+    pub(crate) fn new(target: GuestTarget, projection: X11ProjectionContext) -> Self {
         Self {
             target,
             projection,
@@ -62,7 +61,7 @@ impl X11AuthorizationRequest {
     }
 
     pub(crate) fn for_explicit_session(
-        target: ShellTarget,
+        target: GuestTarget,
         projection: X11ProjectionContext,
     ) -> Self {
         Self {
@@ -72,7 +71,7 @@ impl X11AuthorizationRequest {
         }
     }
 
-    pub(crate) fn target(&self) -> &ShellTarget {
+    pub(crate) fn target(&self) -> &GuestTarget {
         &self.target
     }
 
@@ -198,7 +197,8 @@ pub(crate) trait X11DesktopAccessPort: Send + Sync {
 
     async fn snapshot(
         &self,
-        socket: &HostX11Socket,
+        target: &GuestTarget,
+        projection: &X11ProjectionContext,
     ) -> Result<X11DesktopObservation, X11DesktopAccessError>;
 
     async fn ensure(

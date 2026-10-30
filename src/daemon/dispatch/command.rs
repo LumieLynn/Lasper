@@ -281,11 +281,13 @@ async fn validate_runtime_target<B: DaemonRuntimeQueries>(
                 })?
         }
         MachineControlTransport::SystemdTools => {
-            crate::adapters::runtime::state::list_machines_at(crate::paths::runtime_machines_dir())
-                .await
-                .map_err(|error| MachineControlOutcome::NotAttempted {
-                    reason: format!("could not verify machine registration: {error}"),
-                })?
+            crate::adapters::runtime::registration::list_machines_at(
+                crate::paths::runtime_machines_dir(),
+            )
+            .await
+            .map_err(|error| MachineControlOutcome::NotAttempted {
+                reason: format!("could not verify machine registration: {error}"),
+            })?
         }
     };
 

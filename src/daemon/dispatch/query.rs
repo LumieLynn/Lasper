@@ -33,13 +33,14 @@ pub(super) async fn handle<B: DaemonRuntimeQueries>(
 
         RpcMethod::SystemdToolsInspectMachine => {
             let inspection: InspectMachineRequest = decode_params(method, params)?;
-            let properties = crate::adapters::runtime::systemd_tools::get_properties_with_runner(
-                inspection.machine.as_str(),
-                inspection.include_nspawn_unit,
-                &crate::adapters::process::DefaultCommandRunner,
-            )
-            .await
-            .map_err(|error| error.to_string())?;
+            let properties =
+                crate::adapters::runtime::systemd_tools::query::get_properties_with_runner(
+                    inspection.machine.as_str(),
+                    inspection.include_nspawn_unit,
+                    &crate::adapters::process::DefaultCommandRunner,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
             encode_result(properties)
         }
 
@@ -54,7 +55,7 @@ pub(super) async fn handle<B: DaemonRuntimeQueries>(
                     None => Err("DBus not available".into()),
                 }
             } else {
-                crate::adapters::runtime::systemd_tools::get_unit_properties_with_runner(
+                crate::adapters::runtime::systemd_tools::query::get_unit_properties_with_runner(
                     &machine,
                     &crate::adapters::process::DefaultCommandRunner,
                 )

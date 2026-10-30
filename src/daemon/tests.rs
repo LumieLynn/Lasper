@@ -34,8 +34,8 @@ fn daemon_resource_claims(
     )
 }
 
-fn systemd_tools_sessions() -> crate::adapters::session::MachineSessionTransport {
-    crate::adapters::session::MachineSessionTransport::SystemdTools
+fn systemd_tools_sessions() -> crate::adapters::session::NativeExecution {
+    crate::adapters::session::NativeExecution::SystemdTools
 }
 
 #[derive(Clone)]

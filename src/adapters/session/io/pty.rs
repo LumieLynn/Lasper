@@ -10,6 +10,11 @@ use std::io::{Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::Ordering;
 
+pub(crate) struct MachinePty {
+    pub(crate) master: OwnedFd,
+    pub(crate) machine_removed: Option<tokio::sync::oneshot::Receiver<SessionLifecycle>>,
+}
+
 pub(crate) struct RemoteSessionControl {
     pub close: tokio::sync::oneshot::Receiver<()>,
     pub lifecycle: tokio::sync::watch::Sender<SessionLifecycle>,
@@ -83,11 +88,11 @@ pub(crate) fn spawn_fd_terminal(
 /// Login PTYs survive getty hangups until machine removal or explicit close.
 /// Shell PTYs finish as soon as the remote side hangs up, matching machinectl.
 pub(crate) fn spawn_machine_terminal(
-    pty: super::MachinePty,
+    pty: MachinePty,
     id: SessionId,
     size: SessionSize,
 ) -> Result<TerminalSessionHandle, SessionError> {
-    let super::MachinePty {
+    let MachinePty {
         master,
         machine_removed,
     } = pty;
@@ -419,7 +424,6 @@ fn spawn_direct_owner(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapters::session::MachinePty;
     use portable_pty::CommandBuilder;
     use std::os::fd::FromRawFd;
     use std::os::unix::fs::OpenOptionsExt;

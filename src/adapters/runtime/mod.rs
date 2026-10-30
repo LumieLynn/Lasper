@@ -1,16 +1,22 @@
-//! RuntimeCatalog composition over the current host adapters.
+//! Host runtime catalog and native systemd transports.
+//!
+//! [`dbus`] and [`systemd_tools`] implement native queries and operations; [`daemon`]
+//! forwards privileged runtime reads. [`registration`] reads machined state,
+//! [`notifications`] watches filesystem changes, and [`systemd_properties`] owns the
+//! shared property classification/formatting pipeline. This entry composes
+//! those sources into the application runtime catalog.
 
+mod daemon;
 pub(crate) mod dbus;
-pub(crate) mod elevated;
-mod filesystem;
+mod notifications;
+pub(crate) mod registration;
 pub(crate) mod source;
-pub(crate) mod state;
 pub(crate) mod systemd_properties;
 pub(crate) mod systemd_tools;
 
 use crate::adapters::error::NspawnError;
+use crate::adapters::runtime::daemon::DaemonBackend;
 use crate::adapters::runtime::dbus::DbusBackend;
-use crate::adapters::runtime::elevated::DaemonBackend;
 use crate::adapters::runtime::source::RuntimeSource;
 use crate::adapters::runtime::systemd_tools::SystemdToolsBackend;
 use crate::application::operations::ExecutionRoute;
@@ -70,7 +76,7 @@ pub(crate) fn compose_runtime_catalog(
         fallback,
         RuntimeObservers {
             backend,
-            filesystem: Some(Arc::new(filesystem::FilesystemChanges::new(vec![
+            filesystem: Some(Arc::new(notifications::FilesystemChanges::new(vec![
                 crate::paths::machines_dir(),
                 crate::paths::runtime_machines_dir(),
             ]))),

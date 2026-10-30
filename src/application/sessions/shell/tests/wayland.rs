@@ -150,7 +150,7 @@ async fn selection_failure_preserves_its_cause_through_fallback() {
 async fn disabled_wayland_skips_discovery_and_probe() {
     let port = Arc::new(CountingSessionPort::default());
     let sessions = SessionService::new(port.clone());
-    let target = ShellTarget::new(
+    let target = GuestTarget::new(
         MachineName::new("demo").unwrap(),
         ValidatedGuestUserName::new("alice").unwrap(),
     );
@@ -168,7 +168,7 @@ async fn disabled_wayland_skips_discovery_and_probe() {
 async fn automatic_wayland_uses_machine_aware_selection_only() {
     let port = Arc::new(CountingSessionPort::default());
     let sessions = SessionService::new(port.clone());
-    let target = ShellTarget::new(
+    let target = GuestTarget::new(
         MachineName::new("demo").unwrap(),
         ValidatedGuestUserName::new("alice").unwrap(),
     );

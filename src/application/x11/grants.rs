@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use crate::application::sessions::{MappedGuestIdentity, ShellTarget, X11ProjectionContext};
+use crate::application::sessions::{GuestTarget, MappedGuestIdentity, X11ProjectionContext};
 use crate::domain::x11::X11SocketRevision;
 
 use super::acl::{X11AccessControlMode, X11AclEntry, X11AclSnapshot, SERVER_INTERPRETED_FAMILY};
@@ -25,7 +25,7 @@ pub(crate) struct X11GrantRecordEvidence {
     pub(crate) created_unix_millis: u64,
     pub(crate) caller_uid: u32,
     pub(crate) boot_id: String,
-    pub(crate) target: ShellTarget,
+    pub(crate) target: GuestTarget,
     pub(crate) identity: MappedGuestIdentity,
     pub(crate) display: u16,
     pub(crate) alternate_endpoint: bool,
@@ -35,6 +35,30 @@ pub(crate) struct X11GrantRecordEvidence {
     pub(crate) server_peer: (u32, u32, u32),
     pub(crate) server_peer_start_time: u64,
     pub(crate) acl_entry: X11AclEntry,
+}
+
+/// A current consumer of an existing ACL grant. Unlike the operation record,
+/// this evidence describes the machine instance that reused the grant.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct X11MachineClaimEvidence {
+    pub(crate) grant_record_id: String,
+    pub(crate) boot_id: String,
+    pub(crate) target: GuestTarget,
+    pub(crate) identity: MappedGuestIdentity,
+}
+
+impl X11MachineClaimEvidence {
+    pub(crate) fn matches(
+        &self,
+        record: &X11GrantRecordEvidence,
+        target: &GuestTarget,
+        identity: MappedGuestIdentity,
+    ) -> bool {
+        self.grant_record_id == record.record_id
+            && self.boot_id == record.boot_id
+            && self.target == *target
+            && self.identity.matches(identity)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,6 +93,9 @@ pub(crate) struct X11DesktopObservation {
     host_boot_id: Option<String>,
     server_peer_start_time: Option<u64>,
     records: X11GrantRecordCatalog,
+    machine_claims: Vec<X11MachineClaimEvidence>,
+    machine_claims_complete: bool,
+    revocation_checks: Vec<X11RecordRevocationCheck>,
     diagnostics: Vec<String>,
 }
 
@@ -87,8 +114,31 @@ impl X11DesktopObservation {
             host_boot_id,
             server_peer_start_time,
             records,
+            machine_claims: Vec::new(),
+            machine_claims_complete: true,
+            revocation_checks: Vec::new(),
             diagnostics,
         }
+    }
+
+    pub(crate) fn with_machine_claims(
+        mut self,
+        claims: Vec<X11MachineClaimEvidence>,
+        complete: bool,
+    ) -> Self {
+        self.machine_claims = claims;
+        self.machine_claims_complete = complete;
+        self
+    }
+
+    pub(crate) fn with_diagnostics(mut self, diagnostics: Vec<String>) -> Self {
+        self.diagnostics.extend(diagnostics);
+        self
+    }
+
+    pub(crate) fn with_revocation_checks(mut self, checks: Vec<X11RecordRevocationCheck>) -> Self {
+        self.revocation_checks = checks;
+        self
     }
 
     fn acl(&self) -> &X11AclSnapshot {
@@ -134,11 +184,29 @@ impl X11GrantHistoryEntry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum X11GrantAssessmentStatus {
     AccessControlDisabled,
-    Managed { record_id: String },
+    /// Attribution of the observed entry, not permission to revoke it.
+    /// Shared consumers and uncertain operations are assessed separately.
+    Managed {
+        record_id: String,
+    },
     PreExisting,
     Historical,
     Absent,
     OutcomeUnknown,
+}
+
+/// A read-only decision for the checked consumer and endpoint. Execution must
+/// repeat this decision under the ACL lock with fresh desktop observations.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum X11RevocationAssessment {
+    Available { record_id: String },
+    Blocked { reason: String },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct X11RecordRevocationCheck {
+    pub(crate) record_id: String,
+    pub(crate) eligibility: Result<(), String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -146,7 +214,8 @@ pub struct X11GrantAssessment {
     status: X11GrantAssessmentStatus,
     history: Vec<X11GrantHistoryEntry>,
     diagnostics: Vec<String>,
-    records_complete: bool,
+    management_state_complete: bool,
+    revocation: X11RevocationAssessment,
 }
 
 impl X11GrantAssessment {
@@ -162,8 +231,12 @@ impl X11GrantAssessment {
         &self.diagnostics
     }
 
-    pub const fn records_complete(&self) -> bool {
-        self.records_complete
+    pub const fn management_state_complete(&self) -> bool {
+        self.management_state_complete
+    }
+
+    pub fn revocation(&self) -> &X11RevocationAssessment {
+        &self.revocation
     }
 }
 
@@ -188,7 +261,7 @@ pub struct X11AccessCheck {
 impl X11AccessCheck {
     #[cfg(test)]
     pub(crate) fn from_observations(
-        target: ShellTarget,
+        target: GuestTarget,
         projection: X11ProjectionContext,
         acl: X11AclSnapshot,
     ) -> Self {
@@ -207,7 +280,7 @@ impl X11AccessCheck {
     }
 
     pub(super) fn from_desktop_observation(
-        target: ShellTarget,
+        target: GuestTarget,
         projection: X11ProjectionContext,
         observation: X11DesktopObservation,
     ) -> Self {
@@ -266,10 +339,12 @@ impl X11AccessCheck {
 }
 
 fn assess_grants(
-    target: &ShellTarget,
+    target: &GuestTarget,
     projection: &X11ProjectionContext,
     observation: &X11DesktopObservation,
 ) -> X11GrantAssessment {
+    let management_state_complete =
+        observation.records.complete && observation.machine_claims_complete;
     let display = projection.host_socket().display();
     let desired_entry = X11AclEntry::from_wire(
         SERVER_INTERPRETED_FAMILY,
@@ -280,10 +355,19 @@ fn assess_grants(
         .records
         .records
         .iter()
-        .filter(|record| record.target == *target && record.display == display)
+        .filter(|record| {
+            record.display == display
+                && (record.target == *target
+                    || observation.machine_claims.iter().any(|claim| {
+                        claim.matches(record, target, projection.identity())
+                    }))
+        })
         .map(|record| {
             let entry_present = observation.acl.contains(&record.acl_entry);
             let current_key = record.acl_entry == desired_entry;
+            let current_claim = observation.machine_claims.iter().any(|claim| {
+                claim.matches(record, target, projection.identity())
+            });
             let (status, detail) = match &record.phase {
                 X11GrantRecordPhase::Pending
                     if server_continuity(record, projection, observation)
@@ -325,6 +409,10 @@ fn assess_grants(
                     X11GrantHistoryStatus::Absent,
                     "the confirmed exact ACL entry is no longer present".to_owned(),
                 ),
+                X11GrantRecordPhase::ConfirmedAdded if !management_state_complete => (
+                    X11GrantHistoryStatus::OutcomeUnknown,
+                    "Lasper grant or machine claim catalog is incomplete".to_owned(),
+                ),
                 X11GrantRecordPhase::ConfirmedAdded => {
                     let mut differences = Vec::new();
                     let endpoint_changed = record.alternate_endpoint
@@ -340,7 +428,7 @@ fn assess_grants(
                     {
                         differences.push("X server continuity is not confirmed");
                     }
-                    if !record.identity.matches(projection.identity()) {
+                    if !current_claim && !record.identity.matches(projection.identity()) {
                         differences.push("machine instance or mapped identity changed");
                     }
                     if current_key && differences.is_empty() {
@@ -406,7 +494,7 @@ fn assess_grants(
                     record_id: managed.record_id.clone(),
                 }
             } else if matching_current_key.contains(&X11GrantHistoryStatus::OutcomeUnknown)
-                || !observation.records.complete
+                || !management_state_complete
             {
                 X11GrantAssessmentStatus::OutcomeUnknown
             } else if matching_current_key.contains(&X11GrantHistoryStatus::Historical) {
@@ -416,6 +504,7 @@ fn assess_grants(
             }
         }
     };
+    let revocation = assess_revocation(&status, &history, &observation.revocation_checks);
     let diagnostics = observation
         .records
         .diagnostics
@@ -427,7 +516,45 @@ fn assess_grants(
         status,
         history,
         diagnostics,
-        records_complete: observation.records.complete,
+        management_state_complete,
+        revocation,
+    }
+}
+
+fn assess_revocation(
+    status: &X11GrantAssessmentStatus,
+    history: &[X11GrantHistoryEntry],
+    checks: &[X11RecordRevocationCheck],
+) -> X11RevocationAssessment {
+    if !matches!(status, X11GrantAssessmentStatus::Managed { .. }) {
+        return X11RevocationAssessment::Blocked {
+            reason: "no current Lasper-managed ACL entry is available for revocation".into(),
+        };
+    }
+    let mut blocked_reason = None;
+    for entry in history
+        .iter()
+        .filter(|entry| entry.status == X11GrantHistoryStatus::Managed)
+    {
+        if let Some(check) = checks
+            .iter()
+            .find(|check| check.record_id == entry.record_id)
+        {
+            match &check.eligibility {
+                Ok(()) => {
+                    return X11RevocationAssessment::Available {
+                        record_id: entry.record_id.clone(),
+                    }
+                }
+                Err(reason) if blocked_reason.is_none() => blocked_reason = Some(reason.clone()),
+                Err(_) => {}
+            }
+        }
+    }
+    X11RevocationAssessment::Blocked {
+        reason: blocked_reason.unwrap_or_else(|| {
+            "revocation eligibility has not been assessed for this consumer and endpoint".into()
+        }),
     }
 }
 

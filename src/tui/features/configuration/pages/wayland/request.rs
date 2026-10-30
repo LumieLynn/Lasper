@@ -1,7 +1,7 @@
 //! Wayland page messages. Workspace routing is owned by the page registry.
 
 use crate::application::configuration::ConfigurationTarget;
-use crate::application::sessions::{SessionError, ShellTarget, WaylandSessionContext};
+use crate::application::sessions::{GuestTarget, SessionError, WaylandSessionContext};
 use crate::domain::wayland::HostWaylandSocket;
 use crate::tui::foundation::status::StatusLevel;
 
@@ -9,11 +9,11 @@ use crate::tui::foundation::status::StatusLevel;
 pub(crate) enum WaylandPageAction {
     Check {
         generation: u64,
-        target: ShellTarget,
+        target: GuestTarget,
         host_socket: HostWaylandSocket,
     },
     EnterShell {
-        target: ShellTarget,
+        target: GuestTarget,
         host_socket: HostWaylandSocket,
     },
 }

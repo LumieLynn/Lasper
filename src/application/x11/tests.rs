@@ -3,11 +3,11 @@ use super::service::MACHINE_LIFECYCLE_RETRY_DELAY;
 use super::session::select_session_endpoints;
 use super::*;
 use crate::application::sessions::{
-    JournalSessionHandle, JournalSessionRequest, MappedGuestIdentity, ObservedGuestIdentity,
-    ObservedMachineInstance, ObservedNamespaceIdentity, SessionError, SessionPort, SessionService,
-    ShellTarget, TerminalSessionHandle, TerminalSessionRequest, ValidatedGuestUserName,
-    WaylandPreparationRequest, WaylandSessionContext, X11FilesystemAccess, X11ProjectionContext,
-    X11ProjectionProbeRequest,
+    GuestTarget, JournalSessionHandle, JournalSessionRequest, MappedGuestIdentity,
+    ObservedGuestIdentity, ObservedMachineInstance, ObservedNamespaceIdentity, SessionError,
+    SessionPort, SessionService, TerminalSessionHandle, TerminalSessionRequest,
+    ValidatedGuestUserName, WaylandPreparationRequest, WaylandSessionContext, X11FilesystemAccess,
+    X11ProjectionContext, X11ProjectionProbeRequest,
 };
 use crate::domain::machine::MachineName;
 use crate::domain::wayland::HostWaylandSocket;
@@ -26,7 +26,7 @@ struct SessionProjectionPort {
 impl X11ProjectionPort for SessionProjectionPort {
     async fn probe(
         &self,
-        target: ShellTarget,
+        target: GuestTarget,
         host_socket: HostX11Socket,
     ) -> Result<X11ProjectionContext, SessionError> {
         self.session.test_x11_projection(target, host_socket).await
@@ -87,8 +87,8 @@ fn projection_for_socket(socket: HostX11Socket, host_uid: u32) -> X11ProjectionC
     )
 }
 
-fn target() -> ShellTarget {
-    ShellTarget::new(
+fn target() -> GuestTarget {
+    GuestTarget::new(
         MachineName::new("archlinux").unwrap(),
         ValidatedGuestUserName::new("alice").unwrap(),
     )
@@ -282,6 +282,221 @@ fn confirmed_record_is_managed_only_with_current_server_and_instance_evidence() 
 }
 
 #[test]
+fn reused_grant_is_managed_by_its_current_claim_after_restart_or_shared_use() {
+    let host_uid = 1_437_402_088;
+    let record = record(X11GrantRecordPhase::ConfirmedAdded, host_uid);
+    let instance =
+        ObservedMachineInstance::from_process(43, std::num::NonZeroU64::new(88).unwrap(), None);
+    let old_projection = projection(host_uid);
+    let identity = MappedGuestIdentity::verified(
+        old_projection.identity().guest(),
+        host_uid,
+        host_uid,
+        instance,
+    );
+    let projection = X11ProjectionContext::verified(
+        old_projection.host_socket().clone(),
+        old_projection.guest_mount().to_path_buf(),
+        old_projection.guest_client_path().to_path_buf(),
+        old_projection.filesystem_access(),
+        identity,
+    );
+    for machine in ["archlinux", "fedora"] {
+        let target = GuestTarget::new(MachineName::new(machine).unwrap(), target().user().clone());
+        let observation = X11DesktopObservation::new(
+            X11AclSnapshot::from_wire(1, vec![record.acl_entry.clone()]),
+            record.caller_uid,
+            Some(record.boot_id.clone()),
+            Some(record.server_peer_start_time),
+            X11GrantRecordCatalog {
+                records: vec![record.clone()],
+                diagnostics: Vec::new(),
+                complete: true,
+            },
+            Vec::new(),
+        );
+        let stale = X11AccessCheck::from_desktop_observation(
+            target.clone(),
+            projection.clone(),
+            observation.clone(),
+        );
+        assert!(!matches!(
+            stale.grant_assessment().status(),
+            X11GrantAssessmentStatus::Managed { .. }
+        ));
+        let claim = X11MachineClaimEvidence {
+            grant_record_id: record.record_id.clone(),
+            boot_id: record.boot_id.clone(),
+            target: target.clone(),
+            identity,
+        };
+        let check = X11AccessCheck::from_desktop_observation(
+            target,
+            projection.clone(),
+            observation.with_machine_claims(vec![claim], true),
+        );
+        assert!(
+            matches!(check.grant_assessment().status(), X11GrantAssessmentStatus::Managed { record_id } if record_id == &record.record_id)
+        );
+        assert_eq!(
+            check.grant_assessment().history()[0].status(),
+            X11GrantHistoryStatus::Managed
+        );
+    }
+}
+
+#[test]
+fn managed_status_does_not_imply_revocation_is_available() {
+    let host_uid = 1_437_402_088;
+    let record = record(X11GrantRecordPhase::ConfirmedAdded, host_uid);
+    for eligibility in [
+        Ok(()),
+        Err("another machine still uses this ACL key".to_owned()),
+    ] {
+        let observation = X11DesktopObservation::new(
+            X11AclSnapshot::from_wire(1, vec![record.acl_entry.clone()]),
+            record.caller_uid,
+            Some(record.boot_id.clone()),
+            Some(record.server_peer_start_time),
+            X11GrantRecordCatalog {
+                records: vec![record.clone()],
+                diagnostics: Vec::new(),
+                complete: true,
+            },
+            Vec::new(),
+        )
+        .with_revocation_checks(vec![X11RecordRevocationCheck {
+            record_id: record.record_id.clone(),
+            eligibility: eligibility.clone(),
+        }]);
+        let check =
+            X11AccessCheck::from_desktop_observation(target(), projection(host_uid), observation);
+        assert!(matches!(
+            check.grant_assessment().status(),
+            X11GrantAssessmentStatus::Managed { .. }
+        ));
+        match eligibility {
+            Ok(()) => assert_eq!(
+                check.grant_assessment().revocation(),
+                &X11RevocationAssessment::Available {
+                    record_id: record.record_id.clone()
+                }
+            ),
+            Err(reason) => assert_eq!(
+                check.grant_assessment().revocation(),
+                &X11RevocationAssessment::Blocked { reason }
+            ),
+        }
+    }
+}
+
+#[test]
+fn revocation_selects_a_usable_record_instead_of_the_first_managed_record() {
+    let host_uid = 1_437_402_088;
+    let usable = record(X11GrantRecordPhase::ConfirmedAdded, host_uid);
+    let mut latest = usable.clone();
+    latest.record_id = "11111111111111111111111111111111".into();
+    latest.created_unix_millis += 1;
+    let observation = X11DesktopObservation::new(
+        X11AclSnapshot::from_wire(1, vec![usable.acl_entry.clone()]),
+        usable.caller_uid,
+        Some(usable.boot_id.clone()),
+        Some(usable.server_peer_start_time),
+        X11GrantRecordCatalog {
+            records: vec![latest.clone(), usable.clone()],
+            diagnostics: Vec::new(),
+            complete: true,
+        },
+        Vec::new(),
+    )
+    .with_revocation_checks(vec![
+        X11RecordRevocationCheck {
+            record_id: latest.record_id.clone(),
+            eligibility: Err("selected listener changed".into()),
+        },
+        X11RecordRevocationCheck {
+            record_id: usable.record_id.clone(),
+            eligibility: Ok(()),
+        },
+    ]);
+    let check =
+        X11AccessCheck::from_desktop_observation(target(), projection(host_uid), observation);
+    assert_eq!(
+        check.grant_assessment().status(),
+        &X11GrantAssessmentStatus::Managed {
+            record_id: latest.record_id
+        }
+    );
+    assert_eq!(
+        check.grant_assessment().revocation(),
+        &X11RevocationAssessment::Available {
+            record_id: usable.record_id
+        }
+    );
+}
+
+#[test]
+fn incomplete_management_state_never_claims_managed_access() {
+    let host_uid = 1_437_402_088;
+    let record = record(X11GrantRecordPhase::ConfirmedAdded, host_uid);
+    for (records_complete, claims_complete) in [(true, false), (false, true), (false, false)] {
+        for entry_present in [true, false] {
+            let acl = X11AclSnapshot::from_wire(
+                1,
+                if entry_present {
+                    vec![record.acl_entry.clone()]
+                } else {
+                    Vec::new()
+                },
+            );
+            let observation = X11DesktopObservation::new(
+                acl,
+                1000,
+                Some(record.boot_id.clone()),
+                Some(77),
+                X11GrantRecordCatalog {
+                    records: vec![record.clone()],
+                    diagnostics: Vec::new(),
+                    complete: records_complete,
+                },
+                Vec::new(),
+            )
+            .with_machine_claims(
+                vec![X11MachineClaimEvidence {
+                    grant_record_id: record.record_id.clone(),
+                    boot_id: record.boot_id.clone(),
+                    target: target(),
+                    identity: projection(host_uid).identity(),
+                }],
+                claims_complete,
+            );
+            let check = X11AccessCheck::from_desktop_observation(
+                target(),
+                projection(host_uid),
+                observation,
+            );
+            assert!(!check.grant_assessment().management_state_complete());
+            assert_eq!(
+                check.grant_assessment().status(),
+                if entry_present {
+                    &X11GrantAssessmentStatus::OutcomeUnknown
+                } else {
+                    &X11GrantAssessmentStatus::Absent
+                }
+            );
+            assert_eq!(
+                check.mapped_uid_status(),
+                if entry_present {
+                    X11MappedUidAclStatus::ExactNumericEntryPresent
+                } else {
+                    X11MappedUidAclStatus::ExactNumericEntryAbsent
+                }
+            );
+        }
+    }
+}
+
+#[test]
 fn managed_grant_survives_a_listener_change_within_the_same_x_server() {
     let check = assessed_check_for_socket(
         Some(X11GrantRecordPhase::ConfirmedAdded),
@@ -386,7 +601,7 @@ fn uncertain_records_never_create_managed_ownership() {
         incomplete.grant_assessment().status(),
         &X11GrantAssessmentStatus::OutcomeUnknown
     );
-    assert!(!incomplete.grant_assessment().records_complete());
+    assert!(!incomplete.grant_assessment().management_state_complete());
 }
 
 #[test]
@@ -531,7 +746,8 @@ impl X11DesktopAccessPort for RecordingDesktopPort {
 
     async fn snapshot(
         &self,
-        _socket: &HostX11Socket,
+        _target: &GuestTarget,
+        _projection: &X11ProjectionContext,
     ) -> Result<X11DesktopObservation, X11DesktopAccessError> {
         self.snapshots.fetch_add(1, Ordering::Relaxed);
         Ok(X11DesktopObservation::new(
@@ -613,7 +829,8 @@ impl X11DesktopAccessPort for SequencedDesktopPort {
 
     async fn snapshot(
         &self,
-        _socket: &HostX11Socket,
+        _target: &GuestTarget,
+        _projection: &X11ProjectionContext,
     ) -> Result<X11DesktopObservation, X11DesktopAccessError> {
         panic!("lifecycle retry test must not query desktop snapshots")
     }

@@ -1,11 +1,9 @@
 //! Terminal launch planning and delivery of machine or process PTYs.
 
-use crate::adapters::session::terminal_attach::TerminalAttachCommand;
 use crate::adapters::session::{
-    MachinePty, MachineSessionOpening, MachineSessionRequest, MachineSessionTransport,
-    MachineShellEnvironment, MachineShellRequest, WaylandSessionResolver,
+    MachinePty, NativeExecution, NativeSession, SelectedUserShell, WaylandSessionResolver,
 };
-use crate::application::sessions::{GuestCommand, SessionError, ShellTarget, TerminalOpenError};
+use crate::application::sessions::{GuestCommand, GuestTarget, SessionError, TerminalOpenError};
 use crate::daemon::sessions::process::{self, SessionChild};
 use crate::daemon::sessions::{handoff, lifecycle, SessionRegistry};
 use crate::domain::machine::MachineName;
@@ -24,7 +22,7 @@ pub(crate) async fn open(
     stream: UnixStream,
     params: SpawnTerminalParams,
     sessions: Arc<SessionRegistry>,
-    machine: MachineSessionTransport,
+    machine: NativeExecution,
     invoking_uid: u32,
 ) {
     let SpawnTerminalParams {
@@ -46,9 +44,9 @@ pub(crate) async fn open(
             }
         };
         match opening {
-            MachineSessionOpening::Dbus(pty) => deliver_machine_terminal(stream, pty),
-            MachineSessionOpening::SystemdTools(command) => {
-                spawn_process_terminal(stream, session_id, name, size, *command, sessions)
+            NativeSession::Pty(pty) => deliver_machine_terminal(stream, pty),
+            NativeSession::Command(command) => {
+                spawn_process_terminal(stream, session_id, name, size, command, sessions)
             }
         }
     })
@@ -58,15 +56,12 @@ pub(crate) async fn open(
 async fn prepare(
     name: &MachineName,
     launch: WireTerminalLaunch,
-    machine: MachineSessionTransport,
+    machine: NativeExecution,
     invoking_uid: u32,
     probe_id: SessionId,
-) -> Result<MachineSessionOpening, TerminalOpenError> {
+) -> Result<NativeSession, TerminalOpenError> {
     match launch {
-        WireTerminalLaunch::LoginPrompt => machine
-            .open(MachineSessionRequest::login_prompt(name.clone()))
-            .await
-            .map_err(Into::into),
+        WireTerminalLaunch::LoginPrompt => machine.login(name).await.map_err(Into::into),
         WireTerminalLaunch::SelectedUserShell {
             user,
             terminal,
@@ -87,30 +82,16 @@ async fn prepare(
                 crate::adapters::config::NspawnConfigStore::direct(),
                 invoking_uid,
             );
-            let wayland_display = resolver
-                .prepare_display(
-                    ShellTarget::new(name.clone(), user.clone()),
-                    wayland.map(|socket| *socket),
-                    probe_id,
-                )
-                .await
-                .map_err(TerminalOpenError::WaylandPreparation)?;
-            let environment =
-                MachineShellEnvironment::shell(*terminal, wayland_display.as_deref(), x11_display)
-                    .map_err(|error| {
-                        SessionError::new(format!(
-                            "selected-user shell environment validation failed: {error}"
-                        ))
-                    })?;
-            let request = MachineShellRequest::new(name.clone(), user, environment);
-            let request = match command {
-                Some(command) => request.with_command(command),
-                None => request,
-            };
-            machine
-                .open(MachineSessionRequest::shell(request))
-                .await
-                .map_err(Into::into)
+            let request = SelectedUserShell {
+                target: GuestTarget::new(name.clone(), user),
+                terminal: *terminal,
+                wayland: wayland.map(|socket| *socket),
+                x11_display,
+                command,
+            }
+            .prepare(&resolver, probe_id)
+            .await?;
+            machine.open(request).await.map_err(Into::into)
         }
     }
 }
@@ -120,7 +101,7 @@ fn spawn_process_terminal(
     session_id: WireSessionId,
     name: MachineName,
     size: WireTerminalSize,
-    attachment: TerminalAttachCommand,
+    command: portable_pty::CommandBuilder,
     sessions: Arc<SessionRegistry>,
 ) -> anyhow::Result<()> {
     let size = size.into_session_size();
@@ -133,8 +114,7 @@ fn spawn_process_terminal(
         })
         .context("open terminal PTY")?;
     let master_fd = pair.master.as_raw_fd().context("PTY master has no fd")?;
-    let kind = attachment.kind();
-    let command = attachment.into_pty_command();
+    let kind = crate::domain::session::TerminalAttachmentKind::Login;
     let response = serde_json::to_vec(&SpawnTerminalResponse {
         attach_kind: WireTerminalAttachmentKind::from(kind),
         lifecycle: WireTerminalLifecycleSource::DaemonStatus,
@@ -198,18 +178,20 @@ mod tests {
         let opening = prepare(
             &MachineName::new("test-machine").unwrap(),
             WireTerminalLaunch::LoginPrompt,
-            MachineSessionTransport::SystemdTools,
+            NativeExecution::SystemdTools,
             uzers::get_current_uid(),
             SessionId::new(1).unwrap(),
         )
         .await
         .unwrap();
 
-        let MachineSessionOpening::SystemdTools(command) = opening else {
+        let NativeSession::Command(command) = opening else {
             panic!("expected the selected systemd-tools transport");
         };
-        assert_eq!(command.program(), "machinectl");
-        assert_eq!(command.args(), ["--", "login", "test-machine"]);
+        assert_eq!(
+            command.get_argv(),
+            &["machinectl", "--", "login", "test-machine"]
+        );
     }
 
     #[tokio::test]
@@ -251,7 +233,7 @@ mod tests {
                 },
             },
             Arc::new(SessionRegistry::default()),
-            MachineSessionTransport::SystemdTools,
+            NativeExecution::SystemdTools,
             uid,
         )
         .await;

@@ -1,7 +1,7 @@
 //! X11 page messages and status reporting. No workspace-specific routing.
 
 use crate::application::configuration::ConfigurationTarget;
-use crate::application::sessions::ShellTarget;
+use crate::application::sessions::GuestTarget;
 use crate::application::x11::{
     X11AccessCheck, X11AccessError, X11Authorization, X11AuthorizationDisposition, X11Revocation,
     X11RevocationDisposition,
@@ -13,17 +13,17 @@ use crate::tui::foundation::status::StatusLevel;
 pub(crate) enum X11PageAction {
     Check {
         generation: u64,
-        target: ShellTarget,
+        target: GuestTarget,
         host_socket: HostX11Socket,
     },
     Authorize {
         generation: u64,
-        target: ShellTarget,
+        target: GuestTarget,
         host_socket: HostX11Socket,
     },
     Revoke {
         generation: u64,
-        target: ShellTarget,
+        target: GuestTarget,
         host_socket: HostX11Socket,
         record_id: String,
     },

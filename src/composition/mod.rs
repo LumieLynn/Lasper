@@ -349,11 +349,11 @@ fn compose_x11_endpoint_discovery() -> Arc<crate::application::x11::X11EndpointD
 fn select_machine_session_transport(
     systemd_tools: bool,
     dbus: crate::adapters::runtime::dbus::DbusBackend,
-) -> crate::adapters::session::MachineSessionTransport {
+) -> crate::adapters::session::NativeExecution {
     if systemd_tools {
-        crate::adapters::session::MachineSessionTransport::SystemdTools
+        crate::adapters::session::NativeExecution::SystemdTools
     } else {
-        crate::adapters::session::MachineSessionTransport::Dbus(dbus)
+        crate::adapters::session::NativeExecution::Dbus(dbus)
     }
 }
 

@@ -87,7 +87,7 @@ pub(in crate::tui::features::configuration) fn start_action(
 fn spawn_check(
     service: Arc<crate::application::x11::X11AccessService>,
     configuration_target: ConfigurationTarget,
-    target: crate::application::sessions::ShellTarget,
+    target: crate::application::sessions::GuestTarget,
     host_socket: crate::domain::x11::HostX11Socket,
     generation: u64,
     events: PageEventSender<X11PageEvent>,
@@ -117,7 +117,7 @@ fn spawn_check(
 
 fn spawn_authorization(
     service: Arc<crate::application::x11::X11AccessService>,
-    target: crate::application::sessions::ShellTarget,
+    target: crate::application::sessions::GuestTarget,
     host_socket: crate::domain::x11::HostX11Socket,
     generation: u64,
     events: PageEventSender<X11PageEvent>,
@@ -145,7 +145,7 @@ fn spawn_authorization(
 
 fn spawn_revocation(
     service: Arc<crate::application::x11::X11AccessService>,
-    target: crate::application::sessions::ShellTarget,
+    target: crate::application::sessions::GuestTarget,
     host_socket: crate::domain::x11::HostX11Socket,
     record_id: String,
     generation: u64,

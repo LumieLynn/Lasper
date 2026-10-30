@@ -23,7 +23,7 @@ const MAX_FD_CONNECTIONS: usize = 32;
 #[derive(Clone)]
 struct FdHostContext {
     trusted_state_root: crate::adapters::trusted_state::TrustedStateRoot,
-    machine_sessions: crate::adapters::session::MachineSessionTransport,
+    machine_sessions: crate::adapters::session::NativeExecution,
     invoking_uid: u32,
 }
 
@@ -261,8 +261,8 @@ pub async fn daemon_main(
 
     let dbus = initialize_dbus_backend(dbus_enabled).await;
     let machine_sessions = match dbus.as_ref() {
-        Some(dbus) => crate::adapters::session::MachineSessionTransport::Dbus(dbus.clone()),
-        None => crate::adapters::session::MachineSessionTransport::SystemdTools,
+        Some(dbus) => crate::adapters::session::NativeExecution::Dbus(dbus.clone()),
+        None => crate::adapters::session::NativeExecution::SystemdTools,
     };
     let trusted_state_root = crate::adapters::trusted_state::TrustedStateRoot::production();
 

@@ -165,7 +165,7 @@ mod tests {
             trusted_state_root: crate::adapters::trusted_state::TrustedStateRoot::for_test(
                 directory.path().to_path_buf(),
             ),
-            machine_sessions: crate::adapters::session::MachineSessionTransport::SystemdTools,
+            machine_sessions: crate::adapters::session::NativeExecution::SystemdTools,
         };
         let (out_tx, _out_rx) = mpsc::channel(1);
         out_tx.send("occupied".into()).await.unwrap();
@@ -217,7 +217,7 @@ mod tests {
                 trusted_state_root: crate::adapters::trusted_state::TrustedStateRoot::for_test(
                     directory.path().to_path_buf(),
                 ),
-                machine_sessions: crate::adapters::session::MachineSessionTransport::SystemdTools,
+                machine_sessions: crate::adapters::session::NativeExecution::SystemdTools,
             };
             let pump = tokio::spawn(async move {
                 run_rpc_request_pump(&mut tokio::io::BufReader::new(server), &out_tx, dispatcher)

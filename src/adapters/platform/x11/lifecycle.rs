@@ -7,21 +7,20 @@
 
 use std::fs;
 
+use crate::adapters::runtime::registration;
 use crate::application::sessions::ObservedMachineInstance;
 use crate::application::x11::{
     X11AclEntry, X11GrantRecordPhase, X11ReconcileReport, X11ReconcileRetry,
 };
 use crate::domain::x11::HostX11Socket;
 
-use super::common::{CLAIM_RECONCILE_GRACE_MILLIS, MAX_GRANT_DIAGNOSTICS, MAX_GRANT_RECORD_BYTES};
+use super::common::{CLAIM_RECONCILE_GRACE_MILLIS, MAX_GRANT_DIAGNOSTICS};
+use super::ownership::GrantOwnership;
 use super::state::{
-    GrantRecordPhase, MachineClaimCatalog, MachineClaimPhase, ManagedX11GrantKey,
-    ManagedX11GrantRecord, ManagedX11MachineClaim, X11RuntimeState,
+    MachineClaimCatalog, MachineClaimPhase, ManagedX11GrantKey, ManagedX11MachineClaim,
+    X11RuntimeState,
 };
-use super::transport::{
-    connect_current_socket, host_boot_id, read_acl, remove_and_observe, require_current_socket,
-    unix_millis, x11_peer_start_time,
-};
+use super::transport::{host_boot_id, unix_millis, ConnectedDesktopAcl, DesktopAcl};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum SystemMachineRegistration {
@@ -56,7 +55,7 @@ pub(super) fn system_machine_registration(machine: &str) -> SystemMachineRegistr
     let path = crate::paths::runtime_machine_state(machine);
     match fs::symlink_metadata(&path) {
         Ok(metadata) if metadata.file_type().is_file() => {
-            let leader_pid = match crate::adapters::runtime::state::leader_pid_at(&path, machine) {
+            let leader_pid = match registration::leader_pid_at(&path, machine) {
                 Ok(leader_pid) => leader_pid,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                     return match fs::symlink_metadata(&path) {
@@ -73,12 +72,12 @@ pub(super) fn system_machine_registration(machine: &str) -> SystemMachineRegistr
                     return SystemMachineRegistration::Unknown(format!(
                         "cannot inspect system machine leader {}: {error}",
                         path.display()
-                    ));
+                    ))
                 }
             };
-            match crate::adapters::runtime::state::machine_instance_at(&path, machine) {
+            match registration::machine_instance_at(&path, machine) {
                 Ok(instance) => SystemMachineRegistration::Present {
-                    leader_pid,
+                    leader_pid: instance.leader_pid(),
                     instance: Some(instance),
                 },
                 Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
@@ -128,16 +127,19 @@ pub(super) fn observe_machine_claim(
     registration: SystemMachineRegistration,
     now_unix_millis: u64,
 ) -> Option<MachineClaimObservation> {
-    match &claim.phase {
+    // A machine registration change is lifecycle evidence, not an uncertain
+    // ACL mutation. Recover the review states written by the old transition
+    // logic, but never reinterpret an unknown ACL outcome as a stopped guest.
+    let phase = match &claim.phase {
         MachineClaimPhase::Ended => return None,
-        MachineClaimPhase::NeedsReview { reason } => {
+        MachineClaimPhase::NeedsReview { reason } if !claim.phase.tracks_machine_lifecycle() => {
             return Some(MachineClaimObservation::NeedsReview(reason.clone()));
         }
-        MachineClaimPhase::Unknown { reason } if !legacy_observation_failure(reason) => {
+        MachineClaimPhase::Unknown { reason } if !claim.phase.tracks_machine_lifecycle() => {
             return Some(MachineClaimObservation::Blocked(reason.clone()));
         }
-        _ => {}
-    }
+        phase => phase,
+    };
     let Some(current_boot_id) = current_boot_id else {
         return Some(MachineClaimObservation::Unavailable(
             "host boot identity is unavailable".into(),
@@ -148,122 +150,44 @@ pub(super) fn observe_machine_claim(
             "claim belongs to an earlier host boot".into(),
         ));
     }
-    // Old versions persisted failed observations as Unknown. Re-observe those
-    // claims from the beginning; no absence/grace-period evidence survives an
-    // interrupted observation. Unknown ACL outcomes remain blocked above.
-    let phase = match &claim.phase {
-        MachineClaimPhase::Unknown { .. } => &MachineClaimPhase::Active,
-        phase => phase,
-    };
-    match (phase, registration) {
-        (
-            MachineClaimPhase::Active,
-            SystemMachineRegistration::Present {
-                leader_pid: _,
-                instance: Some(instance),
-            },
-        ) if claim.compare_machine_instance(instance) != Some(false) => {
-            // Legacy namespace-only records may have no evidence in common
-            // with an unprivileged process-only observation. Retain them, but
-            // never use that uncertainty to authorize or clean up a grant.
-            Some(MachineClaimObservation::Active)
+
+    match registration {
+        SystemMachineRegistration::Present {
+            leader_pid,
+            instance,
+        } => {
+            let replaced =
+                match instance.and_then(|instance| claim.compare_machine_instance(instance)) {
+                    Some(same) => !same,
+                    None => leader_pid != claim.machine_leader_pid,
+                };
+            if !replaced {
+                // Retain when the instance matches, or the leader PID is the
+                // same and comparable generation evidence is unavailable.
+                // This does not authorize a replacement instance.
+                return Some(MachineClaimObservation::Active);
+            }
+            // A different registered instance proves this claim's consumer
+            // ended. It does not inherit the claim; a freshly prepared consumer
+            // must register its own claim under the same ACL lock.
         }
-        (
-            MachineClaimPhase::Active,
-            SystemMachineRegistration::Present {
-                leader_pid: _,
-                instance: Some(_),
-            },
-        ) => Some(MachineClaimObservation::NeedsReview(
-            "machine registration belongs to a different machine instance".into(),
-        )),
-        (
-            MachineClaimPhase::Active,
-            SystemMachineRegistration::Present {
-                leader_pid,
-                instance: None,
-            },
-        ) if leader_pid == claim.machine_leader_pid => {
-            // The desktop worker may not read a system machine's namespaces.
-            // A registered name is sufficient to retain an existing claim:
-            // this neither proves instance equality nor authorizes new access.
-            // Cleanup still requires two absent observations with a grace period.
-            Some(MachineClaimObservation::Active)
+        SystemMachineRegistration::Absent => {}
+        SystemMachineRegistration::Unknown(reason) => {
+            return Some(MachineClaimObservation::Unavailable(reason));
         }
-        (
-            MachineClaimPhase::Active,
-            SystemMachineRegistration::Present {
-                leader_pid: _,
-                instance: None,
-            },
-        ) => Some(MachineClaimObservation::NeedsReview(
-            "machine leader changed but namespace identity is unavailable".into(),
-        )),
-        (MachineClaimPhase::Active, SystemMachineRegistration::Absent) => {
-            Some(MachineClaimObservation::EndedCandidate)
-        }
-        (MachineClaimPhase::Active, SystemMachineRegistration::Unknown(reason)) => {
-            Some(MachineClaimObservation::Unavailable(reason))
-        }
-        (
-            MachineClaimPhase::CleanupPending { .. },
-            SystemMachineRegistration::Present {
-                leader_pid,
-                instance,
-            },
-        ) => {
-            let reason = if instance
-                .is_some_and(|instance| claim.compare_machine_instance(instance) == Some(true))
-            {
-                "machine registration reappeared before cleanup; explicit preparation is required"
-            } else if leader_pid == claim.machine_leader_pid && instance.is_none() {
-                "machine registration reappeared but namespace identity is unavailable; explicit preparation is required"
-            } else {
-                "a different machine instance reappeared before cleanup; explicit preparation is required"
-            };
-            Some(MachineClaimObservation::NeedsReview(reason.into()))
-        }
-        (
-            MachineClaimPhase::CleanupPending { since_unix_millis },
-            SystemMachineRegistration::Absent,
-        ) => Some(
+    }
+    Some(match phase {
+        MachineClaimPhase::CleanupPending { since_unix_millis } => {
             if now_unix_millis.saturating_sub(*since_unix_millis) >= CLAIM_RECONCILE_GRACE_MILLIS {
                 MachineClaimObservation::CleanupReady
             } else {
                 MachineClaimObservation::CleanupPending {
                     since_unix_millis: *since_unix_millis,
                 }
-            },
-        ),
-        (
-            MachineClaimPhase::CleanupPending {
-                since_unix_millis: _,
-            },
-            SystemMachineRegistration::Unknown(reason),
-        ) => Some(MachineClaimObservation::Unavailable(reason)),
-        _ => None,
-    }
-}
-
-/// Compatibility for the observation errors that older versions wrote into
-/// Unknown claims. Only known machine-read diagnostics are retryable; arbitrary
-/// reasons, including all ACL mutation failures, must retain their old guard.
-fn legacy_observation_failure(reason: &str) -> bool {
-    matches!(
-        reason,
-        "host boot identity is unavailable"
-            | "machine namespace identity is unavailable; cleanup is blocked"
-    ) || [
-        "system machined runtime path is not a directory: ",
-        "cannot inspect system machined runtime directory ",
-        "system machine registration changed during leader inspection ",
-        "cannot inspect system machine leader ",
-        "cannot inspect system machine instance ",
-        "system machine registration is not a regular file: ",
-        "cannot inspect system machine registration ",
-    ]
-    .iter()
-    .any(|prefix| reason.starts_with(prefix))
+            }
+        }
+        _ => MachineClaimObservation::EndedCandidate,
+    })
 }
 
 impl MachineClaimObservation {
@@ -399,11 +323,9 @@ impl ReconcileGroup {
     }
 
     pub(super) fn ready(&self) -> bool {
-        !self.claims.is_empty()
-            && self
-                .claims
-                .iter()
-                .all(|claim| matches!(&claim.status, ReconcileClaimStatus::Ready))
+        self.claims
+            .iter()
+            .all(|claim| matches!(&claim.status, ReconcileClaimStatus::Ready))
     }
 }
 
@@ -452,32 +374,6 @@ pub(super) fn reconcile_claim(
     Some(observation.into_reconcile_status())
 }
 
-pub(super) fn mark_record_phase_sync(
-    state: &X11RuntimeState,
-    record_id: &str,
-    phase: GrantRecordPhase,
-) -> Result<(), String> {
-    let file_name = format!("grant-{record_id}.json");
-    let file = state
-        .grants
-        .read_bounded(&file_name, MAX_GRANT_RECORD_BYTES)
-        .map_err(|error| format!("read X11 grant record {record_id}: {error}"))?
-        .ok_or_else(|| format!("X11 grant record {record_id} does not exist"))?;
-    if file.uid != uzers::get_effective_uid() || file.mode & 0o077 != 0 {
-        return Err(format!(
-            "X11 grant record {record_id} is not owned by the invoking user"
-        ));
-    }
-    let mut record: ManagedX11GrantRecord = serde_json::from_slice(&file.bytes)
-        .map_err(|error| format!("invalid X11 grant record {record_id}: {error}"))?;
-    record
-        .clone()
-        .into_evidence(&file_name)
-        .map_err(|error| format!("invalid X11 grant record {record_id}: {error}"))?;
-    record.phase = phase;
-    state.write(&file_name, &record)
-}
-
 pub(super) fn push_reconcile_diagnostic(diagnostics: &mut Vec<String>, message: impl Into<String>) {
     if diagnostics.len() < MAX_GRANT_DIAGNOSTICS {
         diagnostics.push(message.into());
@@ -494,6 +390,25 @@ pub(super) fn reconcile_sync(socket: &HostX11Socket) -> Result<X11ReconcileRepor
         ));
     };
     let _lock = state.lock()?;
+    reconcile_with_state(
+        &state,
+        socket,
+        ConnectedDesktopAcl::connect,
+        system_machine_registration,
+        unix_millis,
+    )
+}
+
+/// Run the same locked operation with explicit observation boundaries. Time
+/// and registration are read again before mutation; a test can exercise that
+/// race without installing a container or touching the desktop ACL.
+pub(super) fn reconcile_with_state<D: DesktopAcl>(
+    state: &X11RuntimeState,
+    socket: &HostX11Socket,
+    connect: impl FnOnce(&HostX11Socket) -> Result<D, String>,
+    mut observe: impl FnMut(&str) -> SystemMachineRegistration,
+    mut clock: impl FnMut() -> Result<u64, String>,
+) -> Result<X11ReconcileReport, String> {
     let claims = state.load_claims();
     if !claims.complete {
         return Err(claims
@@ -519,12 +434,11 @@ pub(super) fn reconcile_sync(socket: &HostX11Socket) -> Result<X11ReconcileRepor
         ));
     }
 
-    let connection = connect_current_socket(socket)?;
-    let server_peer_start_time = x11_peer_start_time(socket)?;
+    let desktop = connect(socket)?;
+    let server_peer_start_time = desktop.server_start_time();
     let current_boot_id = host_boot_id()?;
-    let now = unix_millis()?;
-    let mut acl = read_acl(&connection, socket.display())?;
-    require_current_socket(socket, "before X11 lifecycle reconcile")?;
+    let now = clock()?;
+    let mut acl = desktop.snapshot()?;
     if !matches!(
         acl.mode(),
         crate::application::x11::X11AccessControlMode::Enabled
@@ -533,6 +447,7 @@ pub(super) fn reconcile_sync(socket: &HostX11Socket) -> Result<X11ReconcileRepor
     }
 
     let mut diagnostics = Vec::new();
+    let mut groups = Vec::<ReconcileGroup>::new();
     for record in &records.records {
         if matches!(record.phase, X11GrantRecordPhase::ConfirmedAdded)
             && claim_key_matches_socket(
@@ -540,20 +455,16 @@ pub(super) fn reconcile_sync(socket: &HostX11Socket) -> Result<X11ReconcileRepor
                 socket,
                 server_peer_start_time,
             )
-            && !claims.claims.iter().any(|claim| {
-                claim.grant_record_id == record.record_id && claim.phase.requires_reconcile()
-            })
         {
-            push_reconcile_diagnostic(
-                &mut diagnostics,
-                format!(
-                    "confirmed grant {} has no unresolved machine claim; automatic cleanup cannot establish its lifecycle",
-                    record.record_id,
-                ),
-            );
+            let key = ManagedX11GrantKey::from_evidence(record);
+            if !groups.iter().any(|group| group.key == key) {
+                groups.push(ReconcileGroup {
+                    key,
+                    claims: Vec::new(),
+                });
+            }
         }
     }
-    let mut groups = Vec::<ReconcileGroup>::new();
     for claim in claims.claims.iter() {
         if !claim.phase.requires_reconcile() {
             continue;
@@ -561,13 +472,9 @@ pub(super) fn reconcile_sync(socket: &HostX11Socket) -> Result<X11ReconcileRepor
         if !claim_key_matches_socket(&claim.key, socket, server_peer_start_time) {
             continue;
         }
-        let Some(status) = reconcile_claim(
-            &state,
-            claim,
-            &current_boot_id,
-            system_machine_registration(&claim.machine),
-            now,
-        ) else {
+        let Some(status) =
+            reconcile_claim(state, claim, &current_boot_id, observe(&claim.machine), now)
+        else {
             continue;
         };
         let reconcile_claim = ReconcileClaim {
@@ -635,32 +542,27 @@ pub(super) fn reconcile_sync(socket: &HostX11Socket) -> Result<X11ReconcileRepor
             continue;
         }
 
-        let mut matching_records = Vec::new();
-        let mut invalid_record = None;
-        for claim in &group.claims {
-            let Some(record) = records.records.iter().find(|record| {
-                record.record_id == claim.record_id
-                    && matches!(&record.phase, X11GrantRecordPhase::ConfirmedAdded)
-                    && ManagedX11GrantKey::from_evidence(record) == group.key
-            }) else {
-                invalid_record = Some(format!(
-                    "claim {} has no matching confirmed grant record",
-                    claim.claim_id
-                ));
-                break;
-            };
-            if !matching_records.contains(&record) {
-                matching_records.push(record);
+        let acl_entry = X11AclEntry::from_wire(group.key.acl_family, group.key.acl_address.clone());
+        let ownership = match GrantOwnership::inspect(
+            &records,
+            &claims,
+            &group.key,
+            &current_boot_id,
+        )
+        .and_then(|ownership| {
+            ownership.require_lifecycle_cleanup(acl.contains(&acl_entry))?;
+            Ok(ownership)
+        }) {
+            Ok(ownership) => ownership,
+            Err(reason) => {
+                push_reconcile_diagnostic(&mut diagnostics, reason);
+                continue;
             }
-        }
-        if let Some(reason) = invalid_record {
-            push_reconcile_diagnostic(&mut diagnostics, reason);
-            continue;
-        }
+        };
 
-        // An earlier group may have involved X11 I/O. Recheck every machine
-        // sharing this grant immediately before revoking it, so a registration
-        // that reappeared since the first pass still blocks this mutation.
+        // An earlier group may have involved X11 I/O. Recheck every consumer
+        // immediately before revoking: a matching or inconclusive registration
+        // still retains the grant; a replaced instance does not inherit it.
         let mut still_ready = true;
         for member in &group.claims {
             let claim = claims
@@ -669,11 +571,11 @@ pub(super) fn reconcile_sync(socket: &HostX11Socket) -> Result<X11ReconcileRepor
                 .find(|claim| claim.claim_id == member.claim_id)
                 .expect("reconcile claim came from catalog");
             let status = reconcile_claim(
-                &state,
+                state,
                 claim,
                 &current_boot_id,
-                system_machine_registration(&claim.machine),
-                unix_millis()?,
+                observe(&claim.machine),
+                clock()?,
             );
             if status != Some(ReconcileClaimStatus::Ready) {
                 still_ready = false;
@@ -694,6 +596,17 @@ pub(super) fn reconcile_sync(socket: &HostX11Socket) -> Result<X11ReconcileRepor
                             format!("claim {} changed before cleanup: {reason}", claim.claim_id),
                         );
                     }
+                    Some(ReconcileClaimStatus::Active) => {
+                        retry = X11ReconcileRetry::RegisteredMachine;
+                    }
+                    Some(ReconcileClaimStatus::Pending) => {
+                        if retry == X11ReconcileRetry::None {
+                            retry = X11ReconcileRetry::PendingObservation;
+                        }
+                        if !pending_record_ids.contains(&member.record_id) {
+                            pending_record_ids.push(member.record_id.clone());
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -702,28 +615,18 @@ pub(super) fn reconcile_sync(socket: &HostX11Socket) -> Result<X11ReconcileRepor
             continue;
         }
 
-        let acl_entry = X11AclEntry::from_wire(group.key.acl_family, group.key.acl_address.clone());
         if acl.contains(&acl_entry) {
-            let (change, observed) =
-                remove_and_observe(&connection, socket.display(), group.key.host_uid);
-            let socket_result = require_current_socket(socket, "while revoking a stopped machine");
-            let server_result = x11_peer_start_time(socket).and_then(|current| {
-                (current == server_peer_start_time)
-                    .then_some(())
-                    .ok_or_else(|| {
-                        "X11 server process changed while revoking a stopped machine".to_owned()
-                    })
-            });
-            if change.is_err() || socket_result.is_err() || server_result.is_err() {
+            let (change, observed) = desktop.remove(group.key.host_uid);
+            let endpoint_result = desktop.verify();
+            if change.is_err() || endpoint_result.is_err() {
                 let reason = [
                     change.err(),
                     observed
                         .err()
                         .map(|error| format!("ACL confirmation: {error}")),
-                    socket_result.err(),
-                    server_result
+                    endpoint_result
                         .err()
-                        .map(|error| format!("server generation: {error}")),
+                        .map(|error| format!("endpoint/server revalidation: {error}")),
                 ]
                 .into_iter()
                 .flatten()
@@ -731,7 +634,7 @@ pub(super) fn reconcile_sync(socket: &HostX11Socket) -> Result<X11ReconcileRepor
                 .join("; ");
                 for claim in &group.claims {
                     let _ = mark_claim_phase_sync(
-                        &state,
+                        state,
                         claims
                             .claims
                             .iter()
@@ -758,17 +661,18 @@ pub(super) fn reconcile_sync(socket: &HostX11Socket) -> Result<X11ReconcileRepor
             }
         }
 
-        for record in matching_records {
-            mark_record_phase_sync(&state, &record.record_id, GrantRecordPhase::Revoked)?;
-            revoked_record_ids.push(record.record_id.clone());
+        if let Err(error) = state.finish_revocation(&ownership.records) {
+            push_reconcile_diagnostic(
+                &mut diagnostics,
+                format!("the ACL entry is absent, but its records could not be finalized: {error}"),
+            );
+            if retry == X11ReconcileRetry::None {
+                retry = X11ReconcileRetry::PendingObservation;
+            }
+            continue;
         }
-        for claim in &group.claims {
-            let original = claims
-                .claims
-                .iter()
-                .find(|candidate| candidate.claim_id == claim.claim_id)
-                .expect("reconcile claim came from catalog");
-            mark_claim_phase_sync(&state, original, MachineClaimPhase::Ended)?;
+        for record in ownership.records {
+            revoked_record_ids.push(record.record_id.clone());
         }
     }
 

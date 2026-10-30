@@ -89,7 +89,7 @@ async fn prepared_x11_context_is_target_bound_and_carried_without_reprobing() {
     }
 
     let mismatched = ShellOpenIntent::new(
-        ShellTarget::new(
+        GuestTarget::new(
             MachineName::new("other").unwrap(),
             ValidatedGuestUserName::new("alice").unwrap(),
         ),

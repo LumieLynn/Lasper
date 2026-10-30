@@ -19,9 +19,11 @@ pub use catalog::{X11EndpointCatalog, X11SourceObservation, X11SourceState};
 pub(crate) use catalog::{X11EndpointDiscoveryPort, X11EndpointDiscoveryService};
 pub use grants::{
     X11AccessCheck, X11GrantAssessmentStatus, X11GrantHistoryStatus, X11MappedUidAclStatus,
+    X11RevocationAssessment,
 };
 pub(crate) use grants::{
     X11DesktopObservation, X11GrantRecordCatalog, X11GrantRecordEvidence, X11GrantRecordPhase,
+    X11MachineClaimEvidence, X11RecordRevocationCheck,
 };
 #[allow(unused_imports)]
 pub use grants::{X11GrantAssessment, X11GrantHistoryEntry};

@@ -7,8 +7,8 @@ use crate::domain::session::SessionSize;
 use crate::domain::wayland::{HostWaylandSocket, WaylandDisplay};
 
 use super::{
-    GuestCommand, InteractiveShellEnvironment, SessionError, SessionService, ShellOpenError,
-    ShellOpenIntent, ShellTarget, TerminalSessionHandle, TypedSessionEnvironment,
+    GuestCommand, GuestTarget, InteractiveShellEnvironment, SessionError, SessionService,
+    ShellOpenError, ShellOpenIntent, TerminalSessionHandle, TypedSessionEnvironment,
     WaylandShellRequest,
 };
 
@@ -21,7 +21,7 @@ pub struct ShellLaunchRequest {
 
 impl ShellLaunchRequest {
     pub fn new(
-        target: ShellTarget,
+        target: GuestTarget,
         wayland: WaylandShellRequest,
         terminal_environment: InteractiveShellEnvironment,
         size: SessionSize,
@@ -224,7 +224,7 @@ impl SessionService {
 
     async fn resolve_shell_wayland(
         &self,
-        target: &ShellTarget,
+        target: &GuestTarget,
         selection: &WaylandShellRequest,
     ) -> Result<Option<HostWaylandSocket>, SessionError> {
         match selection {

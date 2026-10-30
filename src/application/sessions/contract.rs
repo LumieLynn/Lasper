@@ -1,10 +1,12 @@
+use super::execution::{
+    GuestCommand, GuestTarget, InteractiveShellEnvironment, MappedGuestIdentity,
+    ObservedGuestIdentity, ValidatedGuestUserName,
+};
 use crate::domain::machine::MachineName;
 use crate::domain::session::{SessionId, SessionLifecycle, SessionSize, TerminalAttachmentKind};
 use crate::domain::wayland::{HostWaylandSocket, WaylandDisplay};
 use crate::domain::x11::HostX11Socket;
 use async_trait::async_trait;
-use serde::{Deserialize, Deserializer, Serialize};
-use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -13,337 +15,6 @@ use tokio::sync::{mpsc, oneshot, watch};
 pub(crate) const TERMINAL_COMMAND_CAPACITY: usize = 1024;
 pub(crate) const TERMINAL_OUTPUT_CAPACITY: usize = 256;
 pub(crate) const JOURNAL_OUTPUT_CAPACITY: usize = 1024;
-
-/// A guest account name accepted by machine1's selected-user shell contract.
-/// It is passed as one D-Bus/argv value after validation, never interpolated
-/// into a shell command.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
-#[serde(transparent)]
-pub struct ValidatedGuestUserName(String);
-
-impl ValidatedGuestUserName {
-    pub fn new(value: impl Into<String>) -> Result<Self, GuestUserNameError> {
-        let value = value.into();
-        let bytes = value.as_bytes();
-        if bytes.is_empty() {
-            return Err(GuestUserNameError::Empty);
-        }
-        if bytes.len() > 32 {
-            return Err(GuestUserNameError::TooLong);
-        }
-        if !value.is_ascii() {
-            return Err(GuestUserNameError::NonAscii);
-        }
-        if bytes[0] == b'-' {
-            return Err(GuestUserNameError::LeadingDash);
-        }
-        if bytes.iter().any(|byte| {
-            byte.is_ascii_whitespace()
-                || byte.is_ascii_control()
-                || matches!(*byte, b'/' | b'\\' | b'@')
-        }) {
-            return Err(GuestUserNameError::InvalidCharacter);
-        }
-        Ok(Self(value))
-    }
-
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for ValidatedGuestUserName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl TryFrom<&str> for ValidatedGuestUserName {
-    type Error = GuestUserNameError;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        Self::new(value)
-    }
-}
-
-impl<'de> Deserialize<'de> for ValidatedGuestUserName {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        let value = String::deserialize(deserializer)?;
-        Self::new(value).map_err(serde::de::Error::custom)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum GuestUserNameError {
-    #[error("guest username cannot be empty")]
-    Empty,
-    #[error("guest username exceeds the 32-byte limit")]
-    TooLong,
-    #[error("guest username must be ASCII")]
-    NonAscii,
-    #[error("guest username cannot start with '-'")]
-    LeadingDash,
-    #[error("guest username contains whitespace, control, path-separator, or '@' characters")]
-    InvalidCharacter,
-}
-
-const MAX_GUEST_COMMAND_ARGS: usize = 256;
-const MAX_GUEST_COMMAND_ARG_BYTES: usize = 4096;
-const MAX_GUEST_COMMAND_TOTAL_BYTES: usize = 64 * 1024;
-
-/// A command to execute as the selected guest user.
-///
-/// The executable is deliberately required to be an absolute path because
-/// machine1's `OpenMachineShell` contract has the same requirement. Arguments
-/// remain separate values all the way to the runtime transport; no shell
-/// command string is ever constructed.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct GuestCommand {
-    program: String,
-    args: Vec<String>,
-}
-
-impl GuestCommand {
-    pub fn new(program: impl Into<String>, args: Vec<String>) -> Result<Self, GuestCommandError> {
-        let program = program.into();
-        validate_guest_command_value(&program, true)?;
-        if !Path::new(&program).is_absolute() {
-            return Err(GuestCommandError::ProgramNotAbsolute);
-        }
-        if args.len() > MAX_GUEST_COMMAND_ARGS {
-            return Err(GuestCommandError::TooManyArguments {
-                maximum: MAX_GUEST_COMMAND_ARGS,
-            });
-        }
-
-        let mut total_bytes = program.len();
-        for argument in &args {
-            validate_guest_command_value(argument, false)?;
-            total_bytes = total_bytes
-                .checked_add(argument.len())
-                .and_then(|total| total.checked_add(1))
-                .ok_or(GuestCommandError::TooLong {
-                    maximum: MAX_GUEST_COMMAND_TOTAL_BYTES,
-                })?;
-        }
-        if total_bytes > MAX_GUEST_COMMAND_TOTAL_BYTES {
-            return Err(GuestCommandError::TooLong {
-                maximum: MAX_GUEST_COMMAND_TOTAL_BYTES,
-            });
-        }
-
-        Ok(Self { program, args })
-    }
-
-    pub fn program(&self) -> &str {
-        &self.program
-    }
-
-    pub fn args(&self) -> &[String] {
-        &self.args
-    }
-
-    /// Return the complete process argument vector, including argv[0].
-    pub fn argv(&self) -> Vec<String> {
-        std::iter::once(self.program.clone())
-            .chain(self.args.iter().cloned())
-            .collect()
-    }
-}
-
-fn validate_guest_command_value(value: &str, program: bool) -> Result<(), GuestCommandError> {
-    if program && value.is_empty() {
-        return Err(GuestCommandError::EmptyProgram);
-    }
-    if value.len() > MAX_GUEST_COMMAND_ARG_BYTES {
-        return Err(GuestCommandError::ArgumentTooLong {
-            maximum: MAX_GUEST_COMMAND_ARG_BYTES,
-        });
-    }
-    if value.contains('\0') {
-        return Err(GuestCommandError::NulByte);
-    }
-    Ok(())
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum GuestCommandError {
-    #[error("guest command executable cannot be empty")]
-    EmptyProgram,
-    #[error("guest command executable must be an absolute path")]
-    ProgramNotAbsolute,
-    #[error("guest command contains a NUL byte")]
-    NulByte,
-    #[error("guest command argument exceeds the {maximum}-byte limit")]
-    ArgumentTooLong { maximum: usize },
-    #[error("guest command has more than {maximum} arguments")]
-    TooManyArguments { maximum: usize },
-    #[error("guest command exceeds the {maximum}-byte total limit")]
-    TooLong { maximum: usize },
-}
-
-const MAX_TERM_BYTES: usize = 256;
-const MAX_TERMINAL_ENVIRONMENT_VALUE_BYTES: usize = 4096;
-
-/// Terminal capability variables inherited by one selected-user shell. The
-/// variable names are fixed; callers cannot add arbitrary entries.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
-pub struct InteractiveShellEnvironment {
-    term: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    colorterm: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    no_color: Option<String>,
-}
-
-impl InteractiveShellEnvironment {
-    /// Environment used by the embedded TUI terminal.  The TUI owns a
-    /// terminal emulator rather than the user's outer terminal, so inheriting
-    /// the host TERM would describe the wrong terminal capabilities.
-    pub fn embedded() -> Self {
-        let captured = Self::capture();
-        Self {
-            term: "xterm-256color".to_string(),
-            colorterm: captured.colorterm,
-            no_color: captured.no_color,
-        }
-    }
-
-    pub fn capture() -> Self {
-        let term = std::env::var("TERM")
-            .ok()
-            .filter(|value| valid_term(value))
-            .unwrap_or_else(|| "dumb".to_string());
-        let colorterm = captured_terminal_value("COLORTERM");
-        let no_color = captured_terminal_value("NO_COLOR");
-        Self {
-            term,
-            colorterm,
-            no_color,
-        }
-    }
-
-    pub(crate) fn new(
-        term: String,
-        colorterm: Option<String>,
-        no_color: Option<String>,
-    ) -> Result<Self, InteractiveShellEnvironmentError> {
-        if !valid_term(&term) {
-            return Err(InteractiveShellEnvironmentError::InvalidTerm);
-        }
-        for (name, value) in [("COLORTERM", &colorterm), ("NO_COLOR", &no_color)] {
-            if value
-                .as_deref()
-                .is_some_and(|value| !valid_terminal_value(value))
-            {
-                return Err(InteractiveShellEnvironmentError::InvalidValue { name });
-            }
-        }
-        Ok(Self {
-            term,
-            colorterm,
-            no_color,
-        })
-    }
-
-    pub fn term(&self) -> &str {
-        &self.term
-    }
-
-    pub fn colorterm(&self) -> Option<&str> {
-        self.colorterm.as_deref()
-    }
-
-    pub fn no_color(&self) -> Option<&str> {
-        self.no_color.as_deref()
-    }
-}
-
-impl Default for InteractiveShellEnvironment {
-    fn default() -> Self {
-        Self {
-            term: "dumb".to_string(),
-            colorterm: None,
-            no_color: None,
-        }
-    }
-}
-
-impl<'de> Deserialize<'de> for InteractiveShellEnvironment {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Environment {
-            term: String,
-            #[serde(default)]
-            colorterm: Option<String>,
-            #[serde(default)]
-            no_color: Option<String>,
-        }
-
-        let environment = Environment::deserialize(deserializer)?;
-        Self::new(
-            environment.term,
-            environment.colorterm,
-            environment.no_color,
-        )
-        .map_err(serde::de::Error::custom)
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum InteractiveShellEnvironmentError {
-    #[error("TERM is not a valid terminal type name")]
-    InvalidTerm,
-    #[error("{name} contains control characters or exceeds the value limit")]
-    InvalidValue { name: &'static str },
-}
-
-fn captured_terminal_value(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .filter(|value| valid_terminal_value(value))
-}
-
-fn valid_term(value: &str) -> bool {
-    !value.is_empty()
-        && value != "unknown"
-        && value.len() <= MAX_TERM_BYTES
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'+' | b'.'))
-}
-
-fn valid_terminal_value(value: &str) -> bool {
-    value.len() <= MAX_TERMINAL_ENVIRONMENT_VALUE_BYTES && !value.chars().any(char::is_control)
-}
-
-/// The only user-selected identity accepted by the shell workflow.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ShellTarget {
-    machine: MachineName,
-    user: ValidatedGuestUserName,
-}
-
-impl ShellTarget {
-    pub fn new(machine: MachineName, user: ValidatedGuestUserName) -> Self {
-        Self { machine, user }
-    }
-
-    pub fn machine(&self) -> &MachineName {
-        &self.machine
-    }
-
-    pub fn user(&self) -> &ValidatedGuestUserName {
-        &self.user
-    }
-}
 
 /// Optional Wayland context requested for one selected-user shell.
 ///
@@ -359,7 +30,7 @@ pub enum WaylandShellRequest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ShellOpenIntent {
-    target: ShellTarget,
+    target: GuestTarget,
     wayland: WaylandShellRequest,
     x11: Option<X11SessionContext>,
     terminal_environment: InteractiveShellEnvironment,
@@ -369,7 +40,7 @@ pub struct ShellOpenIntent {
 
 impl ShellOpenIntent {
     pub fn new(
-        target: ShellTarget,
+        target: GuestTarget,
         wayland: WaylandShellRequest,
         terminal_environment: InteractiveShellEnvironment,
         size: SessionSize,
@@ -395,7 +66,7 @@ impl ShellOpenIntent {
         self
     }
 
-    pub fn target(&self) -> &ShellTarget {
+    pub fn target(&self) -> &GuestTarget {
         &self.target
     }
 
@@ -537,16 +208,16 @@ impl X11ProjectionContext {
 /// being attached to another machine or guest account.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct X11SessionContext {
-    target: ShellTarget,
+    target: GuestTarget,
     projection: X11ProjectionContext,
 }
 
 impl X11SessionContext {
-    pub(crate) fn prepared(target: ShellTarget, projection: X11ProjectionContext) -> Self {
+    pub(crate) fn prepared(target: GuestTarget, projection: X11ProjectionContext) -> Self {
         Self { target, projection }
     }
 
-    pub fn target(&self) -> &ShellTarget {
+    pub fn target(&self) -> &GuestTarget {
         &self.target
     }
 
@@ -665,177 +336,15 @@ pub struct JournalSessionRequest {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WaylandPreparationRequest {
     pub probe_id: SessionId,
-    pub target: ShellTarget,
+    pub target: GuestTarget,
     pub host_socket: HostWaylandSocket,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct X11ProjectionProbeRequest {
     pub probe_id: SessionId,
-    pub target: ShellTarget,
+    pub target: GuestTarget,
     pub host_socket: HostX11Socket,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ObservedGuestIdentity {
-    uid: u32,
-    gid: u32,
-}
-
-impl ObservedGuestIdentity {
-    pub fn new(uid: u32, gid: u32) -> Self {
-        Self { uid, gid }
-    }
-
-    pub fn uid(self) -> u32 {
-        self.uid
-    }
-
-    pub fn gid(self) -> u32 {
-        self.gid
-    }
-}
-
-/// Kernel identity of one namespace observed through procfs. Device and inode
-/// are kept together because an inode alone is not a complete file identity.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ObservedNamespaceIdentity {
-    device: u64,
-    inode: u64,
-}
-
-impl ObservedNamespaceIdentity {
-    pub(crate) const fn new(device: u64, inode: u64) -> Self {
-        Self { device, inode }
-    }
-
-    pub const fn device(self) -> u64 {
-        self.device
-    }
-
-    pub const fn inode(self) -> u64 {
-        self.inode
-    }
-}
-
-/// Runtime instance against which a guest-to-host identity mapping was
-/// observed. A later machine restart invalidates the evidence even if the
-/// machine name is unchanged.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ObservedMachineInstance {
-    leader_pid: u32,
-    leader_start_time: Option<std::num::NonZeroU64>,
-    namespaces: Option<(ObservedNamespaceIdentity, ObservedNamespaceIdentity)>,
-}
-
-impl ObservedMachineInstance {
-    pub(crate) const fn new(
-        leader_pid: u32,
-        pid_namespace: ObservedNamespaceIdentity,
-        user_namespace: ObservedNamespaceIdentity,
-    ) -> Self {
-        Self {
-            leader_pid,
-            leader_start_time: None,
-            namespaces: Some((pid_namespace, user_namespace)),
-        }
-    }
-
-    pub(crate) const fn from_process(
-        leader_pid: u32,
-        leader_start_time: std::num::NonZeroU64,
-        namespaces: Option<(ObservedNamespaceIdentity, ObservedNamespaceIdentity)>,
-    ) -> Self {
-        Self {
-            leader_pid,
-            leader_start_time: Some(leader_start_time),
-            namespaces,
-        }
-    }
-
-    pub const fn leader_pid(self) -> u32 {
-        self.leader_pid
-    }
-
-    pub const fn leader_start_time(self) -> Option<std::num::NonZeroU64> {
-        self.leader_start_time
-    }
-
-    pub const fn namespaces(
-        self,
-    ) -> Option<(ObservedNamespaceIdentity, ObservedNamespaceIdentity)> {
-        self.namespaces
-    }
-
-    /// None means that the observations have no comparable generation evidence.
-    /// It must not be treated as proof of a matching or replaced instance.
-    pub fn compare(self, other: Self) -> Option<bool> {
-        if self.leader_pid != other.leader_pid {
-            return Some(false);
-        }
-        if let (Some(left), Some(right)) = (self.leader_start_time, other.leader_start_time) {
-            if left != right {
-                return Some(false);
-            }
-            return Some(match (self.namespaces, other.namespaces) {
-                (Some(left), Some(right)) => left == right,
-                _ => true,
-            });
-        }
-        match (self.namespaces, other.namespaces) {
-            (Some(left), Some(right)) => Some(left == right),
-            _ => None,
-        }
-    }
-}
-
-/// A selected guest account and the UID/GID seen for it by the host kernel.
-/// This is runtime evidence, not a prediction from `PrivateUsers=`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MappedGuestIdentity {
-    guest: ObservedGuestIdentity,
-    host_uid: u32,
-    host_gid: u32,
-    instance: ObservedMachineInstance,
-}
-
-impl MappedGuestIdentity {
-    pub(crate) const fn verified(
-        guest: ObservedGuestIdentity,
-        host_uid: u32,
-        host_gid: u32,
-        instance: ObservedMachineInstance,
-    ) -> Self {
-        Self {
-            guest,
-            host_uid,
-            host_gid,
-            instance,
-        }
-    }
-
-    pub const fn guest(self) -> ObservedGuestIdentity {
-        self.guest
-    }
-
-    pub const fn host_uid(self) -> u32 {
-        self.host_uid
-    }
-
-    pub const fn host_gid(self) -> u32 {
-        self.host_gid
-    }
-
-    pub const fn instance(self) -> ObservedMachineInstance {
-        self.instance
-    }
-
-    pub fn matches(self, other: Self) -> bool {
-        self.guest == other.guest
-            && self.host_uid == other.host_uid
-            && self.host_gid == other.host_gid
-            && self.instance.compare(other.instance) == Some(true)
-    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -862,6 +371,11 @@ impl SessionError {
 
     pub fn hint(&self) -> Option<&str> {
         self.hint.as_deref()
+    }
+
+    pub(crate) fn context(mut self, context: &str) -> Self {
+        self.message = format!("{context}: {}", self.message);
+        self
     }
 }
 
@@ -1177,129 +691,6 @@ pub(crate) fn journal_session_channel(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn process_generation_matches_across_authority_without_reusing_a_pid() {
-        let namespace = ObservedNamespaceIdentity::new(1, 2);
-        let start = std::num::NonZeroU64::new(77).unwrap();
-        let privileged =
-            ObservedMachineInstance::from_process(42, start, Some((namespace, namespace)));
-        let unprivileged = ObservedMachineInstance::from_process(42, start, None);
-        assert_eq!(privileged.compare(unprivileged), Some(true));
-        let replacement =
-            ObservedMachineInstance::from_process(42, std::num::NonZeroU64::new(78).unwrap(), None);
-        assert_eq!(unprivileged.compare(replacement), Some(false));
-        assert_eq!(privileged.compare(replacement), Some(false));
-        let legacy = ObservedMachineInstance::new(42, namespace, namespace);
-        assert_eq!(legacy.compare(privileged), Some(true));
-        assert_eq!(legacy.compare(unprivileged), None);
-        let changed_namespaces = ObservedMachineInstance::from_process(
-            42,
-            start,
-            Some((namespace, ObservedNamespaceIdentity::new(1, 3))),
-        );
-        assert_eq!(privileged.compare(changed_namespaces), Some(false));
-    }
-
-    #[test]
-    fn guest_command_keeps_argv_boundaries_and_requires_absolute_program() {
-        let command = GuestCommand::new(
-            "/usr/bin/kitty",
-            vec!["--class".into(), "a b".into(), String::new()],
-        )
-        .unwrap();
-        assert_eq!(command.program(), "/usr/bin/kitty");
-        assert_eq!(command.args(), ["--class", "a b", ""]);
-        assert_eq!(command.argv(), ["/usr/bin/kitty", "--class", "a b", ""]);
-        assert!(matches!(
-            GuestCommand::new("kitty", Vec::new()),
-            Err(GuestCommandError::ProgramNotAbsolute)
-        ));
-    }
-
-    #[test]
-    fn guest_command_rejects_nul_and_unbounded_values() {
-        assert!(matches!(
-            GuestCommand::new("/bin/echo\0bad", Vec::new()),
-            Err(GuestCommandError::NulByte)
-        ));
-        assert!(matches!(
-            GuestCommand::new("/bin/echo", vec!["x".repeat(4097)]),
-            Err(GuestCommandError::ArgumentTooLong { .. })
-        ));
-    }
-
-    #[test]
-    fn guest_user_name_accepts_numeric_and_common_system_accounts() {
-        assert_eq!(
-            ValidatedGuestUserName::new("1000").unwrap().as_str(),
-            "1000"
-        );
-        assert_eq!(
-            ValidatedGuestUserName::new("alice-1").unwrap().as_str(),
-            "alice-1"
-        );
-        assert_eq!(
-            ValidatedGuestUserName::new("nvidia$").unwrap().as_str(),
-            "nvidia$"
-        );
-    }
-
-    #[test]
-    fn guest_user_name_rejects_target_and_argument_delimiters() {
-        for value in [
-            "",
-            "-root",
-            "alice@host",
-            "alice/name",
-            "alice\\name",
-            "alice name",
-            "alice\n",
-        ] {
-            assert!(ValidatedGuestUserName::new(value).is_err(), "{value:?}");
-        }
-    }
-
-    #[test]
-    fn guest_user_name_deserialization_reapplies_validation() {
-        let user: ValidatedGuestUserName = serde_json::from_str(r#""alice""#).unwrap();
-        assert_eq!(user.as_str(), "alice");
-        assert!(serde_json::from_str::<ValidatedGuestUserName>(r#""../root""#).is_err());
-    }
-
-    #[test]
-    fn interactive_shell_environment_is_typed_and_wire_validated() {
-        let environment = InteractiveShellEnvironment::new(
-            "xterm-kitty".into(),
-            Some("truecolor".into()),
-            Some(String::new()),
-        )
-        .unwrap();
-        let encoded = serde_json::to_value(&environment).unwrap();
-        let decoded: InteractiveShellEnvironment = serde_json::from_value(encoded).unwrap();
-
-        assert_eq!(decoded.term(), "xterm-kitty");
-        assert_eq!(decoded.colorterm(), Some("truecolor"));
-        assert_eq!(decoded.no_color(), Some(""));
-        assert!(InteractiveShellEnvironment::new("bad term".into(), None, None).is_err());
-        assert!(
-            InteractiveShellEnvironment::new("xterm".into(), Some("truecolor\n".into()), None,)
-                .is_err()
-        );
-        assert!(
-            serde_json::from_value::<InteractiveShellEnvironment>(serde_json::json!({
-                "term": "xterm",
-                "unexpected": "value"
-            }))
-            .is_err()
-        );
-    }
-
-    #[test]
-    fn embedded_terminal_environment_uses_tui_capabilities() {
-        let environment = InteractiveShellEnvironment::embedded();
-        assert_eq!(environment.term(), "xterm-256color");
-    }
 
     #[test]
     fn terminal_input_and_output_channels_are_bounded() {

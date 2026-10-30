@@ -26,7 +26,7 @@ impl MachineObservation for CatalogMachineObservation {
         let query = self.runtime.inspect(machine.as_str(), entry).await?;
         if query.value.completeness == InspectionCompleteness::RuntimeOnly {
             let mut properties = query.value;
-            match crate::adapters::runtime::systemd_tools::append_nspawn_unit_properties_with_runner(
+            match crate::adapters::runtime::systemd_tools::query::append_nspawn_unit_properties_with_runner(
                 machine,
                 self.systemd_tools.as_ref(),
                 &mut properties,

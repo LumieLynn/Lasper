@@ -1,6 +1,9 @@
+use crate::adapters::session::execution::NativeExecution;
+use crate::adapters::session::projection::{WaylandSessionResolver, X11SessionResolver};
+use crate::adapters::session::shell::SelectedUserShell;
 use crate::application::sessions::{
-    journal_session_channel, JournalSessionHandle, JournalSessionRequest, SessionError,
-    SessionPort, ShellTarget, TerminalLaunch, TerminalOpenError, TerminalSessionHandle,
+    journal_session_channel, GuestTarget, JournalSessionHandle, JournalSessionRequest,
+    SessionError, SessionPort, TerminalLaunch, TerminalOpenError, TerminalSessionHandle,
     TerminalSessionRequest, WaylandPreparationRequest, WaylandSessionContext, X11ProjectionContext,
     X11ProjectionProbeRequest,
 };
@@ -11,20 +14,20 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 const MAX_JOURNAL_DIAGNOSTICS: usize = 64 * 1024;
 
 pub(crate) struct DirectSessionAdapter {
-    machine: super::MachineSessionTransport,
-    wayland: super::wayland::WaylandSessionResolver,
-    x11: super::x11::X11SessionResolver,
+    machine: NativeExecution,
+    wayland: WaylandSessionResolver,
+    x11: X11SessionResolver,
 }
 
 impl DirectSessionAdapter {
     pub(crate) fn new(
-        machine: super::MachineSessionTransport,
+        machine: NativeExecution,
         nspawn: crate::adapters::config::NspawnConfigStore,
     ) -> Self {
         Self {
             machine: machine.clone(),
-            wayland: super::wayland::WaylandSessionResolver::new(machine.clone(), nspawn.clone()),
-            x11: super::x11::X11SessionResolver::new(machine, nspawn),
+            wayland: WaylandSessionResolver::new(machine.clone(), nspawn.clone()),
+            x11: X11SessionResolver::new(machine, nspawn),
         }
     }
 }
@@ -60,56 +63,38 @@ impl SessionPort for DirectSessionAdapter {
                 environment,
                 command,
             } => {
-                let wayland_display = self
-                    .wayland
-                    .prepare_display(
-                        ShellTarget::new(machine.clone(), user.clone()),
-                        environment.wayland_socket().cloned(),
-                        id,
+                let request = SelectedUserShell {
+                    target: GuestTarget::new(machine, user),
+                    terminal: environment.terminal_environment().clone(),
+                    wayland: environment.wayland_socket().cloned(),
+                    x11_display: environment.x11_context().map(|context| context.display()),
+                    command,
+                }
+                .prepare(&self.wayland, id)
+                .await?;
+                // Wayland preparation may open a guest probe. Recheck the
+                // desktop endpoint afterwards, immediately before execution.
+                if let Some(context) = environment.x11_context() {
+                    crate::adapters::platform::x11::revalidate_for_desktop(
+                        context.projection().host_socket(),
                     )
                     .await
-                    .map_err(TerminalOpenError::WaylandPreparation)?;
-                let x11_display = match environment.x11_context() {
-                    Some(context) => {
-                        crate::adapters::platform::x11::revalidate_for_desktop(
-                            context.projection().host_socket(),
-                        )
-                        .await
-                        .map_err(|error| {
-                            SessionError::new(format!(
-                                "revalidate prepared X11 display before opening shell: {error}"
-                            ))
-                        })?;
-                        Some(context.display())
-                    }
-                    None => None,
-                };
-                let shell_environment = super::MachineShellEnvironment::shell(
-                    environment.terminal_environment().clone(),
-                    wayland_display.as_deref(),
-                    x11_display,
-                )
-                .map_err(|error| {
-                    SessionError::new(format!("build selected-user shell environment: {error}"))
-                })?;
-                let request = super::MachineShellRequest::new(machine, user, shell_environment);
-                let request = match command {
-                    Some(command) => request.with_command(command),
-                    None => request,
-                };
+                    .map_err(|error| {
+                        SessionError::new(format!(
+                            "revalidate prepared X11 display before opening shell: {error}",
+                        ))
+                    })?;
+                }
                 self.machine
-                    .open_local(super::MachineSessionRequest::shell(request), id, size)
+                    .open_local(request, id, size)
                     .await
                     .map_err(Into::into)
             }
             TerminalLaunch::LoginPrompt => self
                 .machine
-                .open_local(
-                    super::MachineSessionRequest::login_prompt(machine),
-                    id,
-                    size,
-                )
-                .await
+                .login(&machine)
+                .await?
+                .into_local(id, size)
                 .map_err(Into::into),
         }
     }

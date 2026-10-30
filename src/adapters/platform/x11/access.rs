@@ -6,16 +6,18 @@
 
 use x11rb::protocol::xproto::Family;
 
+use crate::application::sessions::{GuestTarget, X11ProjectionContext};
 use crate::application::x11::{
     X11AclEntry, X11AclSnapshot, X11AuthorizationDisposition, X11AuthorizationPurpose,
     X11AuthorizationRequest, X11DesktopAuthorization, X11DesktopObservation, X11DesktopRevocation,
-    X11GrantRecordCatalog, X11GrantRecordEvidence, X11GrantRecordPhase, X11RevocationDisposition,
-    X11RevokeRequest,
+    X11GrantRecordCatalog, X11GrantRecordEvidence, X11GrantRecordPhase, X11RecordRevocationCheck,
+    X11RevocationDisposition, X11RevokeRequest,
 };
 use crate::domain::x11::HostX11Socket;
 
 use super::common::MAX_GRANT_RECORD_BYTES;
 use super::lifecycle::machine_claim_diagnostics;
+use super::ownership::GrantOwnership;
 use super::state::{
     load_existing_grant_records, load_existing_machine_claims, valid_record_id, GrantRecordPhase,
     MachineClaimCatalog, ManagedX11GrantKey, ManagedX11GrantRecord, ManagedX11MachineClaim,
@@ -23,25 +25,29 @@ use super::state::{
 };
 use super::transport::{
     authorization_was_confirmed, connect_current_socket, host_boot_id, insert_and_observe,
-    numeric_local_user_address, read_acl, remove_and_observe, require_current_socket,
-    x11_peer_start_time,
+    numeric_local_user_address, read_acl, require_current_socket, x11_peer_start_time,
+    ConnectedDesktopAcl, DesktopAcl,
 };
 
 pub(super) fn snapshot_desktop_sync(
-    socket: &HostX11Socket,
+    target: &GuestTarget,
+    projection: &X11ProjectionContext,
 ) -> Result<X11DesktopObservation, String> {
+    let socket = projection.host_socket();
     let connection = connect_current_socket(socket)?;
     let acl = read_acl(&connection, socket.display())?;
     require_current_socket(socket, "while querying its ACL")?;
-    let observation = desktop_observation(socket, acl, None);
+    let observation = desktop_observation(target, projection, acl, None);
     require_current_socket(socket, "while assessing its grant records")?;
     Ok(observation)
 }
 pub(super) fn desktop_observation(
-    socket: &HostX11Socket,
+    target: &GuestTarget,
+    projection: &X11ProjectionContext,
     acl: X11AclSnapshot,
     state: Option<&X11RuntimeState>,
 ) -> X11DesktopObservation {
+    let socket = projection.host_socket();
     let mut diagnostics = Vec::new();
     let host_boot_id = match host_boot_id() {
         Ok(value) => Some(value),
@@ -72,6 +78,25 @@ pub(super) fn desktop_observation(
         .map(X11RuntimeState::load_claims)
         .unwrap_or_else(load_existing_machine_claims);
     diagnostics.extend(machine_claim_diagnostics(&claims, host_boot_id.as_deref()));
+    let machine_claims = claims
+        .claims
+        .iter()
+        .filter_map(|claim| {
+            let record = records
+                .records
+                .iter()
+                .find(|record| record.record_id == claim.grant_record_id)?;
+            claim.active_evidence(record)
+        })
+        .collect();
+    let revocation_checks = revocation_checks(
+        target,
+        projection,
+        &records,
+        &claims,
+        host_boot_id.as_deref(),
+        server_peer_start_time,
+    );
     X11DesktopObservation::new(
         acl,
         uzers::get_effective_uid(),
@@ -80,6 +105,50 @@ pub(super) fn desktop_observation(
         records,
         diagnostics,
     )
+    .with_machine_claims(machine_claims, claims.complete)
+    .with_revocation_checks(revocation_checks)
+}
+
+pub(super) fn revocation_checks(
+    target: &GuestTarget,
+    projection: &X11ProjectionContext,
+    records: &X11GrantRecordCatalog,
+    claims: &MachineClaimCatalog,
+    boot_id: Option<&str>,
+    server_start_time: Option<u64>,
+) -> Vec<X11RecordRevocationCheck> {
+    records
+        .records
+        .iter()
+        .filter(|record| {
+            record.display == projection.host_socket().display()
+                && matches!(record.phase, X11GrantRecordPhase::ConfirmedAdded)
+        })
+        .map(|record| {
+            let request =
+                X11RevokeRequest::new(target.clone(), projection.clone(), record.record_id.clone());
+            let eligibility = (|| {
+                let boot_id = boot_id.ok_or("host boot identity is unavailable")?;
+                if record.boot_id != boot_id
+                    || Some(record.server_peer_start_time) != server_start_time
+                {
+                    return Err("X11 server continuity is not confirmed".into());
+                }
+                let ownership = GrantOwnership::inspect(
+                    records,
+                    claims,
+                    &ManagedX11GrantKey::from_evidence(record),
+                    boot_id,
+                )?;
+                ownership.require_request(&request, uzers::get_effective_uid())?;
+                ownership.require_exclusive_consumer(&request)
+            })();
+            X11RecordRevocationCheck {
+                record_id: record.record_id.clone(),
+                eligibility,
+            }
+        })
+        .collect()
 }
 
 pub(super) fn ensure_access_sync(
@@ -94,7 +163,7 @@ pub(super) fn ensure_access_sync(
     match before.mode() {
         crate::application::x11::X11AccessControlMode::Disabled => {
             return Ok(X11DesktopAuthorization::new(
-                desktop_observation(socket, before, None),
+                desktop_observation(request.target(), projection, before, None),
                 X11AuthorizationDisposition::AccessControlDisabled,
             ));
         }
@@ -127,7 +196,7 @@ pub(super) fn ensure_access_sync(
     match before.mode() {
         crate::application::x11::X11AccessControlMode::Disabled => {
             return Ok(X11DesktopAuthorization::new(
-                desktop_observation(socket, before, Some(&state)),
+                desktop_observation(request.target(), projection, before, Some(&state)),
                 X11AuthorizationDisposition::AccessControlDisabled,
             ));
         }
@@ -162,11 +231,19 @@ pub(super) fn ensure_access_sync(
             server_peer_start_time,
             &boot_id,
         )? {
-            Some(record_id) => X11AuthorizationDisposition::ReusedManaged { record_id },
+            Some(reused) => {
+                return Ok(X11DesktopAuthorization::new(
+                    desktop_observation(request.target(), projection, before, Some(&state))
+                        .with_diagnostics(reused.diagnostics),
+                    X11AuthorizationDisposition::ReusedManaged {
+                        record_id: reused.record_id,
+                    },
+                ));
+            }
             None => X11AuthorizationDisposition::PreExisting,
         };
         return Ok(X11DesktopAuthorization::new(
-            desktop_observation(socket, before, Some(&state)),
+            desktop_observation(request.target(), projection, before, Some(&state)),
             disposition,
         ));
     }
@@ -215,20 +292,25 @@ pub(super) fn ensure_access_sync(
                 "X11 access was added, but its operation record could not be finalized ({error}); the pending record was preserved"
             )
         })?;
-        if let Err(claim_error) =
-            state.write_claim(&ManagedX11MachineClaim::active_from_record(&record))
-        {
-            let reason = format!(
+        let diagnostics = match state.register_machine_claim(
+            ManagedX11MachineClaim::active_from_record(&record),
+            &existing_claims,
+        ) {
+            Ok(diagnostics) => diagnostics,
+            Err(claim_error) => {
+                let reason = format!(
                 "X11 access was confirmed, but its machine claim could not be persisted: {claim_error}"
             );
-            record.phase = GrantRecordPhase::OutcomeUnknown {
-                reason: reason.clone(),
-            };
-            let _ = state.write(&file_name, &record);
-            return Err(reason);
-        }
+                record.phase = GrantRecordPhase::OutcomeUnknown {
+                    reason: reason.clone(),
+                };
+                let _ = state.write(&file_name, &record);
+                return Err(reason);
+            }
+        };
         return Ok(X11DesktopAuthorization::new(
-            desktop_observation(socket, after, Some(&state)),
+            desktop_observation(request.target(), projection, after, Some(&state))
+                .with_diagnostics(diagnostics),
             X11AuthorizationDisposition::Added { record_id },
         ));
     }
@@ -268,6 +350,12 @@ pub(super) fn ensure_access_sync(
     })
 }
 
+#[derive(Debug)]
+pub(super) struct ManagedGrantReuse {
+    pub(super) record_id: String,
+    pub(super) diagnostics: Vec<String>,
+}
+
 pub(super) fn reuse_managed_grant_sync(
     state: &X11RuntimeState,
     records: &X11GrantRecordCatalog,
@@ -275,7 +363,7 @@ pub(super) fn reuse_managed_grant_sync(
     request: &X11AuthorizationRequest,
     server_peer_start_time: u64,
     boot_id: &str,
-) -> Result<Option<String>, String> {
+) -> Result<Option<ManagedGrantReuse>, String> {
     let key = ManagedX11GrantKey::from_projection(request.projection(), server_peer_start_time);
     let Some(record) = records.records.iter().find(|record| {
         record.caller_uid == uzers::get_effective_uid()
@@ -285,26 +373,15 @@ pub(super) fn reuse_managed_grant_sync(
     }) else {
         return Ok(None);
     };
-    let already_claimed = claims.claims.iter().any(|claim| {
-        claim.grant_record_id == record.record_id
-            && claim.boot_id == boot_id
-            && claim.key == key
-            && claim.machine == request.target().machine().as_str()
-            && claim.guest_user == request.target().user().as_str()
-            && claim.compare_machine_instance(request.projection().identity().instance())
-                == Some(true)
-            && claim.phase.requires_reconcile()
-    });
-    if !already_claimed {
-        // Reuse adds a lifecycle consumer, not a second ACL mutation record.
-        let claim = ManagedX11MachineClaim::active_for_grant(request, record)?;
-        state.write_claim(&claim).map_err(|error| {
-            format!(
-                "X11 access was not reused because its machine claim could not be saved: {error}"
-            )
-        })?;
-    }
-    Ok(Some(record.record_id.clone()))
+    // Reuse renews this consumer's lifecycle, not the original ACL mutation.
+    let claim = ManagedX11MachineClaim::active_for_grant(request, record)?;
+    let diagnostics = state
+        .register_machine_claim(claim, claims)
+        .map_err(|error| format!("X11 grant reuse could not be completed: {error}"))?;
+    Ok(Some(ManagedGrantReuse {
+        record_id: record.record_id.clone(),
+        diagnostics,
+    }))
 }
 
 pub(super) fn current_generation_record<'a>(
@@ -337,6 +414,16 @@ pub(super) fn revoke_access_sync(
     let state = X11RuntimeState::open_existing()?
         .ok_or_else(|| "X11 grant record storage does not exist".to_owned())?;
     let _lock = state.lock()?;
+    revoke_access_with_state(&state, request, ConnectedDesktopAcl::connect)
+}
+
+/// The caller holds the ACL lock. Separating runtime-directory selection from
+/// the operation also lets tests exercise the complete revoke flow in isolation.
+pub(super) fn revoke_access_with_state<D: DesktopAcl>(
+    state: &X11RuntimeState,
+    request: &X11RevokeRequest,
+    connect: impl FnOnce(&HostX11Socket) -> Result<D, String>,
+) -> Result<X11DesktopRevocation, String> {
     let records = state.load_records();
     if !records.complete {
         let detail = records
@@ -359,10 +446,6 @@ pub(super) fn revoke_access_sync(
             "X11 revocation was not attempted because Lasper cannot safely inspect its machine claims: {detail}"
         ));
     }
-    let claim_is_unresolved = claims.claims.iter().any(|claim| {
-        claim.grant_record_id == request.record_id() && claim.phase.requires_reconcile()
-    });
-
     let record_id = request.record_id();
     if !valid_record_id(record_id) {
         return Err("X11 revocation record ID is invalid".to_owned());
@@ -392,34 +475,18 @@ pub(super) fn revoke_access_sync(
 
     let projection = request.projection();
     let socket = projection.host_socket();
-    let current_uid = uzers::get_effective_uid();
-    if evidence.caller_uid != current_uid {
-        return Err("X11 grant record belongs to another invoking user".to_owned());
-    }
-    if evidence.target != *request.target()
-        || !evidence.identity.matches(projection.identity())
-        || evidence.display != socket.display()
-        || evidence.alternate_endpoint != socket.alternate()
-        || evidence.source != socket.source()
-        || evidence.canonical_source != socket.canonical_path()
-        || evidence.socket_revision != socket.revision()
-        || evidence.server_peer != socket.peer_identity().legacy_tuple()
-    {
-        return Err(
-            "X11 grant record does not match the current machine instance or endpoint".to_owned(),
-        );
-    }
     let current_boot_id = host_boot_id()?;
     if evidence.boot_id != current_boot_id {
         return Err("X11 grant record belongs to another host boot".to_owned());
     }
-    let connection = connect_current_socket(socket)?;
-    let current_server_start = x11_peer_start_time(socket)?;
-    if current_server_start != evidence.server_peer_start_time {
+    let key = ManagedX11GrantKey::from_evidence(&evidence);
+    let ownership = GrantOwnership::inspect(&records, &claims, &key, &current_boot_id)?;
+    ownership.require_request(request, uzers::get_effective_uid())?;
+    let desktop = connect(socket)?;
+    if desktop.server_start_time() != evidence.server_peer_start_time {
         return Err("X11 server generation changed since the grant was created".to_owned());
     }
-    let before = read_acl(&connection, socket.display())?;
-    require_current_socket(socket, "before changing its ACL")?;
+    let before = desktop.snapshot()?;
     match before.mode() {
         crate::application::x11::X11AccessControlMode::Disabled => {
             return Err("X11 access control is disabled; no ACL revoke was attempted".to_owned())
@@ -433,69 +500,52 @@ pub(super) fn revoke_access_sync(
     }
 
     if !before.contains(&evidence.acl_entry) {
-        record.phase = GrantRecordPhase::Revoked;
-        state.write(&file_name, &record).map_err(|error| {
-            format!(
-                "the exact ACL entry was already absent, but operation record {record_id} could not be finalized: {error}"
-            )
+        // Absence does not prove that other consumers ended. Retire only the
+        // claims matched to this request, then finish shared records only if
+        // no unresolved consumer or operation remains.
+        state.end_consumer_claims(&ownership.consumer_claims(request)).map_err(|error| {
+            format!("the exact ACL entry was already absent, but this consumer's claims could not be ended: {error}")
         })?;
-        if claim_is_unresolved {
-            state.end_claims(record_id).map_err(|error| {
-                format!(
-                    "the exact ACL entry was already absent and the grant record was finalized, but its machine claim could not be ended: {error}"
-                )
-            })?;
-        }
+        let remaining = state.load_claims();
+        let ownership = GrantOwnership::inspect(&records, &remaining, &key, &current_boot_id)?;
+        let diagnostics = match ownership.require_exclusive_consumer(request) {
+            Ok(()) => {
+                state.finish_revocation(&ownership.records).map_err(|error| {
+                    format!("the exact ACL entry was already absent, but its records could not be finalized: {error}")
+                })?;
+                Vec::new()
+            }
+            Err(reason) => vec![format!(
+                "the exact ACL entry is absent; shared records were retained: {reason}"
+            )],
+        };
         return Ok(X11DesktopRevocation::new(
-            desktop_observation(socket, before, Some(&state)),
+            desktop_observation(request.target(), projection, before, Some(state))
+                .with_diagnostics(diagnostics),
             X11RevocationDisposition::AlreadyAbsent {
                 record_id: record_id.to_owned(),
             },
         ));
     }
 
-    let shared_claims = claims
-        .claims
-        .iter()
-        .filter(|claim| claim.grant_record_id == record_id && claim.phase.requires_reconcile())
-        .count();
-    if shared_claims > 1 {
-        return Err(format!(
-            "X11 grant record {record_id} is shared by {shared_claims} unresolved machine claims; stop the machines and let lifecycle cleanup revoke the shared entry"
-        ));
-    }
+    ownership.require_exclusive_consumer(request)?;
 
-    let (change_result, observed) =
-        remove_and_observe(&connection, socket.display(), evidence.identity.host_uid());
-    let socket_result = require_current_socket(socket, "while revoking access");
-    let server_result = x11_peer_start_time(socket).and_then(|current| {
-        (current == evidence.server_peer_start_time)
-            .then_some(())
-            .ok_or_else(|| "X11 server process changed while revoking access".to_owned())
-    });
+    let (change_result, observed) = desktop.remove(evidence.identity.host_uid());
+    let endpoint_result = desktop.verify();
     let confirmed = change_result.is_ok()
-        && socket_result.is_ok()
-        && server_result.is_ok()
+        && endpoint_result.is_ok()
         && observed
             .as_ref()
             .is_ok_and(|snapshot| !snapshot.contains(&evidence.acl_entry));
     if confirmed {
         let after = observed.expect("confirmed observation is successful");
-        record.phase = GrantRecordPhase::Revoked;
-        state.write(&file_name, &record).map_err(|error| {
-            format!(
-                "X11 access was revoked, but operation record {record_id} could not be finalized ({error}); the confirmed record was preserved"
-            )
-        })?;
-        if claim_is_unresolved {
-            state.end_claims(record_id).map_err(|error| {
-                format!(
-                    "X11 access was revoked and the grant record was finalized, but its machine claim could not be ended: {error}"
-                )
+        state
+            .finish_revocation(&ownership.records)
+            .map_err(|error| {
+                format!("X11 access was revoked, but its records could not be finalized: {error}")
             })?;
-        }
         return Ok(X11DesktopRevocation::new(
-            desktop_observation(socket, after, Some(&state)),
+            desktop_observation(request.target(), projection, after, Some(state)),
             X11RevocationDisposition::Revoked {
                 record_id: record_id.to_owned(),
             },
@@ -507,12 +557,9 @@ pub(super) fn revoke_access_sync(
         observed
             .err()
             .map(|error| format!("confirmation query: {error}")),
-        socket_result
+        endpoint_result
             .err()
             .map(|error| format!("endpoint revalidation: {error}")),
-        server_result
-            .err()
-            .map(|error| format!("server generation: {error}")),
     ]
     .into_iter()
     .flatten()

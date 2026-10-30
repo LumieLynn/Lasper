@@ -304,7 +304,7 @@ fn terminal_mouse_event(status: TerminalInputStatus) -> WorkspaceEvent {
 mod tests {
     use super::*;
     use crate::adapters::config::NspawnConfigStore;
-    use crate::adapters::session::{DirectSessionAdapter, MachineSessionTransport};
+    use crate::adapters::session::{DirectSessionAdapter, NativeExecution};
     use crate::application::sessions::SessionService;
     use crossterm::event::{KeyEvent, KeyModifiers, MouseButton};
     use ratatui::layout::Rect;
@@ -312,7 +312,7 @@ mod tests {
 
     fn terminal_manager() -> TerminalManager {
         let service = Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
-            MachineSessionTransport::SystemdTools,
+            NativeExecution::SystemdTools,
             NspawnConfigStore::direct(),
         ))));
         TerminalManager::new(service, crate::config::DEFAULT_SCROLLBACK_LINES)

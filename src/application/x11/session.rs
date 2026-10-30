@@ -4,7 +4,7 @@
 //! projection and an authorization result. ACL observation and lifecycle
 //! reconciliation remain owned by the parent access service.
 
-use crate::application::sessions::{ShellTarget, X11SessionContext};
+use crate::application::sessions::{GuestTarget, X11SessionContext};
 use crate::domain::x11::HostX11Socket;
 
 use super::access::{X11AccessError, X11AuthorizationDisposition};
@@ -21,7 +21,7 @@ pub enum X11SessionSelection {
 pub(crate) trait X11SessionPreparationPort: Send + Sync {
     async fn prepare_session(
         &self,
-        target: ShellTarget,
+        target: GuestTarget,
         selection: X11SessionSelection,
     ) -> Result<X11SessionPreparation, X11AccessError>;
 }
@@ -35,7 +35,7 @@ pub struct X11SessionPreparation {
 
 impl X11SessionPreparation {
     pub(crate) fn new(
-        target: ShellTarget,
+        target: GuestTarget,
         check: X11AccessCheck,
         disposition: X11AuthorizationDisposition,
     ) -> Self {

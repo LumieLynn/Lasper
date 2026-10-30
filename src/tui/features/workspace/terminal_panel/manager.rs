@@ -1,8 +1,8 @@
 //! Terminal session management.
 
 use crate::application::sessions::{
-    terminal_session_channel, InteractiveShellEnvironment, SessionSendStatus, SessionService,
-    ShellLaunchRequest, ShellTarget, TerminalSessionHandle, TerminalSessionInput,
+    terminal_session_channel, GuestTarget, InteractiveShellEnvironment, SessionSendStatus,
+    SessionService, ShellLaunchRequest, TerminalSessionHandle, TerminalSessionInput,
     ValidatedGuestUserName, WaylandShellRequest,
 };
 use crate::application::x11::X11AccessService;
@@ -409,7 +409,7 @@ impl TerminalManager {
         let mut handle = match user.clone() {
             Some(user) => {
                 let request = ShellLaunchRequest::new(
-                    ShellTarget::new(machine, user),
+                    GuestTarget::new(machine, user),
                     wayland,
                     InteractiveShellEnvironment::embedded(),
                     size,
@@ -1194,7 +1194,7 @@ mod tests {
                 if let Some(host_socket) = environment.wayland_socket() {
                     self.prepare_wayland(WaylandPreparationRequest {
                         probe_id: request.id,
-                        target: crate::application::sessions::ShellTarget::new(
+                        target: crate::application::sessions::GuestTarget::new(
                             request.machine.clone(),
                             user.clone(),
                         ),
@@ -1352,7 +1352,7 @@ mod tests {
     #[tokio::test]
     async fn spawn_rejects_transitional_machine_states() {
         let service = Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
-            crate::adapters::session::MachineSessionTransport::SystemdTools,
+            crate::adapters::session::NativeExecution::SystemdTools,
             crate::adapters::config::NspawnConfigStore::direct(),
         ))));
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
@@ -1411,7 +1411,7 @@ mod tests {
     #[tokio::test]
     async fn browser_mode_keeps_navigation_local_and_visual_selection_is_native() {
         let service = Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
-            crate::adapters::session::MachineSessionTransport::SystemdTools,
+            crate::adapters::session::NativeExecution::SystemdTools,
             crate::adapters::config::NspawnConfigStore::direct(),
         ))));
         let mut manager = TerminalManager::new(service, 100);
@@ -1458,7 +1458,7 @@ mod tests {
     #[tokio::test]
     async fn normal_mouse_drag_enters_visual_with_the_clicked_scrollback_anchor() {
         let service = Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
-            crate::adapters::session::MachineSessionTransport::SystemdTools,
+            crate::adapters::session::NativeExecution::SystemdTools,
             crate::adapters::config::NspawnConfigStore::direct(),
         ))));
         let mut manager = TerminalManager::new(service, 100);
@@ -1544,7 +1544,7 @@ mod tests {
     async fn insert_mouse_scroll_keeps_cursor_position_and_follows_accepted_input() {
         crate::tui::foundation::theme::init_theme(crate::tui::foundation::theme::Theme::dark());
         let service = Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
-            crate::adapters::session::MachineSessionTransport::SystemdTools,
+            crate::adapters::session::NativeExecution::SystemdTools,
             crate::adapters::config::NspawnConfigStore::direct(),
         ))));
         let mut manager = TerminalManager::new(service, 100);
@@ -1602,7 +1602,7 @@ mod tests {
     #[tokio::test]
     async fn finished_hidden_terminals_release_both_screens_without_touching_live_history() {
         let service = Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
-            crate::adapters::session::MachineSessionTransport::SystemdTools,
+            crate::adapters::session::NativeExecution::SystemdTools,
             crate::adapters::config::NspawnConfigStore::direct(),
         ))));
         let mut manager = TerminalManager::new(service, 100);
@@ -1648,7 +1648,7 @@ mod tests {
     #[tokio::test]
     async fn duplicate_terminal_tabs_receive_stable_ordinals() {
         let service = Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
-            crate::adapters::session::MachineSessionTransport::SystemdTools,
+            crate::adapters::session::NativeExecution::SystemdTools,
             crate::adapters::config::NspawnConfigStore::direct(),
         ))));
         let mut manager = TerminalManager::new(service, crate::config::DEFAULT_SCROLLBACK_LINES);
@@ -1682,7 +1682,7 @@ mod tests {
 
         crate::tui::foundation::theme::init_theme(crate::tui::foundation::theme::Theme::dark());
         let service = Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
-            crate::adapters::session::MachineSessionTransport::SystemdTools,
+            crate::adapters::session::NativeExecution::SystemdTools,
             crate::adapters::config::NspawnConfigStore::direct(),
         ))));
         let mut manager = TerminalManager::new(service, 100);
@@ -1753,7 +1753,7 @@ mod tests {
     async fn terminal_tabs_follow_the_active_session_and_reset_after_widening() {
         crate::tui::foundation::theme::init_theme(crate::tui::foundation::theme::Theme::dark());
         let service = Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
-            crate::adapters::session::MachineSessionTransport::SystemdTools,
+            crate::adapters::session::NativeExecution::SystemdTools,
             crate::adapters::config::NspawnConfigStore::direct(),
         ))));
         let mut manager = TerminalManager::new(service, crate::config::DEFAULT_SCROLLBACK_LINES);
@@ -1822,7 +1822,7 @@ mod tests {
     #[tokio::test]
     async fn terminal_tab_click_selects_the_session_and_machine() {
         let service = Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
-            crate::adapters::session::MachineSessionTransport::SystemdTools,
+            crate::adapters::session::NativeExecution::SystemdTools,
             crate::adapters::config::NspawnConfigStore::direct(),
         ))));
         let mut manager = TerminalManager::new(service, crate::config::DEFAULT_SCROLLBACK_LINES);
@@ -1848,7 +1848,7 @@ mod tests {
     #[tokio::test]
     async fn closing_active_tab_reports_the_new_active_session() {
         let service = Arc::new(SessionService::new(Arc::new(DirectSessionAdapter::new(
-            crate::adapters::session::MachineSessionTransport::SystemdTools,
+            crate::adapters::session::NativeExecution::SystemdTools,
             crate::adapters::config::NspawnConfigStore::direct(),
         ))));
         let mut manager = TerminalManager::new(service, crate::config::DEFAULT_SCROLLBACK_LINES);

@@ -8,7 +8,7 @@ use ratatui::{
 };
 
 use crate::application::sessions::{
-    SessionError, ShellTarget, ValidatedGuestUserName, WaylandSessionContext,
+    GuestTarget, SessionError, ValidatedGuestUserName, WaylandSessionContext,
 };
 use crate::domain::machine::MachineName;
 use crate::domain::wayland::HostWaylandSocket;
@@ -41,11 +41,11 @@ pub(crate) enum WaylandSessionDialogAction {
     Close,
     Check {
         generation: u64,
-        target: ShellTarget,
+        target: GuestTarget,
         host_socket: HostWaylandSocket,
     },
     EnterShell {
-        target: ShellTarget,
+        target: GuestTarget,
         host_socket: HostWaylandSocket,
     },
 }
@@ -76,7 +76,7 @@ pub(crate) struct WaylandSessionDialog {
     form: FormState<SessionControl>,
     generation: u64,
     state: CheckState,
-    root_confirmation: Option<(ShellTarget, HostWaylandSocket)>,
+    root_confirmation: Option<(GuestTarget, HostWaylandSocket)>,
     pending_check: Option<tokio::task::JoinHandle<()>>,
 }
 
@@ -268,13 +268,13 @@ impl WaylandSessionDialog {
             .cloned()
     }
 
-    fn target(&mut self) -> Result<ShellTarget, String> {
+    fn target(&mut self) -> Result<GuestTarget, String> {
         let result = validate_guest_user(self.guest_user.value());
         self.user_error = result.as_ref().err().cloned();
         result?;
         let user = ValidatedGuestUserName::new(self.guest_user.value())
             .map_err(|error| error.to_string())?;
-        Ok(ShellTarget::new(self.machine.clone(), user))
+        Ok(GuestTarget::new(self.machine.clone(), user))
     }
 
     fn request_check(&mut self) -> WaylandSessionDialogAction {

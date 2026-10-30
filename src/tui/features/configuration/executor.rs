@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 
 use super::pages::{ConfigurationPageAction, ConfigurationPageUpdate};
 use crate::application::sessions::{
-    SessionService, ShellTarget, ValidatedGuestUserName, WaylandShellRequest,
+    GuestTarget, SessionService, ValidatedGuestUserName, WaylandShellRequest,
 };
 use crate::application::x11::X11AccessService;
 use crate::application::HostOperationTracker;
@@ -59,14 +59,14 @@ pub(crate) enum PageEffect<U> {
 
 pub(crate) struct ConfigurationTerminalRequest {
     page: ConfigurationPageId,
-    target: ShellTarget,
+    target: GuestTarget,
     access: WaylandShellRequest,
 }
 
 impl ConfigurationTerminalRequest {
     pub(in crate::tui::features::configuration) fn new(
         page: ConfigurationPageId,
-        target: ShellTarget,
+        target: GuestTarget,
         access: WaylandShellRequest,
     ) -> Self {
         Self {

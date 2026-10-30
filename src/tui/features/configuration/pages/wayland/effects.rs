@@ -57,7 +57,7 @@ pub(in crate::tui::features::configuration) fn start_action(
 fn spawn_check(
     service: Arc<crate::application::sessions::SessionService>,
     configuration_target: ConfigurationTarget,
-    target: crate::application::sessions::ShellTarget,
+    target: crate::application::sessions::GuestTarget,
     host_socket: crate::domain::wayland::HostWaylandSocket,
     generation: u64,
     events: PageEventSender<WaylandPageEvent>,

@@ -9,12 +9,12 @@ use std::path::{Path, PathBuf};
 use x11rb::protocol::xproto::Family;
 
 use crate::application::sessions::{
-    MappedGuestIdentity, ObservedGuestIdentity, ObservedMachineInstance, ObservedNamespaceIdentity,
-    ShellTarget, ValidatedGuestUserName, X11ProjectionContext,
+    GuestTarget, MappedGuestIdentity, ObservedGuestIdentity, ObservedMachineInstance,
+    ObservedNamespaceIdentity, ValidatedGuestUserName, X11ProjectionContext,
 };
 use crate::application::x11::{
     X11AclEntry, X11AuthorizationRequest, X11GrantRecordCatalog, X11GrantRecordEvidence,
-    X11GrantRecordPhase, X11ReconcileTarget,
+    X11GrantRecordPhase, X11MachineClaimEvidence, X11ReconcileTarget,
 };
 use crate::domain::machine::MachineName;
 use crate::domain::x11::X11SocketRevision;
@@ -171,7 +171,7 @@ impl ManagedX11GrantRecord {
             created_unix_millis: self.created_unix_millis,
             caller_uid: self.caller_uid,
             boot_id,
-            target: ShellTarget::new(machine, guest_user),
+            target: GuestTarget::new(machine, guest_user),
             identity: MappedGuestIdentity::verified(
                 ObservedGuestIdentity::new(self.guest_uid, self.guest_gid),
                 self.host_uid,
@@ -312,13 +312,51 @@ impl MachineClaimPhase {
     pub(super) fn requires_reconcile(&self) -> bool {
         !matches!(self, Self::Ended)
     }
+
+    /// Old workers persisted machine observation failures as terminal states.
+    /// The strings below identify that old on-disk format: keep them unchanged
+    /// when editing current diagnostics. New observations must not write them.
+    /// Uncertain ACL mutations remain blocked.
+    pub(super) fn tracks_machine_lifecycle(&self) -> bool {
+        match self {
+            Self::Active | Self::CleanupPending { .. } => true,
+            Self::Ended => false,
+            Self::NeedsReview { reason } => matches!(
+                reason.as_str(),
+                "machine registration belongs to a different machine instance"
+                | "machine leader changed but namespace identity is unavailable"
+                | "machine registration reappeared before cleanup; explicit preparation is required"
+                | "machine registration reappeared but namespace identity is unavailable; explicit preparation is required"
+                | "a different machine instance reappeared before cleanup; explicit preparation is required"
+            ),
+            Self::Unknown { reason } => {
+                matches!(
+                    reason.as_str(),
+                    "host boot identity is unavailable"
+                    | "machine namespace identity is unavailable; cleanup is blocked"
+                ) || [
+                    "system machined runtime path is not a directory: ",
+                    "cannot inspect system machined runtime directory ",
+                    "system machine registration changed during leader inspection ",
+                    "cannot inspect system machine leader ",
+                    "cannot inspect system machine instance ",
+                    "system machine registration is not a regular file: ",
+                    "cannot inspect system machine registration ",
+                ]
+                .iter()
+                .any(|prefix| reason.starts_with(prefix))
+            }
+        }
+    }
 }
 
 /// A lifecycle claim is deliberately separate from the grant operation
 /// record.  The grant record answers “what ACL mutation happened”; this file
-/// answers “which currently-running system-scope machine instance may keep
-/// that exact ACL key alive”.  Keeping the two records separate lets future
-/// reconciliation end a claim without rewriting operation history.
+/// answers “which system-scope machine instance requested that ACL key”.
+/// Cleanup waits until that instance unregisters or is replaced; authorizing
+/// the replacement requires explicit preparation and its own claim.
+/// Keeping the two records separate lets reconciliation end a claim without
+/// rewriting operation history.
 /// Multiple machine instances may reference the same grant record.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -446,6 +484,35 @@ impl ManagedX11MachineClaim {
         instance: ObservedMachineInstance,
     ) -> Option<bool> {
         self.machine_instance().ok()?.compare(instance)
+    }
+
+    pub(super) fn active_evidence(
+        &self,
+        record: &X11GrantRecordEvidence,
+    ) -> Option<X11MachineClaimEvidence> {
+        if !matches!(
+            self.phase,
+            MachineClaimPhase::Active | MachineClaimPhase::CleanupPending { .. }
+        ) || self.grant_record_id != record.record_id
+            || self.boot_id != record.boot_id
+            || self.key != ManagedX11GrantKey::from_evidence(record)
+        {
+            return None;
+        }
+        Some(X11MachineClaimEvidence {
+            grant_record_id: self.grant_record_id.clone(),
+            boot_id: self.boot_id.clone(),
+            target: GuestTarget::new(
+                MachineName::new(self.machine.clone()).ok()?,
+                ValidatedGuestUserName::new(self.guest_user.clone()).ok()?,
+            ),
+            identity: MappedGuestIdentity::verified(
+                ObservedGuestIdentity::new(self.guest_uid, self.guest_gid),
+                self.key.host_uid,
+                self.host_gid,
+                self.machine_instance().ok()?,
+            ),
+        })
     }
 }
 
@@ -599,21 +666,129 @@ impl X11RuntimeState {
             .map_err(|error| format!("persist X11 machine claim: {error}"))
     }
 
-    /// End all claims associated with one grant record. Older runtime state
-    /// has no claim directory; that is an ordinary compatibility case and is
-    /// intentionally treated as a no-op.
-    pub(super) fn end_claims(&self, grant_record_id: &str) -> Result<(), String> {
+    /// Under the ACL lock, register the current consumer before retiring its
+    /// predecessors across operation records for the same key. Only a current
+    /// claim write failure rejects registration; retirement failures are
+    /// diagnostics and can be retried without losing the saved consumer.
+    /// Claims for other machines/users and uncertain ACL outcomes are retained.
+    pub(super) fn register_machine_claim(
+        &self,
+        mut current: ManagedX11MachineClaim,
+        catalog: &MachineClaimCatalog,
+    ) -> Result<Vec<String>, String> {
+        if !catalog.complete {
+            return Err("cannot register an X11 machine claim from an incomplete catalog".into());
+        }
+        let instance = current.machine_instance()?;
+        let same_consumer = |claim: &&ManagedX11MachineClaim| {
+            claim.boot_id == current.boot_id
+                && claim.key == current.key
+                && claim.machine == current.machine
+                && claim.guest_user == current.guest_user
+                && claim.phase.tracks_machine_lifecycle()
+        };
+        let predecessors = catalog
+            .claims
+            .iter()
+            .filter(same_consumer)
+            .collect::<Vec<_>>();
+        if let Some(existing) = predecessors.iter().find(|claim| {
+            claim.grant_record_id == current.grant_record_id
+                && claim.compare_machine_instance(instance) == Some(true)
+                && claim.guest_uid == current.guest_uid
+                && claim.guest_gid == current.guest_gid
+                && claim.host_gid == current.host_gid
+        }) {
+            current.claim_id = existing.claim_id.clone();
+            current.created_unix_millis = existing.created_unix_millis;
+        }
+        self.write_claim(&current).map_err(|error| {
+            format!(
+                "could not confirm persistence of current machine claim {}: {error}",
+                current.claim_id
+            )
+        })?;
+        let mut diagnostics = Vec::new();
+        for previous in predecessors {
+            if previous.claim_id != current.claim_id {
+                let mut ended = previous.clone();
+                ended.phase = MachineClaimPhase::Ended;
+                if let Err(error) = self.write_claim(&ended) {
+                    diagnostics.push(format!(
+                        "current machine claim {} was saved, but predecessor {} could not be ended: {error}; its lifecycle remains unresolved",
+                        current.claim_id, previous.claim_id
+                    ));
+                }
+            }
+        }
+        Ok(diagnostics)
+    }
+
+    /// After absence has been confirmed, finish every operation record for the
+    /// shared key. End claims first: if a later write fails, confirmed records
+    /// retain the watcher and the next pass can finish without another revoke.
+    pub(super) fn finish_revocation(
+        &self,
+        records: &[&X11GrantRecordEvidence],
+    ) -> Result<(), String> {
         let claims = self.load_claims();
         if !claims.complete {
-            return Err("cannot end X11 grant claims because their catalog is incomplete".into());
+            return Err(
+                "cannot finalize X11 revocation because its claim catalog is incomplete".into(),
+            );
         }
         for mut claim in claims.claims {
-            if claim.grant_record_id == grant_record_id && claim.phase.requires_reconcile() {
+            if claim.phase.requires_reconcile()
+                && records
+                    .iter()
+                    .any(|record| record.record_id == claim.grant_record_id)
+            {
                 claim.phase = MachineClaimPhase::Ended;
                 self.write_claim(&claim)?;
             }
         }
+        for record in records {
+            self.mark_record_phase(&record.record_id, GrantRecordPhase::Revoked)?;
+        }
         Ok(())
+    }
+
+    pub(super) fn end_consumer_claims(
+        &self,
+        claims: &[&ManagedX11MachineClaim],
+    ) -> Result<(), String> {
+        for claim in claims {
+            let mut ended = (*claim).clone();
+            ended.phase = MachineClaimPhase::Ended;
+            self.write_claim(&ended)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn mark_record_phase(
+        &self,
+        record_id: &str,
+        phase: GrantRecordPhase,
+    ) -> Result<(), String> {
+        let file_name = format!("grant-{record_id}.json");
+        let file = self
+            .grants
+            .read_bounded(&file_name, MAX_GRANT_RECORD_BYTES)
+            .map_err(|error| format!("read X11 grant record {record_id}: {error}"))?
+            .ok_or_else(|| format!("X11 grant record {record_id} does not exist"))?;
+        if file.uid != uzers::get_effective_uid() || file.mode & 0o077 != 0 {
+            return Err(format!(
+                "X11 grant record {record_id} is not owned by the invoking user"
+            ));
+        }
+        let mut record: ManagedX11GrantRecord = serde_json::from_slice(&file.bytes)
+            .map_err(|error| format!("invalid X11 grant record {record_id}: {error}"))?;
+        record
+            .clone()
+            .into_evidence(&file_name)
+            .map_err(|error| format!("invalid X11 grant record {record_id}: {error}"))?;
+        record.phase = phase;
+        self.write(&file_name, &record)
     }
 
     pub(super) fn load_records(&self) -> X11GrantRecordCatalog {

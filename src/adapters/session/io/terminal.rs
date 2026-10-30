@@ -370,7 +370,7 @@ fn detach_notice(show: bool) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapters::session::pty::spawn_direct_terminal;
+    use crate::adapters::session::io::spawn_direct_terminal;
     use crate::domain::session::{SessionId, TerminalAttachmentKind};
     use portable_pty::CommandBuilder;
     use tokio::io::AsyncReadExt;

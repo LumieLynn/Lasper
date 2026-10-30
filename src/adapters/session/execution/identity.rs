@@ -1,4 +1,4 @@
-//! Host-side observation of one running machine's user namespace mapping.
+//! Host-side instance and identity mapping used by guest execution consumers.
 //!
 //! The selected runtime route resolves the leader PID. Procfs is then read
 //! from the host namespace so guest-provided output cannot choose an arbitrary
@@ -13,7 +13,7 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use super::MachineSessionTransport;
+use super::NativeExecution;
 
 const MAX_ID_MAP_BYTES: u64 = 32 * 1024;
 const MAX_ID_MAP_EXTENTS: usize = 340;
@@ -28,7 +28,7 @@ pub(crate) struct MachineInstanceSnapshot {
 
 impl MachineInstanceSnapshot {
     pub(crate) async fn observe(
-        transport: &MachineSessionTransport,
+        transport: &NativeExecution,
         machine: &MachineName,
     ) -> Result<Self, SessionError> {
         for _ in 0..OBSERVATION_ATTEMPTS {
@@ -92,12 +92,12 @@ impl MachineInstanceSnapshot {
 
 fn read_instance(leader: u32) -> std::io::Result<MachineInstanceSnapshot> {
     let proc = PathBuf::from(format!("/proc/{leader}"));
-    let before = crate::adapters::runtime::state::observe_machine_instance(leader)?;
+    let before = crate::adapters::runtime::registration::observe_machine_instance(leader)?;
     let uid_map = read_id_map(&proc.join("uid_map"))?;
     let gid_map = read_id_map(&proc.join("gid_map"))?;
     let current_uid_map = read_id_map(&proc.join("uid_map"))?;
     let current_gid_map = read_id_map(&proc.join("gid_map"))?;
-    let after = crate::adapters::runtime::state::observe_machine_instance(leader)?;
+    let after = crate::adapters::runtime::registration::observe_machine_instance(leader)?;
     if before != after || uid_map != current_uid_map || gid_map != current_gid_map {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,

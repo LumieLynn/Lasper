@@ -1,4 +1,5 @@
 use crate::adapters::elevated::{pipe_reader_owned, ElevatedDaemon};
+use crate::adapters::session::io::MachinePty;
 use crate::application::sessions::{
     journal_session_channel, JournalSessionHandle, JournalSessionRequest, SessionError,
     SessionPort, TerminalLaunch, TerminalOpenError, TerminalSessionHandle, TerminalSessionRequest,
@@ -27,7 +28,7 @@ impl SessionPort for ElevatedSessionAdapter {
         &self,
         machine: &crate::domain::machine::MachineName,
     ) -> Result<Option<crate::domain::wayland::HostWaylandSocket>, SessionError> {
-        super::wayland::automatic_wayland(
+        crate::adapters::session::projection::automatic_wayland(
             &crate::adapters::config::NspawnConfigStore::elevated(Arc::clone(&self.daemon)),
             machine,
         )
@@ -86,8 +87,8 @@ impl SessionPort for ElevatedSessionAdapter {
             .spawn_terminal(id.get(), machine.as_str(), size, launch)
             .await?;
         let Some(lifecycle) = spawned.lifecycle else {
-            return crate::adapters::session::pty::spawn_machine_terminal(
-                super::MachinePty {
+            return crate::adapters::session::io::spawn_machine_terminal(
+                MachinePty {
                     master: spawned.master_fd,
                     machine_removed: spawned.machine_removed,
                 },
@@ -96,7 +97,7 @@ impl SessionPort for ElevatedSessionAdapter {
             )
             .map_err(Into::into);
         };
-        let (handle, control) = match crate::adapters::session::pty::spawn_fd_terminal(
+        let (handle, control) = match crate::adapters::session::io::spawn_fd_terminal(
             spawned.master_fd,
             id,
             spawned.attach_kind,

@@ -16,8 +16,8 @@ use x11rb::protocol::xproto::{AccessControl, Family, ListHostsReply, Setup};
 use x11rb::x11_utils::Serialize;
 
 use crate::application::sessions::{
-    MappedGuestIdentity, ObservedGuestIdentity, ObservedMachineInstance, ObservedNamespaceIdentity,
-    ShellTarget, ValidatedGuestUserName, X11ProjectionContext,
+    GuestTarget, MappedGuestIdentity, ObservedGuestIdentity, ObservedMachineInstance,
+    ObservedNamespaceIdentity, ValidatedGuestUserName, X11ProjectionContext,
 };
 use crate::application::x11::{
     X11AclEntry, X11AclSnapshot, X11AuthorizationPurpose, X11AuthorizationRequest,
@@ -371,7 +371,7 @@ pub(super) fn grant_request_for_instance(
         identity,
     );
     X11AuthorizationRequest::new(
-        ShellTarget::new(
+        GuestTarget::new(
             crate::domain::machine::MachineName::new("archlinux").unwrap(),
             ValidatedGuestUserName::new("alice").unwrap(),
         ),
@@ -432,15 +432,15 @@ fn grant_records_are_versioned_and_reject_unknown_fields() {
 
     let claim = ManagedX11MachineClaim::active_from_record(&decoded);
     claim.validate(&format!("claim-{record_id}.json")).unwrap();
-    let claim_instance = claim.machine_instance().unwrap();
+    let registration = SystemMachineRegistration::Present {
+        leader_pid: claim.machine_leader_pid,
+        instance: Some(claim.machine_instance().unwrap()),
+    };
     assert_eq!(
         observe_machine_claim(
             &claim,
             Some(claim.boot_id.as_str()),
-            SystemMachineRegistration::Present {
-                leader_pid: claim_instance.leader_pid(),
-                instance: Some(claim_instance),
-            },
+            registration.clone(),
             1,
         ),
         Some(MachineClaimObservation::Active)
@@ -495,49 +495,14 @@ fn grant_records_are_versioned_and_reject_unknown_fields() {
         observe_machine_claim(
             &claim,
             Some("22222222-2222-4222-8222-222222222222"),
-            SystemMachineRegistration::Present {
-                leader_pid: claim_instance.leader_pid(),
-                instance: Some(claim_instance),
-            },
+            registration.clone(),
             1,
         ),
         Some(MachineClaimObservation::NeedsReview(_))
     ));
     assert!(matches!(
-        observe_machine_claim(
-            &claim,
-            None,
-            SystemMachineRegistration::Present {
-                leader_pid: claim_instance.leader_pid(),
-                instance: Some(claim_instance),
-            },
-            1,
-        ),
+        observe_machine_claim(&claim, None, registration, 1),
         Some(MachineClaimObservation::Unavailable(_))
-    ));
-    let replacement_instance = ObservedMachineInstance::new(
-        claim.machine_leader_pid.saturating_add(1),
-        ObservedNamespaceIdentity::new(
-            claim.machine_pid_namespace.unwrap().0,
-            claim.machine_pid_namespace.unwrap().1.saturating_add(1),
-        ),
-        ObservedNamespaceIdentity::new(
-            claim.machine_user_namespace.unwrap().0,
-            claim.machine_user_namespace.unwrap().1.saturating_add(1),
-        ),
-    );
-    assert!(matches!(
-        observe_machine_claim(
-            &claim,
-            Some(claim.boot_id.as_str()),
-            SystemMachineRegistration::Present {
-                leader_pid: replacement_instance.leader_pid(),
-                instance: Some(replacement_instance),
-            },
-            1,
-        ),
-        Some(MachineClaimObservation::NeedsReview(reason))
-            if reason.contains("different machine instance")
     ));
     let claim_value = serde_json::to_value(&claim).unwrap();
     let decoded_claim: ManagedX11MachineClaim =

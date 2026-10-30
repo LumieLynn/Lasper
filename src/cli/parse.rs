@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 
 use crate::application::sessions::{
-    GuestCommand, ShellTarget, ValidatedGuestUserName, WaylandShellRequest,
+    GuestCommand, GuestTarget, ValidatedGuestUserName, WaylandShellRequest,
 };
 use crate::domain::machine::MachineName;
 use crate::domain::wayland::WaylandDisplay;
@@ -208,7 +208,7 @@ fn parse_wayland_option(argument: &str) -> Result<Option<WaylandShellRequest>, S
     }
 }
 
-fn parse_shell_target(target: &str) -> Result<ShellTarget, String> {
+fn parse_shell_target(target: &str) -> Result<GuestTarget, String> {
     let Some((user, machine)) = target.split_once('@') else {
         return Err("session target must be USER@MACHINE".into());
     };
@@ -219,7 +219,7 @@ fn parse_shell_target(target: &str) -> Result<ShellTarget, String> {
         .map_err(|error| format!("invalid machine in session target: {error}"))?;
     let user = ValidatedGuestUserName::new(user)
         .map_err(|error| format!("invalid user in session target: {error}"))?;
-    Ok(ShellTarget::new(machine, user))
+    Ok(GuestTarget::new(machine, user))
 }
 
 fn parse_x11_display(value: &str) -> Result<u16, String> {

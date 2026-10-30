@@ -1,31 +1,33 @@
 //! Runtime validation for a Wayland bind that was declared before container
 //! startup. This module never creates or removes mounts.
 
-use super::probe::SocketAccess;
-use super::wayland_probe::{WaylandProbeObservation, WaylandProbeRequest};
-use super::{MachineSessionRequest, MachineSessionTransport};
+mod probe;
+
 use crate::adapters::config::NspawnConfigStore;
+use crate::adapters::session::execution::NativeExecution;
+use crate::adapters::session::projection::probe::SocketAccess;
 use crate::application::sessions::{
-    SessionError, ShellTarget, TerminalSessionHandle, WaylandPreparationRequest,
+    GuestTarget, SessionError, TerminalSessionHandle, WaylandPreparationRequest,
     WaylandSessionContext,
 };
 use crate::domain::machine::MachineName;
 use crate::domain::session::{SessionId, SessionSize};
+use probe::{WaylandProbeObservation, WaylandProbeRequest};
 
 #[derive(Clone)]
 pub(crate) struct WaylandSessionResolver {
-    machine: MachineSessionTransport,
+    machine: NativeExecution,
     nspawn: NspawnConfigStore,
     authorized_uid: u32,
 }
 
 impl WaylandSessionResolver {
-    pub(crate) fn new(machine: MachineSessionTransport, nspawn: NspawnConfigStore) -> Self {
+    pub(crate) fn new(machine: NativeExecution, nspawn: NspawnConfigStore) -> Self {
         Self::for_authorized_uid(machine, nspawn, crate::adapters::platform::invoking_uid())
     }
 
     pub(crate) fn for_authorized_uid(
-        machine: MachineSessionTransport,
+        machine: NativeExecution,
         nspawn: NspawnConfigStore,
         authorized_uid: u32,
     ) -> Self {
@@ -89,7 +91,7 @@ impl WaylandSessionResolver {
     /// the selected host socket, never an earlier Check Access observation.
     pub(crate) async fn prepare_display(
         &self,
-        target: ShellTarget,
+        target: GuestTarget,
         socket: Option<crate::domain::wayland::HostWaylandSocket>,
         probe_id: SessionId,
     ) -> Result<Option<std::path::PathBuf>, SessionError> {
@@ -109,7 +111,7 @@ impl WaylandSessionResolver {
     }
 }
 
-pub(super) async fn automatic_wayland(
+pub(in crate::adapters::session) async fn automatic_wayland(
     nspawn: &NspawnConfigStore,
     machine: &MachineName,
 ) -> Result<Option<crate::domain::wayland::HostWaylandSocket>, SessionError> {
@@ -171,17 +173,18 @@ async fn revalidate_host_socket(
 }
 
 async fn run_probe(
-    machine: &MachineSessionTransport,
+    machine: &NativeExecution,
     request: WaylandProbeRequest,
     id: SessionId,
 ) -> Result<WaylandProbeObservation, SessionError> {
     let size = SessionSize::new(80, 24).expect("fixed probe PTY size is valid");
     let mut handle: TerminalSessionHandle = machine
-        .open_local(MachineSessionRequest::wayland_probe(request), id, size)
-        .await?;
-    super::wayland_probe::collect_wayland_probe(&mut handle)
+        .open_local(request.execution_request()?, id, size)
         .await
-        .map_err(|error| SessionError::new(format!("Wayland access probe failed: {error}")))
+        .map_err(|error| error.context("open Wayland access probe"))?;
+    probe::collect_wayland_probe(&mut handle)
+        .await
+        .map_err(|error| error.context("Wayland access probe failed"))
 }
 
 fn projection_not_configured() -> SessionError {
@@ -194,7 +197,7 @@ fn projection_not_configured() -> SessionError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adapters::session::probe::SocketObservation;
+    use crate::adapters::session::projection::probe::SocketObservation;
     use crate::application::sessions::ObservedGuestIdentity;
     use crate::domain::wayland::{HostWaylandSocket, SocketRevision, WaylandDisplay};
     use std::path::{Path, PathBuf};

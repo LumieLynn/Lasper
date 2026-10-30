@@ -16,7 +16,7 @@ pub(super) async fn handle(
     operation: FdOperation,
     server_state: Arc<DaemonServerState>,
     trusted_state_root: TrustedStateRoot,
-    machine: crate::adapters::session::MachineSessionTransport,
+    machine: crate::adapters::session::NativeExecution,
     invoking_uid: u32,
 ) {
     let Some(_active_request) = server_state.shutdown.admit() else {
