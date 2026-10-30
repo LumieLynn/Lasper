@@ -84,7 +84,7 @@ The configuration is typed and can control:
 
 Command-line flags take precedence over the corresponding settings. Configuration does not add arbitrary executable paths or arbitrary root commands.
 
-The TUI's per-machine configuration editor separately manages Wayland and X11 display binds. Those binds belong to the machine's `.nspawn` configuration rather than to the global TOML file.
+The TUI's per-machine configuration editor separately manages Wayland and X11 display binds. Those binds belong to the machine's `.nspawn` configuration rather than to the global TOML file. X11 authorization is a separate runtime action; the access dialog shows whether Lasper manages the current grant and whether it can be revoked for the selected user. See the [display-access FAQ](FAQ.md#how-do-wayland-and-x11-display-access-work) for the checks and cleanup behavior.
 
 ## Usage
 

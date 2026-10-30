@@ -104,13 +104,33 @@ Opening a display-enabled shell does not mount a host socket at runtime, write a
 
 ### Wayland
 
-The automatic shell probe resolves the current host `WAYLAND_DISPLAY` through `XDG_RUNTIME_DIR` and uses it only when that exact host socket is declared as a startup bind. Before the shell opens, a fixed probe runs as the selected guest user and reports a bounded result: whether the projected target exists, is a Unix socket, is usable by that user, and still has the expected device and inode. Lasper compares that evidence with the host socket and the machine's startup configuration. This probe is read-only and does not grant any additional access. `--wayland=DISPLAY` selects a display strictly, while `--no-wayland` requests a terminal-only session. An automatic probe failure in interactive `lasper shell` can fall back once to a terminal-only shell; explicit selection and `lasper launch` remain strict.
+The automatic shell probe resolves the current host `WAYLAND_DISPLAY` through `XDG_RUNTIME_DIR` and uses it only when that exact host socket is declared as a startup bind. Before the shell opens, a fixed probe runs as the selected guest user and reports whether the projected target is a Unix socket, its device and inode, and whether that user has write access. Lasper compares that evidence with the host socket and the machine's startup configuration. If the probe cannot inspect a path, it reports it as unavailable rather than assuming it does not exist; a missing path and an inaccessible parent directory can both cause the check to fail. This probe is read-only and does not grant additional access. `--wayland=DISPLAY` selects a display strictly, while `--no-wayland` requests a terminal-only session. An automatic probe failure in interactive `lasper shell` can fall back once to a terminal-only shell; explicit selection and `lasper launch` remain strict.
 
 ### X11
 
 X11 is always explicit: use `--with-x11` for the current local `DISPLAY`, `--with-x11=:N` for a specific display, or the corresponding TUI action. The selected display must resolve to a supported pathname socket that is already declared in the machine's startup configuration. Its probe checks both the projected bind and the guest's X11 client path, and compares their socket identities with the current host endpoint before the shell opens.
 
-The shell still receives only the selected display environment and terminal variables. However, when X11 access control is enabled, `--with-x11` may additionally add a recorded numeric `localuser` ACL entry for the projected guest identity. That host-side authorization records the display, socket revision, X server generation, and machine instance, and cleanup revokes only an entry that matches the record. If the X server has disabled access control, Lasper does not add an ACL entry; it also never removes pre-existing or externally managed entries. X11 clients receive broad access to the selected X server, so Wayland is the safer default for untrusted guests.
+The shell still receives only the selected display environment and terminal variables. However, when X11 access control is enabled, `--with-x11` may additionally add a recorded numeric `localuser` ACL entry for the projected guest identity. That host-side authorization records the display, socket revision, X server generation, and machine instance, and cleanup revokes only an entry that matches the record. If the X server has disabled access control, Lasper does not add an ACL entry. It does not adopt pre-existing entries as its own, though it cannot distinguish an external removal and recreation of the exact same entry; see [SECURITY.md](SECURITY.md#display-access). X11 clients receive broad access to the selected X server, so Wayland is the safer default for untrusted guests.
+
+### Why can an X11 grant be Managed without a Revoke action?
+
+`Managed` means the observed ACL entry matches Lasper's records for this user, machine instance, and X server. Revoking it is a separate decision: another registered consumer may still need the same entry, an operation may have an unknown result, or the selected listener may differ from the recorded endpoint. The dialog shows the reason when Revoke is unavailable. Lasper checks these conditions again before changing the ACL, so a later external change can still cause a request to fail.
+
+### When is X11 access cleaned up?
+
+Lasper tracks each registered consumer by machine instance, not by shell lifetime. Closing a shell does not revoke access while its machine is still running. After the last registered consumer stops or is replaced, cleanup checks the machine state again after a short grace period before removing the shared entry. A restarted machine needs a new explicit X11 session through Lasper to register its own claim; programs started outside Lasper do not renew it.
+
+For cleanup after Lasper exits, it registers `lasper-x11-lifecycle.path` and `lasper-x11-lifecycle.service` with the invoking user's systemd manager. The path unit watches system-machine registration changes, and the service runs reconciliation as needed. These are transient user units, not a continuously running Lasper daemon. Keep the installed Lasper executable available at the path used when the units were registered.
+
+To inspect or retry cleanup from the same desktop user session, run:
+
+```bash
+systemctl --user status lasper-x11-lifecycle.path lasper-x11-lifecycle.service
+journalctl --user -u lasper-x11-lifecycle.service
+lasper --internal-x11-reconcile
+```
+
+The units are stopped or collected when there is no remaining work, so their absence after successful cleanup is normal. Failed observations or unresolved operations can leave a grant in place for review. If an entry has already been removed externally, an explicit revoke request only ends the claims proven to belong to that request; it retains other consumers and uncertain records. Lasper finalizes the shared records only when their remaining consumers and operations are accounted for.
 
 ## Why did a shell fall back without Wayland?
 
