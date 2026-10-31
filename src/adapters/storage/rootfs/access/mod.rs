@@ -17,6 +17,17 @@ impl RootfsAccess {
             .read(true)
             .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(path)?;
+        Self::from_directory(root)
+    }
+
+    /// Reuse a pinned running guest root without resolving its path again.
+    pub(crate) fn from_directory(root: File) -> io::Result<Self> {
+        if !root.metadata()?.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "rootfs is not a directory",
+            ));
+        }
         Ok(Self { root })
     }
 

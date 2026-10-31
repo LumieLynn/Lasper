@@ -44,6 +44,7 @@ impl NativeExecution {
         &self,
         request: GuestExecutionRequest,
     ) -> Result<NativeSession, SessionError> {
+        self.require_native(request.target().machine()).await?;
         match self {
             Self::Dbus(dbus) => {
                 let master = dbus

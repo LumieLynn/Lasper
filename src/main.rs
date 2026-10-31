@@ -47,6 +47,9 @@ fn build_tui_runtime() -> Result<tokio::runtime::Runtime> {
 }
 
 fn main() -> Result<ExitCode> {
+    if let Some(result) = adapters::process::guest_bus::dispatch_connector() {
+        return result.map(|()| ExitCode::SUCCESS).map_err(Into::into);
+    }
     // 1. Help, version and invalid arguments finish without a runtime,
     //    configuration loading or terminal takeover.
     let dispatch = match cli::dispatch() {

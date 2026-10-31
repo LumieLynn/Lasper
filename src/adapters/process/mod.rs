@@ -1,5 +1,8 @@
 //! Command builder helpers.
 
+mod child;
+pub(crate) mod guest_bus;
+pub(crate) use child::ProcessGroupChild;
 mod rootfs;
 #[cfg(test)]
 pub(crate) use rootfs::MockRootfsProcessRunner;
@@ -336,17 +339,11 @@ pub(crate) async fn run_bounded_child_command(
     } else {
         command.stdin(Stdio::null());
     }
-    command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .as_std_mut()
-        .process_group(0);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
-    let mut child = command.spawn()?;
-    let pid = child.id().ok_or_else(|| {
-        std::io::Error::other(format!("bounded command {label} has no process id"))
-    })?;
+    let mut process = ProcessGroupChild::spawn(command, label)?;
+    let pid = process.pid();
+    let child = process.child_mut();
     let stdin = child.stdin.take();
     let stdout = child.stdout.take().expect("bounded child stdout was piped");
     let stderr = child.stderr.take().expect("bounded child stderr was piped");
@@ -359,13 +356,17 @@ pub(crate) async fn run_bounded_child_command(
             }
             Ok::<(), std::io::Error>(())
         };
-        let (status, input_result, stdout, stderr) = tokio::join!(
-            child.wait(),
+        // Drain I/O before reaping. Until the streams close, the unreaped
+        // leader keeps its PID/process-group identity reserved for cancellation.
+        let (input_result, stdout, stderr) = tokio::join!(
             write_input,
             read_bounded_stream(stdout, output_limit),
             read_bounded_stream(stderr, output_limit),
         );
-        let status = status.map_err(|error| unconfirmed_process_exit(label, error))?;
+        let status = child
+            .wait()
+            .await
+            .map_err(|error| unconfirmed_process_exit(label, error))?;
         input_result?;
         Ok::<Output, std::io::Error>(Output {
             status,
@@ -375,6 +376,10 @@ pub(crate) async fn run_bounded_child_command(
     });
 
     if let Ok(result) = tokio::time::timeout(timeout, &mut completion).await {
+        drop(completion);
+        if process.child_mut().id().is_none() {
+            process.completed();
+        }
         return result;
     }
     drop(completion);
@@ -384,7 +389,11 @@ pub(crate) async fn run_bounded_child_command(
         timeout.as_millis()
     );
     let termination =
-        terminate_child_process_group(&mut child, pid, label, BOUNDED_TERMINATION_GRACE).await;
+        terminate_child_process_group(process.child_mut(), pid, label, BOUNDED_TERMINATION_GRACE)
+            .await;
+    if termination.is_ok() {
+        process.completed();
+    }
     match termination {
         Ok(_) => Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,

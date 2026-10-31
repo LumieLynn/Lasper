@@ -3,6 +3,7 @@
 
 mod command;
 mod environment;
+mod readiness;
 mod request;
 mod target;
 
@@ -14,4 +15,5 @@ pub use target::{
 };
 
 pub(crate) use environment::GuestEnvironment;
+pub(crate) use readiness::NativeReadiness;
 pub(crate) use request::{GuestExecutionRequest, GuestProcess};

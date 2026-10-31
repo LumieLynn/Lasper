@@ -9,6 +9,7 @@ mod control;
 mod events;
 mod protocol;
 mod query;
+pub(crate) mod readiness;
 mod session;
 
 use crate::adapters::error::{NspawnError, Result};
