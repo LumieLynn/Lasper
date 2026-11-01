@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 pub(crate) use direct::DirectSessionAdapter;
 pub(crate) use elevated::ElevatedSessionAdapter;
-pub(crate) use execution::{NativeExecution, NativeSession};
+pub(crate) use execution::{NativeExecution, NativeSession, PreparedNativeCommand};
 pub(crate) use io::MachinePty;
 pub(crate) use projection::{WaylandSessionResolver, X11SessionResolver};
 pub(crate) use shell::SelectedUserShell;

@@ -3,7 +3,9 @@
 
 mod identity;
 mod native;
+mod prepared;
 mod readiness;
 
 pub(crate) use identity::MachineInstanceSnapshot;
 pub(crate) use native::{NativeExecution, NativeSession};
+pub(crate) use prepared::{PreparedNativeCommand, PreparedNativeExecution};

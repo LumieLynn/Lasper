@@ -19,13 +19,20 @@ pub(crate) struct SelectedUserShell {
 }
 
 impl SelectedUserShell {
+    /// Use the same preparation budget for local and daemon execution, leaving
+    /// five seconds for the daemon's 150-second FD handoff deadline.
+    pub(crate) fn preparation_deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + std::time::Duration::from_secs(145)
+    }
+
     pub(crate) async fn prepare(
         self,
         wayland: &WaylandSessionResolver,
         probe_id: SessionId,
+        deadline: tokio::time::Instant,
     ) -> Result<GuestExecutionRequest, TerminalOpenError> {
         let display = wayland
-            .prepare_display(self.target.clone(), self.wayland, probe_id)
+            .prepare_display(self.target.clone(), self.wayland, probe_id, deadline)
             .await
             .map_err(TerminalOpenError::WaylandPreparation)?;
         let environment =

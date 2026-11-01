@@ -3,6 +3,9 @@
 use crate::adapters::session::{
     MachinePty, NativeExecution, NativeSession, SelectedUserShell, WaylandSessionResolver,
 };
+use crate::application::sessions::execution::{
+    GuestExecutionError, GuestExecutionFailure, GuestExecutionPort, PreparedGuestExecution,
+};
 use crate::application::sessions::{GuestCommand, GuestTarget, SessionError, TerminalOpenError};
 use crate::daemon::sessions::process::{self, SessionChild};
 use crate::daemon::sessions::{handoff, lifecycle, SessionRegistry};
@@ -34,21 +37,22 @@ pub(crate) async fn open(
     let probe_id = SessionId::new(session_id.get()).expect("wire session id is non-zero");
     let opening = prepare(&name, launch, machine, invoking_uid, probe_id).await;
     handoff::respond(stream, move |stream| {
-        let opening = match opening {
-            Ok(opening) => opening,
-            Err(error) => {
-                log::warn!("Daemon terminal preparation failed: {error}");
-                let response = serde_json::to_vec(&WireTerminalStartupError::from(error))?;
-                stream.send_with_fd(&response, &[])?;
-                return Ok(());
+        let result = opening.and_then(|opening| {
+            match opening {
+                NativeSession::Pty(pty) => deliver_machine_terminal(stream, pty)
+                    .map_err(|error| execution_error(GuestExecutionFailure::OutcomeUnknown, error)),
+                NativeSession::Command(command) => {
+                    spawn_process_terminal(stream, session_id, name, size, command, sessions)
+                }
             }
-        };
-        match opening {
-            NativeSession::Pty(pty) => deliver_machine_terminal(stream, pty),
-            NativeSession::Command(command) => {
-                spawn_process_terminal(stream, session_id, name, size, command, sessions)
-            }
+            .map_err(TerminalOpenError::from)
+        });
+        if let Err(error) = result {
+            log::warn!("Daemon terminal startup failed: {error}");
+            let response = serde_json::to_vec(&WireTerminalStartupError::from(error))?;
+            stream.send_with_fd(&response, &[])?;
         }
+        Ok(())
     })
     .await;
 }
@@ -69,6 +73,7 @@ async fn prepare(
             x11_display,
             command,
         } => {
+            let deadline = SelectedUserShell::preparation_deadline();
             let command = command
                 .map(GuestCommand::try_from)
                 .transpose()
@@ -89,9 +94,15 @@ async fn prepare(
                 x11_display,
                 command,
             }
-            .prepare(&resolver, probe_id)
+            .prepare(&resolver, probe_id, deadline)
             .await?;
-            machine.open(request).await.map_err(Into::into)
+            machine
+                .prepare(request, deadline)
+                .await
+                .map_err(TerminalOpenError::from)?
+                .open()
+                .await
+                .map_err(Into::into)
         }
     }
 }
@@ -101,9 +112,9 @@ fn spawn_process_terminal(
     session_id: WireSessionId,
     name: MachineName,
     size: WireTerminalSize,
-    command: portable_pty::CommandBuilder,
+    command: crate::adapters::session::PreparedNativeCommand,
     sessions: Arc<SessionRegistry>,
-) -> anyhow::Result<()> {
+) -> Result<(), GuestExecutionError> {
     let size = size.into_session_size();
     let pair = portable_pty::native_pty_system()
         .openpty(portable_pty::PtySize {
@@ -112,17 +123,24 @@ fn spawn_process_terminal(
             pixel_width: 0,
             pixel_height: 0,
         })
-        .context("open terminal PTY")?;
-    let master_fd = pair.master.as_raw_fd().context("PTY master has no fd")?;
+        .context("open terminal PTY")
+        .map_err(|error| execution_error(GuestExecutionFailure::NotAttempted, error))?;
+    let master_fd = pair
+        .master
+        .as_raw_fd()
+        .context("PTY master has no fd")
+        .map_err(|error| execution_error(GuestExecutionFailure::NotAttempted, error))?;
     let kind = crate::domain::session::TerminalAttachmentKind::Login;
     let response = serde_json::to_vec(&SpawnTerminalResponse {
         attach_kind: WireTerminalAttachmentKind::from(kind),
         lifecycle: WireTerminalLifecycleSource::DaemonStatus,
-    })?;
+    })
+    .map_err(|error| execution_error(GuestExecutionFailure::NotAttempted, error))?;
     let child = pair
         .slave
-        .spawn_command(command)
-        .context("spawn terminal attachment")?;
+        .spawn_command(command.into_command()?)
+        .context("spawn terminal attachment")
+        .map_err(|error| execution_error(GuestExecutionFailure::NotAttempted, error))?;
     drop(pair.slave);
     process::deliver(
         SessionChild::Terminal { child, name, kind },
@@ -132,6 +150,14 @@ fn spawn_process_terminal(
         &response,
         master_fd,
     )
+    .map_err(|error| execution_error(GuestExecutionFailure::OutcomeUnknown, error))
+}
+
+fn execution_error(
+    failure: GuestExecutionFailure,
+    error: impl std::fmt::Display,
+) -> GuestExecutionError {
+    GuestExecutionError::new(failure, SessionError::new(error.to_string()))
 }
 
 fn deliver_machine_terminal(stream: &UnixStream, pty: MachinePty) -> anyhow::Result<()> {
@@ -189,7 +215,7 @@ mod tests {
             panic!("expected the selected systemd-tools transport");
         };
         assert_eq!(
-            command.get_argv(),
+            command.into_command().unwrap().get_argv(),
             &["machinectl", "--", "login", "test-machine"]
         );
     }

@@ -19,6 +19,7 @@ use tokio::sync::Mutex;
 use zbus::Connection;
 
 use connection::ConnectionCache;
+pub(crate) use session::GuestSessionOpenError;
 
 #[derive(Clone)]
 pub struct DbusBackend {

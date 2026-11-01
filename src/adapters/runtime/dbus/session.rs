@@ -2,11 +2,49 @@
 
 use crate::adapters::error::{NspawnError, Result};
 use crate::application::sessions::execution::{GuestExecutionRequest, GuestProcess};
-use crate::application::sessions::ValidatedGuestUserName;
 use crate::domain::machine::MachineName;
 use std::os::fd::OwnedFd;
+use thiserror::Error;
 
 use super::DbusBackend;
+
+#[derive(Debug, Error)]
+pub(crate) enum GuestSessionOpenError {
+    #[error("guest session was not submitted: {0}")]
+    NotAttempted(NspawnError),
+    #[error("guest session was rejected: {0}")]
+    Rejected(NspawnError),
+    #[error("guest session submission outcome is unknown: {0}")]
+    OutcomeUnknown(NspawnError),
+}
+
+impl GuestSessionOpenError {
+    fn from_submitted(error: NspawnError) -> Self {
+        match &error {
+            NspawnError::Dbus(zbus::Error::MethodError(name, ..))
+                if matches!(
+                    name.as_str(),
+                    "org.freedesktop.DBus.Error.AccessDenied"
+                        | "org.freedesktop.DBus.Error.AuthFailed"
+                        | "org.freedesktop.DBus.Error.InteractiveAuthorizationRequired"
+                        | "org.freedesktop.DBus.Error.InvalidArgs"
+                        | "org.freedesktop.DBus.Error.UnknownMethod"
+                        | "org.freedesktop.machine1.NoSuchMachine"
+                ) =>
+            {
+                Self::Rejected(error)
+            }
+            NspawnError::Dbus(zbus::Error::FDO(fdo))
+                if matches!(fdo.as_ref(), zbus::fdo::Error::AccessDenied(_)) =>
+            {
+                Self::Rejected(error)
+            }
+            // A general error can follow process creation (for example while
+            // constructing the PTY reply). It is not proof of rejection.
+            _ => Self::OutcomeUnknown(error),
+        }
+    }
+}
 
 fn guest_process_arguments(request: &GuestExecutionRequest) -> (&str, Vec<String>) {
     match request.process() {
@@ -16,31 +54,6 @@ fn guest_process_arguments(request: &GuestExecutionRequest) -> (&str, Vec<String
 }
 
 impl DbusBackend {
-    /// Call machine1's `OpenMachineShell` method for a session adapter.
-    ///
-    /// Owns only the native D-Bus signature and timeout/error mapping.
-    async fn open_machine_shell(
-        &self,
-        machine: &MachineName,
-        user: &ValidatedGuestUserName,
-        path: &str,
-        args: Vec<String>,
-        environment: Vec<String>,
-    ) -> Result<OwnedFd> {
-        let (generation, proxy) = self
-            .manager_proxy()
-            .await
-            .ok_or_else(|| NspawnError::Dbus(zbus::Error::Failure("No connection".into())))?;
-        let (fd, _path) = self
-            .mutation_with_deadline(
-                generation,
-                "OpenMachineShell",
-                proxy.open_machine_shell(machine.as_str(), user.as_str(), path, args, environment),
-            )
-            .await?;
-        Ok(fd.into())
-    }
-
     pub(crate) async fn open_machine_login(&self, machine: &MachineName) -> Result<OwnedFd> {
         let (generation, proxy) = self
             .manager_proxy()
@@ -61,16 +74,38 @@ impl DbusBackend {
     pub(crate) async fn open_guest_session(
         &self,
         request: &GuestExecutionRequest,
-    ) -> Result<OwnedFd> {
+        deadline: tokio::time::Instant,
+    ) -> std::result::Result<OwnedFd, GuestSessionOpenError> {
         let (path, args) = guest_process_arguments(request);
-        self.open_machine_shell(
-            request.target().machine(),
-            request.target().user(),
-            path,
-            args,
-            request.environment().assignments(),
-        )
-        .await
+        let proxy = tokio::time::timeout_at(deadline, self.manager_proxy()).await;
+        let (generation, proxy) = proxy.ok().flatten().ok_or_else(|| {
+            GuestSessionOpenError::NotAttempted(NspawnError::Dbus(zbus::Error::Failure(
+                "machine1 connection unavailable before guest session submission".into(),
+            )))
+        })?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(GuestSessionOpenError::NotAttempted(
+                NspawnError::Validation(
+                    "guest execution deadline expired before submission".into(),
+                ),
+            ));
+        }
+        let (fd, _path) = self
+            .mutation_until(
+                generation,
+                "OpenMachineShell",
+                deadline,
+                proxy.open_machine_shell(
+                    request.target().machine().as_str(),
+                    request.target().user().as_str(),
+                    path,
+                    args,
+                    request.environment().assignments(),
+                ),
+            )
+            .await
+            .map_err(GuestSessionOpenError::from_submitted)?;
+        Ok(fd.into())
     }
 
     /// Subscribe before opening the PTY so an intervening machine removal
@@ -120,6 +155,36 @@ impl DbusBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::application::sessions::ValidatedGuestUserName;
+
+    #[test]
+    fn explicit_method_rejection_and_missing_reply_have_different_outcomes() {
+        for (name, rejected) in [
+            ("org.freedesktop.DBus.Error.AccessDenied", true),
+            ("org.freedesktop.machine1.NoSuchMachine", true),
+            ("org.freedesktop.DBus.Error.Failed", false),
+            ("org.freedesktop.DBus.Error.NoReply", false),
+            ("org.freedesktop.DBus.Error.Timeout", false),
+            ("org.freedesktop.DBus.Error.Disconnected", false),
+        ] {
+            let error = NspawnError::Dbus(zbus::Error::MethodError(
+                name.try_into().unwrap(),
+                Some("test".into()),
+                zbus::Message::method_call("/test", "Test")
+                    .unwrap()
+                    .build(&())
+                    .unwrap(),
+            ));
+            assert_eq!(
+                matches!(
+                    GuestSessionOpenError::from_submitted(error),
+                    GuestSessionOpenError::Rejected(_)
+                ),
+                rejected,
+                "{name}"
+            );
+        }
+    }
 
     #[test]
     fn machine1_session_bodies_match_the_upstream_xml_signatures() {

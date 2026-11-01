@@ -382,7 +382,7 @@ mod tests {
         let id = SessionId::new(3).unwrap();
         let size = SessionSize::new(80, 24).unwrap();
         let handle =
-            spawn_direct_terminal(command, id, TerminalAttachmentKind::Login, size).unwrap();
+            spawn_direct_terminal(|| Ok(command), id, TerminalAttachmentKind::Login, size).unwrap();
         let (destination, mut captured) = tokio::io::duplex(1024);
 
         let status = run_launcher_terminal_to(handle, destination).await.unwrap();

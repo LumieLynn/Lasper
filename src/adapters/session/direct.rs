@@ -1,6 +1,7 @@
 use crate::adapters::session::execution::NativeExecution;
 use crate::adapters::session::projection::{WaylandSessionResolver, X11SessionResolver};
 use crate::adapters::session::shell::SelectedUserShell;
+use crate::application::sessions::execution::{GuestExecutionPort, PreparedGuestExecution};
 use crate::application::sessions::{
     journal_session_channel, GuestTarget, JournalSessionHandle, JournalSessionRequest,
     SessionError, SessionPort, TerminalLaunch, TerminalOpenError, TerminalSessionHandle,
@@ -63,6 +64,7 @@ impl SessionPort for DirectSessionAdapter {
                 environment,
                 command,
             } => {
+                let deadline = SelectedUserShell::preparation_deadline();
                 let request = SelectedUserShell {
                     target: GuestTarget::new(machine, user),
                     terminal: environment.terminal_environment().clone(),
@@ -70,7 +72,7 @@ impl SessionPort for DirectSessionAdapter {
                     x11_display: environment.x11_context().map(|context| context.display()),
                     command,
                 }
-                .prepare(&self.wayland, id)
+                .prepare(&self.wayland, id, deadline)
                 .await?;
                 // Wayland preparation may open a guest probe. Recheck the
                 // desktop endpoint afterwards, immediately before execution.
@@ -86,7 +88,10 @@ impl SessionPort for DirectSessionAdapter {
                     })?;
                 }
                 self.machine
-                    .open_local(request, id, size)
+                    .prepare(request, deadline)
+                    .await
+                    .map_err(TerminalOpenError::from)?
+                    .open_local(id, size)
                     .await
                     .map_err(Into::into)
             }

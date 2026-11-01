@@ -30,9 +30,14 @@ impl MachineInstanceSnapshot {
     pub(crate) async fn observe(
         transport: &NativeExecution,
         machine: &MachineName,
+        deadline: tokio::time::Instant,
     ) -> Result<Self, SessionError> {
         for _ in 0..OBSERVATION_ATTEMPTS {
-            let leader = transport.machine_leader(machine).await?;
+            let before = transport
+                .instance_before_deadline(machine, deadline)
+                .await
+                .map_err(|error| observation_error(machine, error))?;
+            let leader = before.leader_pid();
             let snapshot = tokio::task::spawn_blocking(move || read_instance(leader))
                 .await
                 .map_err(|error| {
@@ -44,8 +49,13 @@ impl MachineInstanceSnapshot {
                         machine.as_str()
                     ))
                 })?;
-            let current_leader = transport.machine_leader(machine).await?;
-            if current_leader == leader {
+            let after = transport
+                .instance_before_deadline(machine, deadline)
+                .await
+                .map_err(|error| observation_error(machine, error))?;
+            if before.compare(snapshot.revision) == Some(true)
+                && snapshot.revision.compare(after) == Some(true)
+            {
                 return Ok(snapshot);
             }
         }
@@ -88,6 +98,12 @@ impl MachineInstanceSnapshot {
             self.revision,
         ))
     }
+}
+
+fn observation_error(machine: &MachineName, error: impl std::fmt::Display) -> SessionError {
+    SessionError::new(format!(
+        "inspect machine {machine} identity mapping: {error}"
+    ))
 }
 
 fn read_instance(leader: u32) -> std::io::Result<MachineInstanceSnapshot> {

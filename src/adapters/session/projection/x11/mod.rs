@@ -10,10 +10,8 @@ use crate::adapters::config::NspawnConfigStore;
 use crate::adapters::session::execution::{MachineInstanceSnapshot, NativeExecution};
 use crate::adapters::session::projection::probe::SocketAccess;
 use crate::application::sessions::{
-    SessionError, TerminalSessionHandle, X11FilesystemAccess, X11ProjectionContext,
-    X11ProjectionProbeRequest,
+    SessionError, X11FilesystemAccess, X11ProjectionContext, X11ProjectionProbeRequest,
 };
-use crate::domain::session::SessionSize;
 use probe::{X11ProjectionProbeObservation, X11ProjectionProbeRequest as MachineX11ProbeRequest};
 use std::path::{Path, PathBuf};
 
@@ -32,6 +30,7 @@ impl X11SessionResolver {
         &self,
         request: X11ProjectionProbeRequest,
     ) -> Result<X11ProjectionContext, SessionError> {
+        let deadline = crate::adapters::session::projection::probe::preparation_deadline();
         let expected_client_identities = projection_socket_identities(&request.host_socket).await?;
         let config = self
             .nspawn
@@ -52,7 +51,8 @@ impl X11SessionResolver {
         let client_path =
             PathBuf::from(format!("/tmp/.X11-unix/X{}", request.host_socket.display()));
         let instance =
-            MachineInstanceSnapshot::observe(&self.machine, request.target.machine()).await?;
+            MachineInstanceSnapshot::observe(&self.machine, request.target.machine(), deadline)
+                .await?;
         let mut failure = projection_not_configured();
         for mount_target in targets {
             let probe = MachineX11ProbeRequest::new(
@@ -62,7 +62,10 @@ impl X11SessionResolver {
                 &client_path,
             )
             .map_err(|error| SessionError::new(format!("validate X11 probe paths: {error}")))?;
-            let observation = run_probe(&self.machine, probe, request.probe_id).await?;
+            let observation = probe
+                .execute(&self.machine, request.probe_id, deadline)
+                .await
+                .map_err(|error| error.context("X11 projection probe failed"))?;
             match validate_projection(
                 &observation,
                 request.host_socket.revision(),
@@ -73,9 +76,12 @@ impl X11SessionResolver {
                 Ok(filesystem_access) => {
                     let identity = instance
                         .mapped_identity(observation.identity, observation.user_namespace)?;
-                    let current_instance =
-                        MachineInstanceSnapshot::observe(&self.machine, request.target.machine())
-                            .await?;
+                    let current_instance = MachineInstanceSnapshot::observe(
+                        &self.machine,
+                        request.target.machine(),
+                        deadline,
+                    )
+                    .await?;
                     if current_instance != instance {
                         return Err(SessionError::new(
                             "machine instance changed during X11 projection validation",
@@ -161,21 +167,6 @@ fn validate_socket_access(
         format!("{label} {} {detail}", path.display()),
         "Check the configured bind and guest client path, then restart the machine if its startup configuration changed.",
     ))
-}
-
-async fn run_probe(
-    machine: &NativeExecution,
-    request: MachineX11ProbeRequest,
-    id: crate::domain::session::SessionId,
-) -> Result<X11ProjectionProbeObservation, SessionError> {
-    let size = SessionSize::new(80, 24).expect("fixed probe PTY size is valid");
-    let mut handle: TerminalSessionHandle = machine
-        .open_local(request.execution_request()?, id, size)
-        .await
-        .map_err(|error| error.context("open X11 projection probe"))?;
-    probe::collect_x11_probe(&mut handle)
-        .await
-        .map_err(|error| error.context("X11 projection probe failed"))
 }
 
 fn projection_not_configured() -> SessionError {

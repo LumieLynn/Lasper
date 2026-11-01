@@ -3,12 +3,14 @@
 //! Host UID mapping and X server ACL inspection stay outside the guest.
 //! Framing, socket observations, and PTY collection use the shared probe core.
 
-use crate::application::sessions::execution::{GuestEnvironment, GuestExecutionRequest};
+use crate::application::sessions::execution::{
+    GuestEnvironment, GuestExecutionPort, GuestExecutionRequest,
+};
 use std::path::Path;
 
 use crate::application::sessions::{
     GuestCommand, GuestTarget, ObservedGuestIdentity, ObservedNamespaceIdentity, SessionError,
-    TerminalSessionHandle, ValidatedGuestUserName,
+    ValidatedGuestUserName,
 };
 use crate::domain::machine::MachineName;
 
@@ -52,6 +54,18 @@ pub(crate) struct X11ProjectionProbeRequest {
 }
 
 impl X11ProjectionProbeRequest {
+    pub(crate) async fn execute(
+        &self,
+        execution: &impl GuestExecutionPort,
+        id: crate::domain::session::SessionId,
+        deadline: tokio::time::Instant,
+    ) -> Result<X11ProjectionProbeObservation, SessionError> {
+        let output = PROTOCOL
+            .run(execution, self.execution_request()?, id, deadline)
+            .await?;
+        parse_x11_probe(&output)
+    }
+
     pub(crate) fn new(
         machine: MachineName,
         user: ValidatedGuestUserName,
@@ -98,8 +112,9 @@ pub(crate) struct X11ProjectionProbeObservation {
     pub(crate) client: SocketObservation,
 }
 
-pub(crate) async fn collect_x11_probe(
-    handle: &mut TerminalSessionHandle,
+#[cfg(test)]
+async fn collect_x11_probe(
+    handle: crate::application::sessions::TerminalSessionHandle,
 ) -> Result<X11ProjectionProbeObservation, SessionError> {
     parse_x11_probe(&PROTOCOL.collect(handle).await?)
 }
@@ -216,7 +231,7 @@ mod tests {
 
     #[tokio::test]
     async fn collection_returns_as_soon_as_the_complete_frame_arrives() {
-        let (mut handle, endpoint) = crate::application::sessions::terminal_session_channel(
+        let (handle, endpoint) = crate::application::sessions::terminal_session_channel(
             SessionId::new(1).unwrap(),
             TerminalAttachmentKind::Login,
         );
@@ -226,7 +241,7 @@ mod tests {
             .await
             .unwrap();
         let observation =
-            tokio::time::timeout(Duration::from_millis(100), collect_x11_probe(&mut handle))
+            tokio::time::timeout(Duration::from_millis(100), collect_x11_probe(handle))
                 .await
                 .expect("complete X11 probe waited for the PTY to close")
                 .unwrap();

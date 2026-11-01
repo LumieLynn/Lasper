@@ -7,11 +7,10 @@ use crate::adapters::config::NspawnConfigStore;
 use crate::adapters::session::execution::NativeExecution;
 use crate::adapters::session::projection::probe::SocketAccess;
 use crate::application::sessions::{
-    GuestTarget, SessionError, TerminalSessionHandle, WaylandPreparationRequest,
-    WaylandSessionContext,
+    GuestTarget, SessionError, WaylandPreparationRequest, WaylandSessionContext,
 };
 use crate::domain::machine::MachineName;
-use crate::domain::session::{SessionId, SessionSize};
+use crate::domain::session::SessionId;
 use probe::{WaylandProbeObservation, WaylandProbeRequest};
 
 #[derive(Clone)]
@@ -42,6 +41,15 @@ impl WaylandSessionResolver {
         &self,
         request: WaylandPreparationRequest,
     ) -> Result<WaylandSessionContext, SessionError> {
+        let deadline = crate::adapters::session::projection::probe::preparation_deadline();
+        self.prepare_until(request, deadline).await
+    }
+
+    async fn prepare_until(
+        &self,
+        request: WaylandPreparationRequest,
+        deadline: tokio::time::Instant,
+    ) -> Result<WaylandSessionContext, SessionError> {
         let source = revalidate_host_socket(&request.host_socket, self.authorized_uid).await?;
 
         let config = self
@@ -65,7 +73,10 @@ impl WaylandSessionResolver {
             .map_err(|error| {
                 SessionError::new(format!("validate Wayland probe target: {error}"))
             })?;
-            let access = run_probe(&self.machine, probe, request.probe_id).await?;
+            let access = probe
+                .execute(&self.machine, request.probe_id, deadline)
+                .await
+                .map_err(|error| error.context("Wayland access probe failed"))?;
             match validate_target(&access, &request.host_socket, &guest_socket) {
                 Ok(()) => {
                     revalidate_host_socket(&request.host_socket, self.authorized_uid).await?;
@@ -94,14 +105,18 @@ impl WaylandSessionResolver {
         target: GuestTarget,
         socket: Option<crate::domain::wayland::HostWaylandSocket>,
         probe_id: SessionId,
+        deadline: tokio::time::Instant,
     ) -> Result<Option<std::path::PathBuf>, SessionError> {
         match socket {
             Some(host_socket) => Ok(Some(
-                self.prepare(WaylandPreparationRequest {
-                    probe_id,
-                    target,
-                    host_socket,
-                })
+                self.prepare_until(
+                    WaylandPreparationRequest {
+                        probe_id,
+                        target,
+                        host_socket,
+                    },
+                    deadline,
+                )
                 .await?
                 .guest_socket()
                 .to_path_buf(),
@@ -170,21 +185,6 @@ async fn revalidate_host_socket(
     crate::adapters::wayland::revalidate_host_socket(socket, authorized_uid)
         .await
         .map_err(|error| SessionError::new(format!("revalidate current Wayland socket: {error}")))
-}
-
-async fn run_probe(
-    machine: &NativeExecution,
-    request: WaylandProbeRequest,
-    id: SessionId,
-) -> Result<WaylandProbeObservation, SessionError> {
-    let size = SessionSize::new(80, 24).expect("fixed probe PTY size is valid");
-    let mut handle: TerminalSessionHandle = machine
-        .open_local(request.execution_request()?, id, size)
-        .await
-        .map_err(|error| error.context("open Wayland access probe"))?;
-    probe::collect_wayland_probe(&mut handle)
-        .await
-        .map_err(|error| error.context("Wayland access probe failed"))
 }
 
 fn projection_not_configured() -> SessionError {

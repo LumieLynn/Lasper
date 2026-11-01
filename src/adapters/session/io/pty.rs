@@ -1,5 +1,6 @@
 //! Low-level PTY transport for application-owned terminal sessions.
 
+use crate::application::sessions::execution::{GuestExecutionError, GuestExecutionFailure};
 use crate::application::sessions::{
     terminal_session_channel, SessionError, TerminalCommand, TerminalSessionEndpoint,
     TerminalSessionHandle,
@@ -21,28 +22,35 @@ pub(crate) struct RemoteSessionControl {
 }
 
 pub(crate) fn spawn_direct_terminal(
-    command: CommandBuilder,
+    prepare_command: impl FnOnce() -> Result<CommandBuilder, GuestExecutionError>,
     id: SessionId,
     attachment: TerminalAttachmentKind,
     size: SessionSize,
-) -> Result<TerminalSessionHandle, SessionError> {
+) -> Result<TerminalSessionHandle, GuestExecutionError> {
+    let not_attempted = |context: &str, error: anyhow::Error| {
+        GuestExecutionError::new(
+            GuestExecutionFailure::NotAttempted,
+            SessionError::new(format!("{context}: {error}")),
+        )
+    };
     let pair = native_pty_system()
         .openpty(pty_size(size))
-        .map_err(|error| SessionError::new(format!("open terminal PTY: {error}")))?;
-    let child = pair
-        .slave
-        .spawn_command(command)
-        .map_err(|error| SessionError::new(format!("spawn terminal attachment: {error}")))?;
-    drop(pair.slave);
-
+        .map_err(|error| not_attempted("open terminal PTY", error))?;
+    // Acquire both streams before spawning so setup failure cannot orphan a
+    // child. Once spawned, the session owner takes over without fallible setup.
     let reader = pair
         .master
         .try_clone_reader()
-        .map_err(|error| SessionError::new(format!("clone terminal reader: {error}")))?;
+        .map_err(|error| not_attempted("clone terminal reader", error))?;
     let writer = pair
         .master
         .take_writer()
-        .map_err(|error| SessionError::new(format!("open terminal writer: {error}")))?;
+        .map_err(|error| not_attempted("open terminal writer", error))?;
+    let child = pair
+        .slave
+        .spawn_command(prepare_command()?)
+        .map_err(|error| not_attempted("spawn terminal attachment", error))?;
+    drop(pair.slave);
     let killer = child.clone_killer();
     let (handle, endpoint) = terminal_session_channel(id, attachment);
     let TerminalSessionEndpoint {
@@ -488,7 +496,7 @@ mod tests {
         let id = SessionId::new(1).unwrap();
         let size = SessionSize::new(80, 24).unwrap();
         let mut handle =
-            spawn_direct_terminal(command, id, TerminalAttachmentKind::Login, size).unwrap();
+            spawn_direct_terminal(|| Ok(command), id, TerminalAttachmentKind::Login, size).unwrap();
         let mut output = handle.take_output().unwrap();
         let bytes = tokio::time::timeout(Duration::from_secs(1), output.recv())
             .await
@@ -509,7 +517,7 @@ mod tests {
         let id = SessionId::new(2).unwrap();
         let size = SessionSize::new(80, 24).unwrap();
         let mut handle =
-            spawn_direct_terminal(command, id, TerminalAttachmentKind::Login, size).unwrap();
+            spawn_direct_terminal(|| Ok(command), id, TerminalAttachmentKind::Login, size).unwrap();
         let _ = handle.take_output();
         handle.close();
         assert!(matches!(

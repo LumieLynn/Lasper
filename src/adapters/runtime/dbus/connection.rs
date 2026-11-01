@@ -136,20 +136,35 @@ impl DbusBackend {
     where
         F: Future<Output = zbus::Result<T>>,
     {
-        match tokio::time::timeout(DBUS_MUTATION_TIMEOUT, future).await {
+        self.mutation_until(
+            generation,
+            label,
+            tokio::time::Instant::now() + DBUS_MUTATION_TIMEOUT,
+            future,
+        )
+        .await
+    }
+
+    pub(super) async fn mutation_until<T, F>(
+        &self,
+        generation: u64,
+        label: &str,
+        deadline: tokio::time::Instant,
+        future: F,
+    ) -> Result<T>
+    where
+        F: Future<Output = zbus::Result<T>>,
+    {
+        match tokio::time::timeout_at(deadline, future).await {
             Ok(result) => {
                 self.observe_result(generation, &result).await;
                 result.map_err(NspawnError::Dbus)
             }
             Err(_) => {
-                log::warn!(
-                    "D-Bus mutation {label} exceeded its {}s deadline; its outcome is unknown",
-                    DBUS_MUTATION_TIMEOUT.as_secs()
-                );
+                log::warn!("D-Bus mutation {label} exceeded its deadline; its outcome is unknown");
                 self.invalidate_connection(generation).await;
                 Err(NspawnError::SystemOperationOutcomeUnknown(format!(
-                    "D-Bus mutation {label} timed out after {}s; reconcile host state before retrying",
-                    DBUS_MUTATION_TIMEOUT.as_secs()
+                    "D-Bus mutation {label} timed out; reconcile host state before retrying"
                 )))
             }
         }

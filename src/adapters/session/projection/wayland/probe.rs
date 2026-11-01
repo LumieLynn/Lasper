@@ -1,11 +1,12 @@
 //! Fixed Wayland identity/access probe using the shared guest probe core.
 
-use crate::application::sessions::execution::{GuestEnvironment, GuestExecutionRequest};
+use crate::application::sessions::execution::{
+    GuestEnvironment, GuestExecutionPort, GuestExecutionRequest,
+};
 use std::path::Path;
 
 use crate::application::sessions::{
-    GuestCommand, GuestTarget, ObservedGuestIdentity, SessionError, TerminalSessionHandle,
-    ValidatedGuestUserName,
+    GuestCommand, GuestTarget, ObservedGuestIdentity, SessionError, ValidatedGuestUserName,
 };
 use crate::domain::machine::MachineName;
 
@@ -40,6 +41,18 @@ pub(crate) struct WaylandProbeRequest {
 }
 
 impl WaylandProbeRequest {
+    pub(crate) async fn execute(
+        &self,
+        execution: &impl GuestExecutionPort,
+        id: crate::domain::session::SessionId,
+        deadline: tokio::time::Instant,
+    ) -> Result<WaylandProbeObservation, SessionError> {
+        let output = PROTOCOL
+            .run(execution, self.execution_request()?, id, deadline)
+            .await?;
+        parse_wayland_probe(&output)
+    }
+
     pub(crate) fn target(
         machine: MachineName,
         user: ValidatedGuestUserName,
@@ -81,8 +94,9 @@ pub(crate) struct WaylandProbeObservation {
     pub(crate) target: SocketObservation,
 }
 
-pub(crate) async fn collect_wayland_probe(
-    handle: &mut TerminalSessionHandle,
+#[cfg(test)]
+async fn collect_wayland_probe(
+    handle: crate::application::sessions::TerminalSessionHandle,
 ) -> Result<WaylandProbeObservation, SessionError> {
     parse_wayland_probe(&PROTOCOL.collect(handle).await?)
 }
@@ -106,7 +120,7 @@ mod tests {
 
     #[tokio::test]
     async fn collection_finishes_when_the_result_frame_arrives() {
-        let (mut handle, endpoint) =
+        let (handle, endpoint) =
             terminal_session_channel(SessionId::new(1).unwrap(), TerminalAttachmentKind::Login);
         endpoint
             .output
@@ -117,13 +131,11 @@ mod tests {
             .await
             .unwrap();
 
-        let observation = tokio::time::timeout(
-            Duration::from_millis(100),
-            collect_wayland_probe(&mut handle),
-        )
-        .await
-        .expect("complete Wayland probe waited for the PTY to close")
-        .unwrap();
+        let observation =
+            tokio::time::timeout(Duration::from_millis(100), collect_wayland_probe(handle))
+                .await
+                .expect("complete Wayland probe waited for the PTY to close")
+                .unwrap();
         assert_eq!(observation.target.access, SocketAccess::Unavailable);
     }
 

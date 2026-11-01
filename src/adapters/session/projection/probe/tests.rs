@@ -19,12 +19,12 @@ async fn completed_frame_is_independent_of_chunk_boundaries_and_later_markers() 
     let mut output = frame.to_vec();
     output.extend_from_slice(b"Disconnected\nLASPER_TEST_PROBE\nVALUE=99\n");
     for split in 0..=output.len() {
-        let (mut handle, mut endpoint) =
+        let (handle, mut endpoint) =
             terminal_session_channel(SessionId::new(1).unwrap(), TerminalAttachmentKind::Login);
         for chunk in [&output[..split], &output[split..]] {
             endpoint.output.send(chunk.to_vec()).await.unwrap();
         }
-        let bytes = PROTOCOL.collect(&mut handle).await.unwrap();
+        let bytes = PROTOCOL.collect(handle).await.unwrap();
         assert_eq!(bytes, frame, "split at {split}");
         let mut parsed = PROTOCOL.parse(&bytes).unwrap();
         assert_eq!(parsed.u32(b"VALUE").unwrap(), 42);
@@ -39,16 +39,16 @@ async fn oversized_transport_postlude_does_not_invalidate_a_complete_frame() {
     let mut output = frame.to_vec();
     output.extend(vec![b'x'; PROTOCOL.maximum_output]);
     assert!(PROTOCOL.parse(&output).is_ok());
-    let (mut handle, mut endpoint) =
+    let (handle, mut endpoint) =
         terminal_session_channel(SessionId::new(1).unwrap(), TerminalAttachmentKind::Login);
     endpoint.output.send(output).await.unwrap();
-    assert_eq!(PROTOCOL.collect(&mut handle).await.unwrap(), frame);
+    assert_eq!(PROTOCOL.collect(handle).await.unwrap(), frame);
     endpoint.close.try_recv().unwrap();
 }
 
 #[tokio::test]
 async fn fragmented_frame_uses_the_same_boundary_for_collection_and_parsing() {
-    let (mut handle, mut endpoint) =
+    let (handle, mut endpoint) =
         terminal_session_channel(SessionId::new(1).unwrap(), TerminalAttachmentKind::Login);
     for chunk in [
         b"PAM_NOTICE=ready\r\nLASPER_TEST_".as_slice(),
@@ -59,7 +59,7 @@ async fn fragmented_frame_uses_the_same_boundary_for_collection_and_parsing() {
         endpoint.output.send(chunk.to_vec()).await.unwrap();
     }
 
-    let bytes = tokio::time::timeout(Duration::from_millis(100), PROTOCOL.collect(&mut handle))
+    let bytes = tokio::time::timeout(Duration::from_millis(100), PROTOCOL.collect(handle))
         .await
         .expect("complete frame waited for transport EOF")
         .unwrap();
@@ -71,7 +71,7 @@ async fn fragmented_frame_uses_the_same_boundary_for_collection_and_parsing() {
 
 #[tokio::test]
 async fn error_frame_finishes_without_waiting_for_transport_eof() {
-    let (mut handle, mut endpoint) =
+    let (handle, mut endpoint) =
         terminal_session_channel(SessionId::new(1).unwrap(), TerminalAttachmentKind::Login);
     endpoint
         .output
@@ -79,7 +79,7 @@ async fn error_frame_finishes_without_waiting_for_transport_eof() {
         .await
         .unwrap();
 
-    let bytes = tokio::time::timeout(Duration::from_millis(100), PROTOCOL.collect(&mut handle))
+    let bytes = tokio::time::timeout(Duration::from_millis(100), PROTOCOL.collect(handle))
         .await
         .unwrap()
         .unwrap();
@@ -90,7 +90,7 @@ async fn error_frame_finishes_without_waiting_for_transport_eof() {
 
 #[tokio::test(start_paused = true)]
 async fn collection_deadline_is_not_extended_by_partial_output() {
-    let (mut handle, mut endpoint) =
+    let (handle, mut endpoint) =
         terminal_session_channel(SessionId::new(1).unwrap(), TerminalAttachmentKind::Login);
     endpoint
         .output
@@ -98,7 +98,7 @@ async fn collection_deadline_is_not_extended_by_partial_output() {
         .await
         .unwrap();
     let started = tokio::time::Instant::now();
-    let task = tokio::spawn(async move { PROTOCOL.collect(&mut handle).await });
+    let task = tokio::spawn(async move { PROTOCOL.collect(handle).await });
     tokio::task::yield_now().await;
     tokio::time::advance(Duration::from_secs(4)).await;
     endpoint.output.send(b"VALUE=42\n".to_vec()).await.unwrap();
@@ -113,21 +113,32 @@ async fn collection_deadline_is_not_extended_by_partial_output() {
 }
 
 #[tokio::test]
+async fn cancelling_collection_closes_the_probe_session() {
+    let (handle, mut endpoint) =
+        terminal_session_channel(SessionId::new(1).unwrap(), TerminalAttachmentKind::Login);
+    let mut collection = Box::pin(PROTOCOL.collect(handle));
+    assert!(futures_util::poll!(&mut collection).is_pending());
+    drop(collection);
+    endpoint.close.try_recv().unwrap();
+    assert!(endpoint.output.is_closed());
+}
+
+#[tokio::test]
 async fn collection_closes_the_session_on_missing_output_or_byte_limit() {
     let (mut handle, mut endpoint) =
         terminal_session_channel(SessionId::new(1).unwrap(), TerminalAttachmentKind::Login);
     drop(handle.take_output());
-    assert!(PROTOCOL.collect(&mut handle).await.is_err());
+    assert!(PROTOCOL.collect(handle).await.is_err());
     endpoint.close.try_recv().unwrap();
 
-    let (mut handle, mut endpoint) =
+    let (handle, mut endpoint) =
         terminal_session_channel(SessionId::new(2).unwrap(), TerminalAttachmentKind::Login);
     endpoint
         .output
         .send(vec![b'x'; PROTOCOL.maximum_output + 1])
         .await
         .unwrap();
-    let error = PROTOCOL.collect(&mut handle).await.unwrap_err();
+    let error = PROTOCOL.collect(handle).await.unwrap_err();
     assert!(error.to_string().contains("output exceeded its limit"));
     endpoint.close.try_recv().unwrap();
 }

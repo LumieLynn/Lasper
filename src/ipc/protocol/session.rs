@@ -1,3 +1,4 @@
+use crate::application::sessions::execution::GuestExecutionFailure;
 use crate::application::sessions::{
     GuestCommand, InteractiveShellEnvironment, SessionError, TerminalOpenError,
     ValidatedGuestUserName,
@@ -136,9 +137,7 @@ pub(crate) enum PrepareWaylandResponse {
         gid: u32,
     },
     Failed {
-        message: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        hint: Option<String>,
+        error: WireSessionError,
     },
 }
 
@@ -175,9 +174,7 @@ pub(crate) enum ProbeX11ProjectionResponse {
         namespaces: Option<WireMachineNamespaces>,
     },
     Failed {
-        message: String,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        hint: Option<String>,
+        error: WireSessionError,
     },
 }
 
@@ -264,9 +261,58 @@ pub(crate) struct SpawnTerminalResponse {
 #[serde(deny_unknown_fields)]
 pub(crate) struct WireTerminalStartupError {
     phase: WireTerminalFailurePhase,
+    error: WireSessionError,
+}
+
+/// Keep execution acceptance separate from the preparation phase and user hint.
+/// Both session RPCs and FD delivery preserve the same failure information.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WireSessionError {
     message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    execution_failure: Option<WireGuestExecutionFailure>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum WireGuestExecutionFailure {
+    NotAttempted,
+    Rejected,
+    OutcomeUnknown,
+}
+
+impl From<SessionError> for WireSessionError {
+    fn from(error: SessionError) -> Self {
+        Self {
+            message: error.to_string(),
+            hint: error.hint().map(str::to_owned),
+            execution_failure: error.execution_failure().map(|failure| match failure {
+                GuestExecutionFailure::NotAttempted => WireGuestExecutionFailure::NotAttempted,
+                GuestExecutionFailure::Rejected => WireGuestExecutionFailure::Rejected,
+                GuestExecutionFailure::OutcomeUnknown => WireGuestExecutionFailure::OutcomeUnknown,
+            }),
+        }
+    }
+}
+
+impl From<WireSessionError> for SessionError {
+    fn from(error: WireSessionError) -> Self {
+        let mut reason = match error.hint {
+            Some(hint) => Self::with_hint(error.message, hint),
+            None => Self::new(error.message),
+        };
+        if let Some(failure) = error.execution_failure {
+            reason = reason.with_execution_failure(match failure {
+                WireGuestExecutionFailure::NotAttempted => GuestExecutionFailure::NotAttempted,
+                WireGuestExecutionFailure::Rejected => GuestExecutionFailure::Rejected,
+                WireGuestExecutionFailure::OutcomeUnknown => GuestExecutionFailure::OutcomeUnknown,
+            });
+        }
+        reason
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -284,21 +330,16 @@ impl From<TerminalOpenError> for WireTerminalStartupError {
             }
             TerminalOpenError::Terminal(_) => WireTerminalFailurePhase::Terminal,
         };
-        let error = error.into_session_error();
         Self {
             phase,
-            message: error.to_string(),
-            hint: error.hint().map(str::to_owned),
+            error: error.into_session_error().into(),
         }
     }
 }
 
 impl From<WireTerminalStartupError> for TerminalOpenError {
     fn from(error: WireTerminalStartupError) -> Self {
-        let reason = match error.hint {
-            Some(hint) => SessionError::with_hint(error.message, hint),
-            None => SessionError::new(error.message),
-        };
+        let reason = error.error.into();
         match error.phase {
             WireTerminalFailurePhase::WaylandPreparation => Self::WaylandPreparation(reason),
             WireTerminalFailurePhase::Terminal => Self::Terminal(reason),
@@ -487,16 +528,49 @@ mod tests {
     #[test]
     fn wayland_failure_preserves_its_actionable_hint() {
         let response = PrepareWaylandResponse::Failed {
-            message: "projection is missing".into(),
-            hint: Some("restart the machine".into()),
+            error: SessionError::with_hint("projection is missing", "restart the machine").into(),
         };
         let encoded = serde_json::to_value(response).unwrap();
         let decoded: PrepareWaylandResponse = serde_json::from_value(encoded).unwrap();
 
         assert!(matches!(
             decoded,
-            PrepareWaylandResponse::Failed { hint: Some(hint), .. }
+            PrepareWaylandResponse::Failed { error: WireSessionError {hint: Some(hint), ..} }
                 if hint == "restart the machine"
         ));
+    }
+
+    #[test]
+    fn execution_failure_survives_session_rpc_and_terminal_fd_delivery() {
+        for failure in [
+            GuestExecutionFailure::NotAttempted,
+            GuestExecutionFailure::Rejected,
+            GuestExecutionFailure::OutcomeUnknown,
+        ] {
+            let reason = || {
+                SessionError::with_hint("open failed", "check the guest manager")
+                    .with_execution_failure(failure)
+            };
+            let encoded = serde_json::to_vec(&WireSessionError::from(reason())).unwrap();
+            let decoded: SessionError = serde_json::from_slice::<WireSessionError>(&encoded)
+                .unwrap()
+                .into();
+            assert_eq!(decoded.execution_failure(), Some(failure));
+            assert_eq!(decoded.hint(), Some("check the guest manager"));
+
+            let encoded = serde_json::to_vec(&WireTerminalStartupError::from(
+                TerminalOpenError::Terminal(reason()),
+            ))
+            .unwrap();
+            let decoded: TerminalOpenError =
+                serde_json::from_slice::<WireTerminalStartupError>(&encoded)
+                    .unwrap()
+                    .into();
+            assert!(matches!(&decoded, TerminalOpenError::Terminal(_)));
+            assert_eq!(
+                decoded.into_session_error().execution_failure(),
+                Some(failure)
+            );
+        }
     }
 }

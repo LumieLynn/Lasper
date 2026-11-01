@@ -67,8 +67,7 @@ pub(crate) async fn handle(method: RpcMethod, context: SessionContext) -> Handle
                     gid: context.identity().gid(),
                 },
                 Err(error) => PrepareWaylandResponse::Failed {
-                    message: error.to_string(),
-                    hint: error.hint().map(str::to_owned),
+                    error: error.into(),
                 },
             };
             encode_result(response)
@@ -117,8 +116,7 @@ pub(crate) async fn handle(method: RpcMethod, context: SessionContext) -> Handle
                     }
                 }
                 Err(error) => ProbeX11ProjectionResponse::Failed {
-                    message: error.to_string(),
-                    hint: error.hint().map(str::to_owned),
+                    error: error.into(),
                 },
             };
             encode_result(response)

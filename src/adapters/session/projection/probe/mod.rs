@@ -1,7 +1,8 @@
 //! Shared mechanics for fixed, read-only guest probes.
 //!
 //! Display resolvers own projection policy. This module owns path arguments,
-//! guest filesystem observations, protocol framing, and bounded PTY collection.
+//! guest filesystem observations and framing. Execution owns bounded output
+//! collection and session cleanup.
 
 mod protocol;
 mod request;
@@ -10,7 +11,7 @@ mod socket;
 #[cfg(test)]
 mod tests;
 
-pub(super) use protocol::ProbeProtocol;
+pub(super) use protocol::{preparation_deadline, ProbeProtocol};
 pub(super) use request::{validate_absolute_path, ProbePathError};
 pub(super) use socket::{SocketAccess, SocketObservation};
 

@@ -148,7 +148,7 @@ impl RpcClient {
             }
         }
         log::trace!("[lasper] rpc_call: waiting for response id={}", id);
-        let timeout = rpc_response_timeout(method_kind.family());
+        let timeout = rpc_response_timeout(method_kind);
         let response = wait_for_rpc_response(response_rx, method_kind, timeout)
             .await
             .inspect_err(|error| {
@@ -297,8 +297,16 @@ fn route_response(
 type PendingRpcResponses =
     std::collections::HashMap<u64, tokio::sync::oneshot::Sender<RpcResponse>>;
 
-fn rpc_response_timeout(family: RpcFamily) -> std::time::Duration {
-    match family {
+fn rpc_response_timeout(method: RpcMethod) -> std::time::Duration {
+    // Native display preparation can open a guest PTY and wait for policy
+    // authorization before its bounded five-second observation starts.
+    if matches!(
+        method,
+        RpcMethod::PrepareWayland | RpcMethod::ProbeX11Projection
+    ) {
+        return std::time::Duration::from_secs(165);
+    }
+    match method.family() {
         RpcFamily::Query | RpcFamily::Session => std::time::Duration::from_secs(15),
         RpcFamily::Job => std::time::Duration::from_secs(30),
         RpcFamily::Command => std::time::Duration::from_secs(60),
@@ -385,11 +393,23 @@ mod tests {
     #[test]
     fn rpc_timeout_policy_keeps_commands_longer_than_coordination_calls() {
         assert_eq!(
-            rpc_response_timeout(RpcFamily::Query),
-            rpc_response_timeout(RpcFamily::Session)
+            rpc_response_timeout(RpcMethod::Ping),
+            rpc_response_timeout(RpcMethod::CloseSession)
         );
-        assert!(rpc_response_timeout(RpcFamily::Query) < rpc_response_timeout(RpcFamily::Job));
-        assert!(rpc_response_timeout(RpcFamily::Job) < rpc_response_timeout(RpcFamily::Command));
+        assert!(
+            rpc_response_timeout(RpcMethod::Ping)
+                < rpc_response_timeout(RpcMethod::DeploymentStatus)
+        );
+        assert!(
+            rpc_response_timeout(RpcMethod::DeploymentStatus)
+                < rpc_response_timeout(RpcMethod::MachineRuntimeControl)
+        );
+        for method in [RpcMethod::PrepareWayland, RpcMethod::ProbeX11Projection] {
+            assert_eq!(
+                rpc_response_timeout(method),
+                std::time::Duration::from_secs(165)
+            );
+        }
     }
 
     #[tokio::test]

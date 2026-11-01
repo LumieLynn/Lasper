@@ -1,8 +1,14 @@
 use std::time::Duration;
 
-use crate::application::sessions::{SessionError, TerminalSessionHandle};
+use crate::application::sessions::execution::{
+    run_bounded, GuestCommandOutput, GuestExecutionFailure, GuestExecutionPort,
+    GuestExecutionRequest, GuestOutputBoundary, GuestOutputEnd, GuestOutputLimits,
+};
+use crate::application::sessions::SessionError;
+use crate::domain::session::SessionId;
 
 const PROBE_DEADLINE: Duration = Duration::from_secs(5);
+const PREPARATION_DEADLINE: Duration = Duration::from_secs(155);
 const MAX_PROBE_LINE_BYTES: usize = 1024;
 
 struct CompleteFrame<'a> {
@@ -18,38 +24,55 @@ pub(crate) struct ProbeProtocol {
 }
 
 impl ProbeProtocol {
-    pub(crate) async fn collect(
-        &self,
-        handle: &mut TerminalSessionHandle,
-    ) -> Result<Vec<u8>, SessionError> {
-        let result = self.collect_output(handle).await;
-        handle.close();
-        result
+    fn limits(&self, deadline: tokio::time::Instant) -> GuestOutputLimits {
+        GuestOutputLimits {
+            deadline,
+            opening: Duration::from_secs(150),
+            capture: PROBE_DEADLINE,
+            bytes: self.maximum_output,
+        }
     }
 
-    async fn collect_output(
+    pub(crate) async fn run(
         &self,
-        handle: &mut TerminalSessionHandle,
+        execution: &impl GuestExecutionPort,
+        request: GuestExecutionRequest,
+        id: SessionId,
+        deadline: tokio::time::Instant,
     ) -> Result<Vec<u8>, SessionError> {
-        let mut output = handle
-            .take_output()
-            .ok_or_else(|| self.error("output is unavailable"))?;
-        let deadline = tokio::time::Instant::now() + PROBE_DEADLINE;
-        let mut bytes = Vec::new();
-        loop {
-            match tokio::time::timeout_at(deadline, output.recv()).await {
-                Ok(Some(chunk)) => {
-                    let remaining = self.maximum_output - bytes.len();
-                    bytes.extend_from_slice(&chunk[..chunk.len().min(remaining)]);
-                    if let Some(frame) = self.frame(&bytes)? {
-                        bytes.truncate(frame.end);
-                        return Ok(bytes);
-                    }
-                }
-                Ok(None) => return Ok(bytes),
-                Err(_) => return Err(self.error("timed out")),
-            }
-        }
+        let output = run_bounded(execution, request, id, &self.limits(deadline), self)
+            .await
+            .map_err(SessionError::from)?;
+        self.output(output)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn collect(
+        &self,
+        handle: crate::application::sessions::TerminalSessionHandle,
+    ) -> Result<Vec<u8>, SessionError> {
+        let output = crate::application::sessions::execution::collect_output(
+            handle,
+            &self.limits(preparation_deadline()),
+            self,
+        )
+        .await?;
+        self.output(output)
+    }
+
+    fn output(&self, output: GuestCommandOutput) -> Result<Vec<u8>, SessionError> {
+        let detail = match output.end {
+            GuestOutputEnd::Complete => return Ok(output.bytes),
+            GuestOutputEnd::Closed => format!(
+                "closed before a complete result (captured output: {})",
+                escaped(&output.bytes, 512, true)
+            ),
+            GuestOutputEnd::TimedOut => "timed out".into(),
+            GuestOutputEnd::LimitReached => "output exceeded its limit".into(),
+        };
+        Err(self
+            .error(detail)
+            .with_execution_failure(GuestExecutionFailure::OutcomeUnknown))
     }
 
     /// The first complete header starts the frame; its first RESULT line ends
@@ -152,6 +175,17 @@ impl ProbeProtocol {
 
     fn error(&self, detail: impl std::fmt::Display) -> SessionError {
         SessionError::new(format!("{} {detail}", self.label))
+    }
+}
+
+/// One explicit display preparation owns the budget for all configured binds.
+pub(in crate::adapters::session::projection) fn preparation_deadline() -> tokio::time::Instant {
+    tokio::time::Instant::now() + PREPARATION_DEADLINE
+}
+
+impl GuestOutputBoundary for ProbeProtocol {
+    fn complete(&self, output: &[u8]) -> Result<Option<usize>, SessionError> {
+        self.frame(output).map(|frame| frame.map(|frame| frame.end))
     }
 }
 

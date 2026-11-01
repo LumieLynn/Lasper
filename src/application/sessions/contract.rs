@@ -351,26 +351,53 @@ pub struct X11ProjectionProbeRequest {
 #[error("{message}")]
 pub struct SessionError {
     message: String,
+    details: Option<Box<SessionErrorDetails>>,
+}
+
+#[derive(Debug, Default)]
+struct SessionErrorDetails {
     hint: Option<String>,
+    execution_failure: Option<super::execution::GuestExecutionFailure>,
 }
 
 impl SessionError {
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
-            hint: None,
+            details: None,
         }
     }
 
     pub fn with_hint(message: impl Into<String>, hint: impl Into<String>) -> Self {
         Self {
             message: message.into(),
-            hint: Some(hint.into()),
+            details: Some(Box::new(SessionErrorDetails {
+                hint: Some(hint.into()),
+                execution_failure: None,
+            })),
         }
     }
 
     pub fn hint(&self) -> Option<&str> {
-        self.hint.as_deref()
+        self.details
+            .as_ref()
+            .and_then(|details| details.hint.as_deref())
+    }
+
+    pub(crate) fn execution_failure(&self) -> Option<super::execution::GuestExecutionFailure> {
+        self.details
+            .as_ref()
+            .and_then(|details| details.execution_failure)
+    }
+
+    pub(crate) fn with_execution_failure(
+        mut self,
+        failure: super::execution::GuestExecutionFailure,
+    ) -> Self {
+        self.details
+            .get_or_insert_with(Default::default)
+            .execution_failure = Some(failure);
+        self
     }
 
     pub(crate) fn context(mut self, context: &str) -> Self {

@@ -167,10 +167,7 @@ impl ElevatedDaemon {
                 guest_socket,
                 ObservedGuestIdentity::new(uid, gid),
             )),
-            PrepareWaylandResponse::Failed { message, hint } => match hint {
-                Some(hint) => Err(SessionError::with_hint(message, hint)),
-                None => Err(SessionError::new(message)),
-            },
+            PrepareWaylandResponse::Failed { error } => Err(error.into()),
         }
     }
 
@@ -235,10 +232,7 @@ impl ElevatedDaemon {
                     ),
                 ))
             }
-            ProbeX11ProjectionResponse::Failed { message, hint } => match hint {
-                Some(hint) => Err(SessionError::with_hint(message, hint)),
-                None => Err(SessionError::new(message)),
-            },
+            ProbeX11ProjectionResponse::Failed { error } => Err(error.into()),
         }
     }
 

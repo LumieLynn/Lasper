@@ -13,9 +13,9 @@ pub(crate) mod systemd_unit;
 use self::deployment::SubmitDeploymentParams;
 use self::session::{SpawnJournalctlParams, SpawnTerminalParams};
 
-// v28: terminal opening performs Wayland preparation once and reports typed
-// pre-open failures on the FD channel so only those failures permit fallback.
-pub(crate) const RPC_PROTOCOL_VERSION: u32 = 28;
+// v29: session RPC and terminal startup errors share execution acceptance,
+// preparation phase and actionable hints across direct/daemon delivery.
+pub(crate) const RPC_PROTOCOL_VERSION: u32 = 29;
 
 /// Stable JSON-RPC error codes used by the daemon envelope and scheduler.
 /// Operation-specific semantic failures are migrated separately.

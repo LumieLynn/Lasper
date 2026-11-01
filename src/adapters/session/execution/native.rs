@@ -1,13 +1,19 @@
 //! Compose native systemd calls into locally owned or transferable sessions.
 
+use super::{PreparedNativeCommand, PreparedNativeExecution};
 use crate::adapters::error::NspawnError;
-use crate::adapters::runtime::{dbus::DbusBackend, systemd_tools};
+use crate::adapters::runtime::{
+    dbus::{DbusBackend, GuestSessionOpenError},
+    systemd_tools,
+};
 use crate::adapters::session::io::MachinePty;
-use crate::application::sessions::execution::GuestExecutionRequest;
+use crate::application::sessions::execution::{
+    GuestExecutionError, GuestExecutionFailure, GuestExecutionObservation, GuestExecutionPort,
+    GuestExecutionRequest,
+};
 use crate::application::sessions::{SessionError, TerminalSessionHandle};
 use crate::domain::machine::MachineName;
 use crate::domain::session::{SessionId, SessionSize, TerminalAttachmentKind};
-use portable_pty::CommandBuilder;
 
 #[derive(Clone)]
 pub(crate) enum NativeExecution {
@@ -18,7 +24,7 @@ pub(crate) enum NativeExecution {
 /// A machined PTY or a host client command awaiting local/daemon PTY delivery.
 pub(crate) enum NativeSession {
     Pty(MachinePty),
-    Command(CommandBuilder),
+    Command(PreparedNativeCommand),
 }
 
 impl NativeSession {
@@ -26,42 +32,62 @@ impl NativeSession {
         self,
         id: SessionId,
         size: SessionSize,
-    ) -> Result<TerminalSessionHandle, SessionError> {
+    ) -> Result<TerminalSessionHandle, GuestExecutionError> {
         match self {
-            Self::Pty(pty) => crate::adapters::session::io::spawn_machine_terminal(pty, id, size),
-            Self::Command(command) => crate::adapters::session::io::spawn_direct_terminal(
-                command,
-                id,
-                TerminalAttachmentKind::Login,
-                size,
-            ),
+            Self::Pty(pty) => crate::adapters::session::io::spawn_machine_terminal(pty, id, size)
+                .map_err(|error| {
+                    GuestExecutionError::new(GuestExecutionFailure::OutcomeUnknown, error)
+                }),
+            Self::Command(command) => {
+                // Resolve the prepared command after PTY setup, immediately
+                // before spawn, just as daemon delivery does.
+                crate::adapters::session::io::spawn_direct_terminal(
+                    || command.into_command(),
+                    id,
+                    TerminalAttachmentKind::Login,
+                    size,
+                )
+            }
         }
     }
 }
 
-impl NativeExecution {
-    pub(crate) async fn open(
+#[async_trait::async_trait]
+impl GuestExecutionPort for NativeExecution {
+    type Prepared = PreparedNativeExecution;
+
+    async fn observe(
         &self,
-        request: GuestExecutionRequest,
-    ) -> Result<NativeSession, SessionError> {
-        self.require_native(request.target().machine()).await?;
-        match self {
-            Self::Dbus(dbus) => {
-                let master = dbus
-                    .open_guest_session(&request)
-                    .await
-                    .map_err(|error| map_native_error("execute selected guest process", error))?;
-                Ok(NativeSession::Pty(MachinePty {
-                    master,
-                    machine_removed: None,
-                }))
-            }
-            Self::SystemdTools => Ok(NativeSession::Command(
-                systemd_tools::session::guest_session_command(&request),
-            )),
-        }
+        machine: &MachineName,
+        deadline: tokio::time::Instant,
+    ) -> Result<GuestExecutionObservation, SessionError> {
+        self.observe_native(machine, deadline).await
     }
 
+    /// Preparation observes the guest manager without submitting a process.
+    /// The returned owner is consumed when the request is actually opened.
+    async fn prepare(
+        &self,
+        request: GuestExecutionRequest,
+        deadline: tokio::time::Instant,
+    ) -> Result<PreparedNativeExecution, GuestExecutionError> {
+        let instance = super::readiness::require_native(
+            self,
+            request.target().machine(),
+            deadline,
+            uzers::get_effective_uid() == 0,
+        )
+        .await?;
+        Ok(PreparedNativeExecution::new(
+            self.clone(),
+            request,
+            instance,
+            deadline,
+        ))
+    }
+}
+
+impl NativeExecution {
     /// A getty login is not selected-user execution. Subscribe before opening
     /// its PTY so an intervening machine removal cannot strand the forwarder.
     pub(crate) async fn login(&self, machine: &MachineName) -> Result<NativeSession, SessionError> {
@@ -80,19 +106,13 @@ impl NativeExecution {
                     machine_removed: Some(removed),
                 }))
             }
-            Self::SystemdTools => Ok(NativeSession::Command(
+            Self::SystemdTools => Ok(NativeSession::Command(PreparedNativeCommand::new(
+                machine.clone(),
+                None,
+                None,
                 systemd_tools::session::machine_login_command(machine),
-            )),
+            ))),
         }
-    }
-
-    pub(crate) async fn open_local(
-        &self,
-        request: GuestExecutionRequest,
-        id: SessionId,
-        size: SessionSize,
-    ) -> Result<TerminalSessionHandle, SessionError> {
-        self.open(request).await?.into_local(id, size)
     }
 
     pub(crate) async fn machine_leader(&self, machine: &MachineName) -> Result<u32, SessionError> {
@@ -119,7 +139,7 @@ impl NativeExecution {
     }
 }
 
-fn map_native_error(context: &str, error: NspawnError) -> SessionError {
+pub(super) fn map_native_error(context: &str, error: NspawnError) -> SessionError {
     let message = format!("{context} through D-Bus: {error}");
     if error.is_polkit_rejection() {
         SessionError::with_hint(
@@ -129,4 +149,18 @@ fn map_native_error(context: &str, error: NspawnError) -> SessionError {
     } else {
         SessionError::new(message)
     }
+}
+
+pub(super) fn map_execution_error(
+    context: &str,
+    error: GuestSessionOpenError,
+) -> GuestExecutionError {
+    let (failure, error) = match error {
+        GuestSessionOpenError::NotAttempted(error) => (GuestExecutionFailure::NotAttempted, error),
+        GuestSessionOpenError::Rejected(error) => (GuestExecutionFailure::Rejected, error),
+        GuestSessionOpenError::OutcomeUnknown(error) => {
+            (GuestExecutionFailure::OutcomeUnknown, error)
+        }
+    };
+    GuestExecutionError::new(failure, map_native_error(context, error))
 }
