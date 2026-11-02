@@ -26,6 +26,8 @@ jobs:
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - run: cargo clippy -p lasper-guest-protocol --all-targets --locked -- -D warnings
+      - run: cargo clippy -p lasper-guest-runtime --lib --locked -- -D warnings
 
   test:
     name: test
@@ -35,6 +37,47 @@ jobs:
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-targets --locked
+      - run: cargo test -p lasper-guest-protocol --all-targets --locked
+      - run: cargo test -p lasper-guest-runtime --lib --locked
+
+  guest-runtime:
+    name: guest runtime (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            build-alias: build-guest-runtime-x86-64
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-22.04-arm
+            build-alias: build-guest-runtime-aarch64
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - run: rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: guest-runtime-${{ matrix.target }}
+
+      - name: Check guest runtime binary
+        run: >-
+          cargo clippy
+          --package lasper-guest-runtime
+          --profile guest-runtime
+          --target ${{ matrix.target }}
+          --bin lasper-guest-runtime
+          --features runtime-bin
+          --locked
+          -- -D warnings
+
+      - name: Build guest runtime
+        run: cargo ${{ matrix.build-alias }}
+
+      - name: Verify guest runtime
+        shell: bash
+        run: .github/scripts/verify-guest-runtime.sh ${{ matrix.target }} --run
 
   audit:
     name: dependency audit

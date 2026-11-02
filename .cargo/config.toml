@@ -2,3 +2,37 @@
 # Zig cannot compile simdutf's AVX-512 target attributes; retain SSE/AVX2 dispatch.
 # https://github.com/ziglang/zig/issues/20414
 CXXFLAGS_x86_64_unknown_linux_musl = "-DSIMDUTF_IMPLEMENTATION_ICELAKE=0"
+
+[alias]
+build-guest-runtime-x86-64 = [
+    "rustc",
+    "--package", "lasper-guest-runtime",
+    "--profile", "guest-runtime",
+    "--target", "x86_64-unknown-linux-musl",
+    "--bin", "lasper-guest-runtime",
+    "--features", "runtime-bin",
+    "--locked",
+    "--",
+    "-C", "link-self-contained=no",
+    "-C", "linker=rust-lld",
+    "-C", "linker-flavor=ld.lld",
+    "-C", "relocation-model=pic",
+    "-C", "link-arg=-pie",
+    "-C", "link-arg=--no-dynamic-linker",
+]
+build-guest-runtime-aarch64 = [
+    "rustc",
+    "--package", "lasper-guest-runtime",
+    "--profile", "guest-runtime",
+    "--target", "aarch64-unknown-linux-musl",
+    "--bin", "lasper-guest-runtime",
+    "--features", "runtime-bin",
+    "--locked",
+    "--",
+    "-C", "link-self-contained=no",
+    "-C", "linker=rust-lld",
+    "-C", "linker-flavor=ld.lld",
+    "-C", "relocation-model=pic",
+    "-C", "link-arg=-pie",
+    "-C", "link-arg=--no-dynamic-linker",
+]

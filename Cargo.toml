@@ -5,6 +5,11 @@ edition = "2021"
 license = "GPL-3.0-or-later"
 description = "A LazyDocker-inspired TUI for managing systemd-nspawn containers"
 
+[workspace]
+members = ["crates/guest-protocol", "crates/guest-runtime"]
+default-members = ["."]
+resolver = "2"
+
 [[bin]]
 name = "lasper"
 path = "src/main.rs"
@@ -78,3 +83,8 @@ tokio = { version = "1", features = ["test-util"] }
 opt-level = "z"
 lto = "fat"
 codegen-units = 1
+
+[profile.guest-runtime]
+inherits = "release"
+panic = "abort"
+strip = "symbols"

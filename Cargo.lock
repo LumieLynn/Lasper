@@ -1154,6 +1154,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "lasper-guest-protocol"
+version = "0.1.0"
+
+[[package]]
+name = "lasper-guest-runtime"
+version = "0.1.0"
+dependencies = [
+ "lasper-guest-protocol",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
