@@ -26,6 +26,7 @@ jobs:
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
+      - run: cargo clippy -p lasper-guest-host-transport --all-targets --locked -- -D warnings
       - run: cargo clippy -p lasper-guest-protocol --all-targets --locked -- -D warnings
       - run: cargo clippy -p lasper-guest-runtime --lib --locked -- -D warnings
 
@@ -37,6 +38,7 @@ jobs:
       - run: rustup show
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-targets --locked
+      - run: cargo test -p lasper-guest-host-transport --all-targets --locked
       - run: cargo test -p lasper-guest-protocol --all-targets --locked
       - run: cargo test -p lasper-guest-runtime --lib --locked
 
@@ -60,6 +62,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: guest-runtime-${{ matrix.target }}
+
+      - name: Exercise guest transport on runner architecture
+        run: |
+          cargo test -p lasper-guest-runtime --lib --locked
+          cargo test -p lasper-guest-host-transport --test interop --locked
 
       - name: Check guest runtime binary
         run: >-

@@ -90,6 +90,7 @@ jobs:
 
       - name: Run guest runtime Clippy
         run: |
+          cargo clippy -p lasper-guest-host-transport --all-targets --locked -- -D warnings
           cargo clippy -p lasper-guest-protocol --all-targets --locked -- -D warnings
           cargo clippy -p lasper-guest-runtime --lib --locked -- -D warnings
 
@@ -98,6 +99,7 @@ jobs:
 
       - name: Run guest runtime tests
         run: |
+          cargo test -p lasper-guest-host-transport --all-targets --locked
           cargo test -p lasper-guest-protocol --all-targets --locked
           cargo test -p lasper-guest-runtime --lib --locked
 
@@ -136,6 +138,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-guest-runtime-${{ matrix.target }}
+
+      - name: Exercise guest transport on runner architecture
+        run: |
+          cargo test -p lasper-guest-runtime --lib --locked
+          cargo test -p lasper-guest-host-transport --test interop --locked
 
       - name: Check guest runtime binary
         run: >-

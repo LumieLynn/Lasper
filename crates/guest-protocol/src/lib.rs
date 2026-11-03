@@ -5,8 +5,9 @@ mod control;
 mod identity;
 
 pub use control::{
-    ControlFrameHeader, ControlFrameHeaderError, MessageKind, CONTROL_FRAME_HEADER_BYTES,
-    MAX_CONTROL_DESCRIPTORS, MAX_CONTROL_PAYLOAD_BYTES,
+    ControlFrame, ControlFrameError, ControlFrameHeader, ControlFrameHeaderError, MessageKind,
+    CONTROL_FRAME_DESCRIPTOR_ANCHOR_BYTES, CONTROL_FRAME_HEADER_BYTES, MAX_CONTROL_DESCRIPTORS,
+    MAX_CONTROL_PAYLOAD_BYTES,
 };
 pub use identity::{
     Architecture, FeatureSet, IdentityDecodeError, RuntimeCompatibilityError, RuntimeIdentity,

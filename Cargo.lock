@@ -1154,6 +1154,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "lasper-guest-host-transport"
+version = "0.1.0"
+dependencies = [
+ "lasper-guest-protocol",
+ "lasper-guest-runtime",
+ "libc",
+ "tokio",
+]
+
+[[package]]
 name = "lasper-guest-protocol"
 version = "0.1.0"
 

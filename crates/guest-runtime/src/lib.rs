@@ -1,6 +1,12 @@
 #![no_std]
+#![deny(unsafe_op_in_unsafe_fn)]
+
+#[cfg(not(target_os = "linux"))]
+compile_error!("the Lasper guest runtime is Linux-only");
 
 use lasper_guest_protocol::{Architecture, RuntimeIdentity};
+
+pub mod transport;
 
 #[cfg(target_arch = "x86_64")]
 const RUNTIME_ARCHITECTURE: Architecture = Architecture::X86_64;
