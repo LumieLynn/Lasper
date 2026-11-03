@@ -1,17 +1,11 @@
 name: Development release tag
 
 on:
-  push:
-    branches: [dev]
-  workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: write
   actions: write
-
-concurrency:
-  group: development-release-tag
-  cancel-in-progress: false
 
 jobs:
   tag:
@@ -36,13 +30,18 @@ jobs:
 
           VERSION="${BASE_VERSION}.${GITHUB_SHA:0:7}"
           TAG="v${VERSION}"
-          if git ls-remote --exit-code origin "refs/tags/${TAG}" >/dev/null 2>&1; then
-            echo "${TAG} already exists; no new release dispatch is needed"
-            exit 0
+          EXISTING_TARGET=$(git ls-remote origin "refs/tags/${TAG}^{}" | awk 'NR == 1 { print $1 }')
+          if [[ -n "${EXISTING_TARGET}" ]]; then
+            if [[ "${EXISTING_TARGET}" != "${GITHUB_SHA}" ]]; then
+              echo "${TAG} already points to ${EXISTING_TARGET}, expected ${GITHUB_SHA}" >&2
+              exit 1
+            fi
+            echo "${TAG} already points to this CI-verified commit"
+          else
+            git config --local user.name "github-actions[bot]"
+            git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag --annotate "${TAG}" "${GITHUB_SHA}" --message "Lasper ${VERSION} development snapshot"
+            git push origin "refs/tags/${TAG}"
           fi
 
-          git config --local user.name "github-actions[bot]"
-          git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag --annotate "${TAG}" "${GITHUB_SHA}" --message "Lasper ${VERSION} development snapshot"
-          git push origin "refs/tags/${TAG}"
           gh workflow run release.yml --repo "${GITHUB_REPOSITORY}" --ref "${TAG}"

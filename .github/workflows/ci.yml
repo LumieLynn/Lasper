@@ -167,3 +167,12 @@ jobs:
           name: lasper-${{ matrix.target }}
           path: lasper-${{ matrix.target }}
           if-no-files-found: error
+
+  development-release:
+    name: tag successful dev snapshot
+    if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+    needs: [fmt, clippy, test, guest-runtime, audit, build]
+    permissions:
+      actions: write
+      contents: write
+    uses: ./.github/workflows/dev-release.yml
