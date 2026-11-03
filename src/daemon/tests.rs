@@ -1097,7 +1097,7 @@ async fn pidfd_becomes_readable_after_process_exit() {
         }
         Err(error) => panic!("pidfd_open failed: {error}"),
     };
-    let async_pidfd = tokio::io::unix::AsyncFd::new(pidfd).unwrap();
+    let async_pidfd = unsafe { tokio::io::unix::AsyncFd::register(pidfd) }.unwrap();
     child.kill().unwrap();
     child.wait().unwrap();
 

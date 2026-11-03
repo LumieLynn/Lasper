@@ -45,7 +45,7 @@ pub(super) fn require_daemon_root(effective_uid: u32) -> std::io::Result<()> {
 }
 
 fn monitor_parent(pidfd: OwnedFd, state: Arc<DaemonServerState>) -> std::io::Result<()> {
-    let pidfd = tokio::io::unix::AsyncFd::new(pidfd)?;
+    let pidfd = unsafe { tokio::io::unix::AsyncFd::register(pidfd) }?;
     tokio::spawn(async move {
         match pidfd.readable().await {
             Ok(_) => log::info!("Daemon: launching TUI exited; stopping elevated daemon"),

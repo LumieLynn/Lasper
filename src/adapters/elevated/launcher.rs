@@ -428,7 +428,7 @@ mod tests {
             .finish_with_grace(Duration::from_millis(1))
             .await
             .unwrap();
-        let pidfd = tokio::io::unix::AsyncFd::new(pidfd).unwrap();
+        let pidfd = unsafe { tokio::io::unix::AsyncFd::register(pidfd) }.unwrap();
         let _ready = tokio::time::timeout(Duration::from_secs(1), pidfd.readable())
             .await
             .unwrap()
@@ -449,9 +449,8 @@ mod tests {
         command.arg("30");
         let launcher = launch_test_process(&mut command);
         let pid = launcher.child.as_ref().unwrap().id().unwrap();
-        let pidfd =
-            tokio::io::unix::AsyncFd::new(crate::adapters::process::open_pidfd(pid).unwrap())
-                .unwrap();
+        let pidfd = crate::adapters::process::open_pidfd(pid).unwrap();
+        let pidfd = unsafe { tokio::io::unix::AsyncFd::register(pidfd) }.unwrap();
         let directory = Arc::downgrade(&launcher.socket_directory);
         drop(launcher);
         let _ready = tokio::time::timeout(Duration::from_secs(1), pidfd.readable())

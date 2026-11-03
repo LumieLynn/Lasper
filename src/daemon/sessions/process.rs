@@ -135,7 +135,7 @@ pub(super) fn deliver(
         }
     };
 
-    let (readiness, delivered) = match AsyncFd::new(process.clone()) {
+    let (readiness, delivered) = match unsafe { AsyncFd::register(process.clone()) } {
         Ok(readiness) => (
             Some(readiness),
             stream

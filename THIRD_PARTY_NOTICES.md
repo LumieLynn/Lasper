@@ -20,7 +20,7 @@ To regenerate: `cargo about generate --locked --fail about.hbs --output-file THI
 | [block-buffer](https://github.com/RustCrypto/utils) | 0.12.1 | MIT OR Apache-2.0 |
 | [bytes](https://github.com/tokio-rs/bytes) | 1.12.1 | MIT |
 | [castaway](https://github.com/sagebind/castaway) | 0.2.4 | MIT |
-| [cc](https://github.com/rust-lang/cc-rs) | 1.6.0 | MIT OR Apache-2.0 |
+| [cc](https://github.com/rust-lang/cc-rs) | 1.11.0 | MIT OR Apache-2.0 |
 | [cfg-if](https://github.com/rust-lang/cfg-if) | 1.0.5 | MIT OR Apache-2.0 |
 | [cfg_aliases](https://github.com/katharostech/cfg_aliases) | 0.1.1 | MIT |
 | [compact_str](https://github.com/ParkMyCar/compact_str) | 0.9.1 | MIT |
@@ -30,7 +30,7 @@ To regenerate: `cargo about generate --locked --fail about.hbs --output-file THI
 | [const-random-macro](https://github.com/tkaitchuck/constrandom) | 0.1.16 | MIT OR Apache-2.0 |
 | [convert_case](https://github.com/rutrum/convert-case) | 0.10.0 | MIT |
 | [cpufeatures](https://github.com/RustCrypto/utils) | 0.3.1 | MIT OR Apache-2.0 |
-| [crc32fast](https://github.com/srijs/rust-crc32fast) | 1.5.2 | MIT OR Apache-2.0 |
+| [crc32fast](https://github.com/srijs/rust-crc32fast) | 1.5.4 | MIT OR Apache-2.0 |
 | [critical-section](https://github.com/rust-embedded/critical-section) | 1.2.0 | MIT OR Apache-2.0 |
 | [crossbeam-channel](https://github.com/crossbeam-rs/crossbeam) | 0.5.17 | MIT OR Apache-2.0 |
 | [crossbeam-utils](https://github.com/crossbeam-rs/crossbeam) | 0.8.23 | MIT OR Apache-2.0 |
@@ -41,7 +41,7 @@ To regenerate: `cargo about generate --locked --fail about.hbs --output-file THI
 | [darling](https://github.com/TedDriggs/darling) | 0.24.1 | MIT |
 | [darling_core](https://github.com/TedDriggs/darling) | 0.24.1 | MIT |
 | [darling_macro](https://github.com/TedDriggs/darling) | 0.24.1 | MIT |
-| [deranged](https://github.com/jhpratt/deranged) | 0.5.8 | MIT OR Apache-2.0 |
+| [deranged](https://github.com/jhpratt/deranged) | 0.5.9 | MIT OR Apache-2.0 |
 | [derive_more](https://github.com/JelteF/derive_more) | 2.1.1 | MIT |
 | [derive_more-impl](https://github.com/JelteF/derive_more) | 2.1.1 | MIT |
 | [digest](https://github.com/RustCrypto/traits) | 0.11.3 | MIT OR Apache-2.0 |
@@ -51,17 +51,17 @@ To regenerate: `cargo about generate --locked --fail about.hbs --output-file THI
 | [dlv-list](https://github.com/sgodwincs/dlv-list-rs) | 0.5.2 | MIT OR Apache-2.0 |
 | [document-features](https://github.com/slint-ui/document-features) | 0.2.12 | MIT OR Apache-2.0 |
 | [downcast-rs](https://github.com/marcianx/downcast-rs) | 1.2.1 | MIT OR Apache-2.0 |
-| [either](https://github.com/rayon-rs/either) | 1.18.0 | MIT OR Apache-2.0 |
+| [either](https://github.com/rayon-rs/either) | 1.19.0 | MIT OR Apache-2.0 |
 | [endi](https://github.com/zeenix/endi) | 1.1.1 | MIT |
 | [enumflags2](https://github.com/meithecatte/enumflags2) | 0.7.12 | MIT OR Apache-2.0 |
 | [enumflags2_derive](https://github.com/meithecatte/enumflags2) | 0.7.12 | MIT OR Apache-2.0 |
-| [equivalent](https://github.com/indexmap-rs/equivalent) | 1.0.2 | Apache-2.0 OR MIT |
+| [equivalent](https://github.com/indexmap-rs/equivalent) | 1.0.3 | Apache-2.0 OR MIT |
 | [errno](https://github.com/lambda-fairy/rust-errno) | 0.3.14 | MIT OR Apache-2.0 |
 | [event-listener](https://github.com/smol-rs/event-listener) | 5.4.2 | Apache-2.0 OR MIT |
 | [event-listener-strategy](https://github.com/smol-rs/event-listener-strategy) | 0.5.4 | Apache-2.0 OR MIT |
 | [fastrand](https://github.com/smol-rs/fastrand) | 2.5.0 | Apache-2.0 OR MIT |
 | [filedescriptor](https://github.com/wezterm/wezterm) | 0.8.3 | MIT |
-| [find-msvc-tools](https://github.com/rust-lang/cc-rs) | 0.1.14 | MIT OR Apache-2.0 |
+| [find-msvc-tools](https://github.com/rust-lang/cc-rs) | 0.1.15 | MIT OR Apache-2.0 |
 | [flate2](https://github.com/rust-lang/flate2-rs) | 1.1.10 | MIT OR Apache-2.0 |
 | [foldhash](https://github.com/orlp/foldhash) | 0.2.0 | Zlib |
 | [form_urlencoded](https://github.com/servo/rust-url) | 1.2.2 | MIT OR Apache-2.0 |
@@ -76,48 +76,47 @@ To regenerate: `cargo about generate --locked --fail about.hbs --output-file THI
 | [getrandom](https://github.com/rust-random/getrandom) | 0.2.17 | MIT OR Apache-2.0 |
 | [getrandom](https://github.com/rust-random/getrandom) | 0.4.3 | MIT OR Apache-2.0 |
 | [hashbrown](https://github.com/rust-lang/hashbrown) | 0.14.5 | MIT OR Apache-2.0 |
-| [hashbrown](https://github.com/rust-lang/hashbrown) | 0.16.1 | MIT OR Apache-2.0 |
 | [hashbrown](https://github.com/rust-lang/hashbrown) | 0.17.1 | MIT OR Apache-2.0 |
 | [heck](https://github.com/withoutboats/heck) | 0.5.0 | MIT OR Apache-2.0 |
 | [hex](https://github.com/KokaKiwi/rust-hex) | 0.4.3 | MIT OR Apache-2.0 |
 | [hybrid-array](https://github.com/RustCrypto/hybrid-array) | 0.4.15 | MIT OR Apache-2.0 |
-| [icu_collections](https://github.com/unicode-org/icu4x) | 2.3.0 | Unicode-3.0 |
-| [icu_locale_core](https://github.com/unicode-org/icu4x) | 2.3.0 | Unicode-3.0 |
-| [icu_normalizer](https://github.com/unicode-org/icu4x) | 2.3.0 | Unicode-3.0 |
-| [icu_normalizer_data](https://github.com/unicode-org/icu4x) | 2.3.0 | Unicode-3.0 |
-| [icu_properties](https://github.com/unicode-org/icu4x) | 2.3.0 | Unicode-3.0 |
-| [icu_properties_data](https://github.com/unicode-org/icu4x) | 2.3.0 | Unicode-3.0 |
-| [icu_provider](https://github.com/unicode-org/icu4x) | 2.3.1 | Unicode-3.0 |
+| [icu_collections](https://github.com/unicode-org/icu4x) | 2.4.0 | Unicode-3.0 |
+| [icu_locale_core](https://github.com/unicode-org/icu4x) | 2.4.0 | Unicode-3.0 |
+| [icu_normalizer](https://github.com/unicode-org/icu4x) | 2.4.0 | Unicode-3.0 |
+| [icu_normalizer_data](https://github.com/unicode-org/icu4x) | 2.4.0 | Unicode-3.0 |
+| [icu_properties](https://github.com/unicode-org/icu4x) | 2.4.0 | Unicode-3.0 |
+| [icu_properties_data](https://github.com/unicode-org/icu4x) | 2.4.0 | Unicode-3.0 |
+| [icu_provider](https://github.com/unicode-org/icu4x) | 2.4.0 | Unicode-3.0 |
 | [ident_case](https://github.com/TedDriggs/ident_case) | 1.0.1 | MIT OR Apache-2.0 |
 | [idna](https://github.com/servo/rust-url/) | 1.1.0 | MIT OR Apache-2.0 |
 | [idna_adapter](https://github.com/hsivonen/idna_adapter) | 1.2.2 | Apache-2.0 OR MIT |
 | [indexmap](https://github.com/indexmap-rs/indexmap) | 2.14.2 | Apache-2.0 OR MIT |
-| [indoc](https://github.com/dtolnay/indoc) | 2.0.7 | MIT OR Apache-2.0 |
+| [indoc](https://github.com/dtolnay/indoc) | 2.0.8 | MIT OR Apache-2.0 |
 | [inotify](https://github.com/hannobraun/inotify-rs) | 0.11.5 | ISC |
 | [inotify-sys](https://github.com/hannobraun/inotify-sys) | 0.1.8 | ISC |
 | [instability](https://github.com/ratatui/instability) | 0.3.14 | MIT |
 | [itertools](https://github.com/rust-itertools/itertools) | 0.14.0 | MIT OR Apache-2.0 |
 | [itoa](https://github.com/dtolnay/itoa) | 1.0.18 | MIT OR Apache-2.0 |
-| [kasuari](https://github.com/ratatui/kasuari) | 0.4.12 | MIT OR Apache-2.0 |
+| [kasuari](https://github.com/ratatui/kasuari) | 0.4.13 | MIT OR Apache-2.0 |
 | [lazy_static](https://github.com/rust-lang-nursery/lazy-static.rs) | 1.5.1 | MIT OR Apache-2.0 |
-| [libc](https://github.com/rust-lang/libc) | 0.2.190 | MIT OR Apache-2.0 |
+| [libc](https://github.com/rust-lang/libc) | 0.2.191 | MIT OR Apache-2.0 |
 | [line-clipping](https://github.com/ratatui/line-clipping) | 0.3.8 | MIT OR Apache-2.0 |
 | [linux-raw-sys](https://github.com/sunfishcode/linux-raw-sys) | 0.12.1 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
 | [litemap](https://github.com/unicode-org/icu4x) | 0.8.3 | Unicode-3.0 |
-| [litrs](https://github.com/LukasKalbertodt/litrs) | 1.0.0 | MIT OR Apache-2.0 |
+| [litrs](https://github.com/LukasKalbertodt/litrs) | 1.0.1 | MIT OR Apache-2.0 |
 | [lock_api](https://github.com/Amanieu/parking_lot) | 0.4.14 | MIT OR Apache-2.0 |
-| [log](https://github.com/rust-lang/log) | 0.4.34 | MIT OR Apache-2.0 |
+| [log](https://github.com/rust-lang/log) | 0.4.35 | MIT OR Apache-2.0 |
 | [lru](https://github.com/jeromefroe/lru-rs.git) | 0.18.5 | MIT |
 | [matchers](https://github.com/hawkw/matchers) | 0.2.0 | MIT |
 | [memchr](https://github.com/BurntSushi/memchr) | 2.8.3 | Unlicense OR MIT |
 | [miniz_oxide](https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide) | 0.9.1 | MIT OR Zlib OR Apache-2.0 |
 | [mio](https://github.com/tokio-rs/mio) | 1.2.4 | MIT |
 | [nix](https://github.com/nix-rust/nix) | 0.28.0 | MIT |
-| [notify](https://github.com/notify-rs/notify.git) | 8.2.0 | CC0-1.0 |
-| [notify-types](https://github.com/notify-rs/notify.git) | 2.1.0 | MIT OR Apache-2.0 |
+| [notify](https://github.com/notify-rs/notify.git) | 8.2.1 | CC0-1.0 |
+| [notify-types](https://github.com/notify-rs/notify.git) | 2.2.0 | MIT OR Apache-2.0 |
 | [nu-ansi-term](https://github.com/nushell/nu-ansi-term) | 0.50.3 | MIT |
 | [num-conv](https://github.com/jhpratt/num-conv) | 0.2.2 | MIT OR Apache-2.0 |
-| [num_threads](https://github.com/jhpratt/num_threads) | 0.1.7 | MIT OR Apache-2.0 |
+| [num_threads](https://github.com/jhpratt/num_threads) | 0.1.8 | MIT OR Apache-2.0 |
 | [once_cell](https://github.com/matklad/once_cell) | 1.21.4 | MIT OR Apache-2.0 |
 | [option-ext](https://github.com/soc/option-ext.git) | 0.2.0 | MPL-2.0 |
 | [ordered-multimap](https://github.com/sgodwincs/ordered-multimap-rs) | 0.7.3 | MIT |
@@ -143,14 +142,14 @@ To regenerate: `cargo about generate --locked --fail about.hbs --output-file THI
 | [regex](https://github.com/rust-lang/regex) | 1.13.1 | MIT OR Apache-2.0 |
 | [regex-automata](https://github.com/rust-lang/regex) | 0.4.18 | MIT OR Apache-2.0 |
 | [regex-syntax](https://github.com/rust-lang/regex) | 0.8.11 | MIT OR Apache-2.0 |
-| [rio-grapheme-width](https://github.com/raphamorim/rio) | 0.5.28 | MIT |
-| [rio-graphics](https://github.com/raphamorim/rio) | 0.5.28 | MIT |
-| [rio-unicode](https://github.com/raphamorim/rio) | 0.5.28 | MIT OR Apache-2.0 |
-| [rio-vt](https://github.com/raphamorim/rio) | 0.5.28 | MIT AND Apache-2.0 |
+| [rio-grapheme-width](https://github.com/raphamorim/rio) | 0.5.29 | MIT |
+| [rio-graphics](https://github.com/raphamorim/rio) | 0.5.29 | MIT |
+| [rio-unicode](https://github.com/raphamorim/rio) | 0.5.29 | MIT OR Apache-2.0 |
+| [rio-vt](https://github.com/raphamorim/rio) | 0.5.29 | MIT AND Apache-2.0 |
 | [rust-ini](https://github.com/zonyitoo/rust-ini) | 0.21.3 | MIT |
 | [rustc-hash](https://github.com/rust-lang/rustc-hash) | 2.1.3 | Apache-2.0 OR MIT |
 | [rustc_version](https://github.com/djc/rustc-version-rs) | 0.4.1 | MIT OR Apache-2.0 |
-| [rustix](https://github.com/bytecodealliance/rustix) | 1.1.5 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
+| [rustix](https://github.com/bytecodealliance/rustix) | 1.1.6 | Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT |
 | [rustversion](https://github.com/dtolnay/rustversion) | 1.0.23 | MIT OR Apache-2.0 |
 | [ryu](https://github.com/dtolnay/ryu) | 1.0.23 | Apache-2.0 OR BSL-1.0 |
 | [same-file](https://github.com/BurntSushi/same-file) | 1.0.6 | Unlicense OR MIT |
@@ -160,12 +159,12 @@ To regenerate: `cargo about generate --locked --fail about.hbs --output-file THI
 | [serde](https://github.com/serde-rs/serde) | 1.0.229 | MIT OR Apache-2.0 |
 | [serde_core](https://github.com/serde-rs/serde) | 1.0.229 | MIT OR Apache-2.0 |
 | [serde_derive](https://github.com/serde-rs/serde) | 1.0.229 | MIT OR Apache-2.0 |
-| [serde_json](https://github.com/serde-rs/json) | 1.0.151 | MIT OR Apache-2.0 |
+| [serde_json](https://github.com/serde-rs/json) | 1.0.154 | MIT OR Apache-2.0 |
 | [serde_repr](https://github.com/dtolnay/serde-repr) | 0.1.21 | MIT OR Apache-2.0 |
-| [serde_spanned](https://github.com/toml-rs/toml) | 1.1.1 | MIT OR Apache-2.0 |
+| [serde_spanned](https://github.com/toml-rs/toml) | 1.1.2 | MIT OR Apache-2.0 |
 | [serde_yaml_ng](https://github.com/acatton/serde-yaml-ng) | 0.10.0 | MIT |
-| [serial2](https://github.com/de-vri-es/serial2-rs) | 0.2.38 | BSD-2-Clause OR Apache-2.0 |
-| [sha2](https://github.com/RustCrypto/hashes) | 0.11.0 | MIT OR Apache-2.0 |
+| [serial2](https://github.com/de-vri-es/serial2-rs) | 0.2.39 | BSD-2-Clause OR Apache-2.0 |
+| [sha2](https://github.com/RustCrypto/hashes) | 0.11.1 | MIT OR Apache-2.0 |
 | [sharded-slab](https://github.com/hawkw/sharded-slab) | 0.1.7 | MIT |
 | [shell-words](https://github.com/tmiasko/shell-words) | 1.1.1 | MIT OR Apache-2.0 |
 | [shlex](https://github.com/comex/rust-shlex) | 2.0.1 | MIT OR Apache-2.0 |
@@ -176,7 +175,7 @@ To regenerate: `cargo about generate --locked --fail about.hbs --output-file THI
 | [simdutf](https://github.com/Nugine/simdutf-rs) | 0.7.0 | MIT |
 | [siphasher](https://github.com/jedisct1/rust-siphash) | 1.0.4 | MIT OR Apache-2.0 |
 | [slab](https://github.com/tokio-rs/slab) | 0.4.12 | MIT |
-| [smallvec](https://github.com/servo/rust-smallvec) | 1.16.2 | MIT OR Apache-2.0 |
+| [smallvec](https://github.com/servo/rust-smallvec) | 1.16.4 | MIT OR Apache-2.0 |
 | [socket2](https://github.com/rust-lang/socket2) | 0.6.5 | MIT OR Apache-2.0 |
 | [stable_deref_trait](https://github.com/storyyeller/stable_deref_trait) | 1.2.1 | MIT OR Apache-2.0 |
 | [static_assertions](https://github.com/nvzqz/static-assertions-rs) | 1.1.0 | MIT OR Apache-2.0 |
@@ -185,7 +184,7 @@ To regenerate: `cargo about generate --locked --fail about.hbs --output-file THI
 | [strum_macros](https://github.com/Peternator7/strum) | 0.28.0 | MIT |
 | [symlink](https://gitlab.com/chris-morgan/symlink) | 0.1.0 | MIT OR Apache-2.0 |
 | [syn](https://github.com/dtolnay/syn) | 2.0.119 | MIT OR Apache-2.0 |
-| [syn](https://github.com/dtolnay/syn) | 3.0.6 | MIT OR Apache-2.0 |
+| [syn](https://github.com/dtolnay/syn) | 3.0.9 | MIT OR Apache-2.0 |
 | [synstructure](https://github.com/mystor/synstructure) | 0.14.0 | MIT |
 | [tempfile](https://github.com/Stebalien/tempfile) | 3.27.0 | MIT OR Apache-2.0 |
 | [thiserror](https://github.com/dtolnay/thiserror) | 1.0.69 | MIT OR Apache-2.0 |
@@ -196,15 +195,15 @@ To regenerate: `cargo about generate --locked --fail about.hbs --output-file THI
 | [time](https://github.com/time-rs/time) | 0.3.55 | MIT OR Apache-2.0 |
 | [time-core](https://github.com/time-rs/time) | 0.1.9 | MIT OR Apache-2.0 |
 | [tiny-keccak](https://crates.io/crates/tiny-keccak) | 2.0.2 | CC0-1.0 |
-| [tinystr](https://github.com/unicode-org/icu4x) | 0.8.4 | Unicode-3.0 |
-| [tokio](https://github.com/tokio-rs/tokio) | 1.53.2 | MIT |
+| [tinystr](https://github.com/unicode-org/icu4x) | 0.8.5 | Unicode-3.0 |
+| [tokio](https://github.com/tokio-rs/tokio) | 1.54.1 | MIT |
 | [tokio-macros](https://github.com/tokio-rs/tokio) | 2.7.2 | MIT |
 | [tokio-stream](https://github.com/tokio-rs/tokio) | 0.1.19 | MIT |
-| [toml](https://github.com/toml-rs/toml) | 1.1.6+spec-1.1.0 | MIT OR Apache-2.0 |
-| [toml_datetime](https://github.com/toml-rs/toml) | 1.1.1+spec-1.1.0 | MIT OR Apache-2.0 |
-| [toml_edit](https://github.com/toml-rs/toml) | 0.25.15+spec-1.1.0 | MIT OR Apache-2.0 |
-| [toml_parser](https://github.com/toml-rs/toml) | 1.1.3+spec-1.1.0 | MIT OR Apache-2.0 |
-| [toml_writer](https://github.com/toml-rs/toml) | 1.1.2+spec-1.1.0 | MIT OR Apache-2.0 |
+| [toml](https://github.com/toml-rs/toml) | 1.1.8+spec-1.1.0 | MIT OR Apache-2.0 |
+| [toml_datetime](https://github.com/toml-rs/toml) | 1.1.2+spec-1.1.0 | MIT OR Apache-2.0 |
+| [toml_edit](https://github.com/toml-rs/toml) | 0.25.17+spec-1.1.0 | MIT OR Apache-2.0 |
+| [toml_parser](https://github.com/toml-rs/toml) | 1.1.5+spec-1.1.0 | MIT OR Apache-2.0 |
+| [toml_writer](https://github.com/toml-rs/toml) | 1.1.3+spec-1.1.0 | MIT OR Apache-2.0 |
 | [tracing](https://github.com/tokio-rs/tracing) | 0.1.44 | MIT |
 | [tracing-appender](https://github.com/tokio-rs/tracing) | 0.2.5 | MIT |
 | [tracing-attributes](https://github.com/tokio-rs/tracing) | 0.1.31 | MIT |
@@ -214,14 +213,15 @@ To regenerate: `cargo about generate --locked --fail about.hbs --output-file THI
 | [tui-input](https://github.com/sayanarijit/tui-input) | 0.15.5 | MIT |
 | [typenum](https://github.com/paholg/typenum) | 1.20.1 | MIT OR Apache-2.0 |
 | [ucd-trie](https://github.com/BurntSushi/ucd-generate) | 0.1.7 | MIT OR Apache-2.0 |
-| [unicode-ident](https://github.com/dtolnay/unicode-ident) | 1.0.26 | (MIT OR Apache-2.0) AND Unicode-3.0 |
+| [unicode-ident](https://github.com/dtolnay/unicode-ident) | 1.0.27 | (MIT OR Apache-2.0) AND Unicode-3.0 |
 | [unicode-segmentation](https://github.com/unicode-rs/unicode-segmentation) | 1.13.3 | MIT OR Apache-2.0 |
 | [unicode-truncate](https://github.com/Aetf/unicode-truncate) | 2.0.1 | MIT OR Apache-2.0 |
-| [unicode-width](https://github.com/unicode-rs/unicode-width) | 0.2.2 | MIT OR Apache-2.0 |
+| [unicode-width](https://github.com/unicode-rs/unicode-width) | 0.2.3 | MIT OR Apache-2.0 |
 | [unsafe-libyaml](https://github.com/dtolnay/unsafe-libyaml) | 0.2.11 | MIT |
 | [url](https://github.com/servo/rust-url) | 2.5.8 | MIT OR Apache-2.0 |
-| [utf8_iter](https://github.com/hsivonen/utf8_iter) | 1.0.4 | Apache-2.0 OR MIT |
-| [uuid](https://github.com/uuid-rs/uuid) | 1.27.0 | Apache-2.0 OR MIT |
+| [utf8_iter](https://github.com/hsivonen/utf8_iter) | 1.1.0 | Apache-2.0 OR MIT |
+| [utf_types](https://github.com/hsivonen/utf_types) | 1.0.0 | Apache-2.0 OR MIT |
+| [uuid](https://github.com/uuid-rs/uuid) | 1.29.0 | Apache-2.0 OR MIT |
 | [uzers](https://github.com/rustadopt/uzers-rs) | 0.12.2 | MIT |
 | [walkdir](https://github.com/BurntSushi/walkdir) | 2.5.0 | Unlicense OR MIT |
 | [which](https://github.com/harryfei/which-rs.git) | 8.0.6 | MIT |
@@ -229,21 +229,21 @@ To regenerate: `cargo about generate --locked --fail about.hbs --output-file THI
 | [writeable](https://github.com/unicode-org/icu4x) | 0.6.4 | Unicode-3.0 |
 | [x11rb](https://github.com/psychon/x11rb) | 0.14.0 | MIT OR Apache-2.0 |
 | [x11rb-protocol](https://github.com/psychon/x11rb) | 0.14.0 | MIT OR Apache-2.0 |
-| [yoke](https://github.com/unicode-org/icu4x) | 0.8.3 | Unicode-3.0 |
+| [yoke](https://github.com/unicode-org/icu4x) | 0.8.4 | Unicode-3.0 |
 | [yoke-derive](https://github.com/unicode-org/icu4x) | 0.8.4 | Unicode-3.0 |
 | [zbus](https://github.com/z-galaxy/zbus/) | 5.19.0 | MIT |
 | [zbus_macros](https://github.com/z-galaxy/zbus/) | 5.19.0 | MIT |
-| [zbus_names](https://github.com/z-galaxy/zbus/) | 4.3.4 | MIT |
-| [zcheapstr](https://github.com/z-galaxy/zcheapstr/) | 1.1.0 | MIT |
+| [zbus_names](https://github.com/z-galaxy/zbus/) | 4.3.5 | MIT |
+| [zcheapstr](https://github.com/z-galaxy/zcheapstr/) | 1.2.0 | MIT |
 | [zerofrom](https://github.com/unicode-org/icu4x) | 0.1.8 | Unicode-3.0 |
 | [zerofrom-derive](https://github.com/unicode-org/icu4x) | 0.1.8 | Unicode-3.0 |
-| [zeroize](https://github.com/RustCrypto/utils) | 1.9.0 | Apache-2.0 OR MIT |
+| [zeroize](https://github.com/RustCrypto/utils) | 1.9.1 | Apache-2.0 OR MIT |
 | [zerotrie](https://github.com/unicode-org/icu4x) | 0.2.5 | Unicode-3.0 |
-| [zerovec](https://github.com/unicode-org/icu4x) | 0.11.8 | Unicode-3.0 |
-| [zerovec-derive](https://github.com/unicode-org/icu4x) | 0.11.6 | Unicode-3.0 |
+| [zerovec](https://github.com/unicode-org/icu4x) | 0.11.9 | Unicode-3.0 |
+| [zerovec-derive](https://github.com/unicode-org/icu4x) | 0.11.7 | Unicode-3.0 |
 | [zmij](https://github.com/dtolnay/zmij) | 1.0.23 | MIT |
-| [zvariant](https://github.com/z-galaxy/zbus/) | 5.15.0 | MIT |
-| [zvariant_derive](https://github.com/z-galaxy/zbus/) | 5.15.0 | MIT |
+| [zvariant](https://github.com/z-galaxy/zbus/) | 5.15.1 | MIT |
+| [zvariant_derive](https://github.com/z-galaxy/zbus/) | 5.15.1 | MIT |
 | [zvariant_utils](https://github.com/z-galaxy/zbus/) | 4.2.0 | MIT |
 
 ## License texts
@@ -650,7 +650,7 @@ limitations under the License.
 <details>
 <summary>Apache License 2.0 (Apache-2.0)</summary>
 
-Used by: [rio-vt 0.5.28](https://crates.io/crates/rio-vt/0.5.28).
+Used by: [rio-vt 0.5.29](https://crates.io/crates/rio-vt/0.5.29).
 
 ```text
 // grid/mod.rs was originally taken from Alacritty
@@ -665,7 +665,7 @@ Used by: [rio-vt 0.5.28](https://crates.io/crates/rio-vt/0.5.28).
 <details>
 <summary>BSD 2-Clause &quot;Simplified&quot; License (BSD-2-Clause)</summary>
 
-Used by: [serial2 0.2.38](https://crates.io/crates/serial2/0.2.38).
+Used by: [serial2 0.2.39](https://crates.io/crates/serial2/0.2.39).
 
 ```text
 BSD 2-Clause License
@@ -741,7 +741,7 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 <details>
 <summary>Creative Commons Zero v1.0 Universal (CC0-1.0)</summary>
 
-Used by: [notify 8.2.0](https://crates.io/crates/notify/8.2.0).
+Used by: [notify 8.2.1](https://crates.io/crates/notify/8.2.1).
 
 ```text
 Creative Commons CC0 1.0 Universal
@@ -1074,7 +1074,7 @@ SOFTWARE.
 <details>
 <summary>MIT License (MIT)</summary>
 
-Used by: [rio-unicode 0.5.28](https://crates.io/crates/rio-unicode/0.5.28).
+Used by: [rio-unicode 0.5.29](https://crates.io/crates/rio-unicode/0.5.29).
 
 ```text
 // Copyright 2012-2022 The Rust Project Developers. See the COPYRIGHT
@@ -1254,7 +1254,7 @@ DEALINGS IN THE SOFTWARE.
 <details>
 <summary>MIT License (MIT)</summary>
 
-Used by: [cc 1.6.0](https://crates.io/crates/cc/1.6.0), [cfg-if 1.0.5](https://crates.io/crates/cfg-if/1.0.5), [find-msvc-tools 0.1.14](https://crates.io/crates/find-msvc-tools/0.1.14), [socket2 0.6.5](https://crates.io/crates/socket2/0.6.5).
+Used by: [cc 1.11.0](https://crates.io/crates/cc/1.11.0), [cfg-if 1.0.5](https://crates.io/crates/cfg-if/1.0.5), [find-msvc-tools 0.1.15](https://crates.io/crates/find-msvc-tools/0.1.15), [socket2 0.6.5](https://crates.io/crates/socket2/0.6.5).
 
 ```text
 Copyright (c) 2014 Alex Crichton
@@ -1392,7 +1392,7 @@ DEALINGS IN THE SOFTWARE.
 <details>
 <summary>MIT License (MIT)</summary>
 
-Used by: [bitflags 2.13.2](https://crates.io/crates/bitflags/2.13.2), [log 0.4.34](https://crates.io/crates/log/0.4.34), [regex-automata 0.4.18](https://crates.io/crates/regex-automata/0.4.18), [regex-syntax 0.8.11](https://crates.io/crates/regex-syntax/0.8.11), [regex 1.13.1](https://crates.io/crates/regex/1.13.1).
+Used by: [bitflags 2.13.2](https://crates.io/crates/bitflags/2.13.2), [log 0.4.35](https://crates.io/crates/log/0.4.35), [regex-automata 0.4.18](https://crates.io/crates/regex-automata/0.4.18), [regex-syntax 0.8.11](https://crates.io/crates/regex-syntax/0.8.11), [regex 1.13.1](https://crates.io/crates/regex/1.13.1).
 
 ```text
 Copyright (c) 2014 The Rust Project Developers
@@ -1428,7 +1428,7 @@ DEALINGS IN THE SOFTWARE.
 <details>
 <summary>MIT License (MIT)</summary>
 
-Used by: [uuid 1.27.0](https://crates.io/crates/uuid/1.27.0).
+Used by: [uuid 1.29.0](https://crates.io/crates/uuid/1.29.0).
 
 ```text
 Copyright (c) 2014 The Rust Project Developers
@@ -1501,7 +1501,7 @@ DEALINGS IN THE SOFTWARE.
 <details>
 <summary>MIT License (MIT)</summary>
 
-Used by: [either 1.18.0](https://crates.io/crates/either/1.18.0), [itertools 0.14.0](https://crates.io/crates/itertools/0.14.0).
+Used by: [either 1.19.0](https://crates.io/crates/either/1.19.0), [itertools 0.14.0](https://crates.io/crates/itertools/0.14.0).
 
 ```text
 Copyright (c) 2015
@@ -1573,7 +1573,7 @@ DEALINGS IN THE SOFTWARE.
 <details>
 <summary>MIT License (MIT)</summary>
 
-Used by: [fs2 0.4.3](https://crates.io/crates/fs2/0.4.3), [heck 0.5.0](https://crates.io/crates/heck/0.5.0), [unicode-segmentation 1.13.3](https://crates.io/crates/unicode-segmentation/1.13.3), [unicode-width 0.2.2](https://crates.io/crates/unicode-width/0.2.2).
+Used by: [fs2 0.4.3](https://crates.io/crates/fs2/0.4.3), [heck 0.5.0](https://crates.io/crates/heck/0.5.0), [unicode-segmentation 1.13.3](https://crates.io/crates/unicode-segmentation/1.13.3), [unicode-width 0.2.3](https://crates.io/crates/unicode-width/0.2.3).
 
 ```text
 Copyright (c) 2015 The Rust Project Developers
@@ -1676,7 +1676,7 @@ DEALINGS IN THE SOFTWARE.
 <details>
 <summary>MIT License (MIT)</summary>
 
-Used by: [const-random-macro 0.1.16](https://crates.io/crates/const-random-macro/0.1.16), [const-random 0.1.18](https://crates.io/crates/const-random/0.1.18), [hashbrown 0.14.5](https://crates.io/crates/hashbrown/0.14.5), [hashbrown 0.16.1](https://crates.io/crates/hashbrown/0.16.1), [hashbrown 0.17.1](https://crates.io/crates/hashbrown/0.17.1).
+Used by: [const-random-macro 0.1.16](https://crates.io/crates/const-random-macro/0.1.16), [const-random 0.1.18](https://crates.io/crates/const-random/0.1.18), [hashbrown 0.14.5](https://crates.io/crates/hashbrown/0.14.5), [hashbrown 0.17.1](https://crates.io/crates/hashbrown/0.17.1).
 
 ```text
 Copyright (c) 2016 Amanieu d'Antras
@@ -1820,7 +1820,7 @@ DEALINGS IN THE SOFTWARE.
 <details>
 <summary>MIT License (MIT)</summary>
 
-Used by: [equivalent 1.0.2](https://crates.io/crates/equivalent/1.0.2).
+Used by: [equivalent 1.0.3](https://crates.io/crates/equivalent/1.0.3).
 
 ```text
 Copyright (c) 2016--2023
@@ -1892,7 +1892,7 @@ DEALINGS IN THE SOFTWARE.
 <details>
 <summary>MIT License (MIT)</summary>
 
-Used by: [sha2 0.11.0](https://crates.io/crates/sha2/0.11.0).
+Used by: [sha2 0.11.1](https://crates.io/crates/sha2/0.11.1).
 
 ```text
 Copyright (c) 2016-2026 The RustCrypto Project Developers
@@ -2147,7 +2147,7 @@ DEALINGS IN THE SOFTWARE.
 <details>
 <summary>MIT License (MIT)</summary>
 
-Used by: [smallvec 1.16.2](https://crates.io/crates/smallvec/1.16.2).
+Used by: [smallvec 1.16.4](https://crates.io/crates/smallvec/1.16.4).
 
 ```text
 Copyright (c) 2018 The Servo Project Developers
@@ -2286,7 +2286,7 @@ DEALINGS IN THE SOFTWARE.
 <details>
 <summary>MIT License (MIT)</summary>
 
-Used by: [zeroize 1.9.0](https://crates.io/crates/zeroize/1.9.0).
+Used by: [zeroize 1.9.1](https://crates.io/crates/zeroize/1.9.1).
 
 ```text
 Copyright (c) 2018-2026 The RustCrypto Project Developers
@@ -2593,7 +2593,7 @@ SOFTWARE.
 <details>
 <summary>MIT License (MIT)</summary>
 
-Used by: [litrs 1.0.0](https://crates.io/crates/litrs/1.0.0).
+Used by: [litrs 1.0.1](https://crates.io/crates/litrs/1.0.1).
 
 ```text
 Copyright (c) 2020 Project Developers
@@ -2665,7 +2665,7 @@ DEALINGS IN THE SOFTWARE.
 <details>
 <summary>MIT License (MIT)</summary>
 
-Used by: [num_threads 0.1.7](https://crates.io/crates/num_threads/0.1.7).
+Used by: [num_threads 0.1.8](https://crates.io/crates/num_threads/0.1.8).
 
 ```text
 Copyright (c) 2021 Jacob Pratt
@@ -2863,7 +2863,7 @@ SOFTWARE.
 <details>
 <summary>MIT License (MIT)</summary>
 
-Used by: [notify-types 2.1.0](https://crates.io/crates/notify-types/2.1.0).
+Used by: [notify-types 2.2.0](https://crates.io/crates/notify-types/2.2.0).
 
 ```text
 Copyright (c) 2023 Notify Contributors
@@ -2930,7 +2930,7 @@ SOFTWARE.
 <details>
 <summary>MIT License (MIT)</summary>
 
-Used by: [deranged 0.5.8](https://crates.io/crates/deranged/0.5.8).
+Used by: [deranged 0.5.9](https://crates.io/crates/deranged/0.5.9).
 
 ```text
 Copyright (c) 2024 Jacob Pratt et al.
@@ -2960,7 +2960,7 @@ SOFTWARE.
 <details>
 <summary>MIT License (MIT)</summary>
 
-Used by: [zbus 5.19.0](https://crates.io/crates/zbus/5.19.0), [zbus_macros 5.19.0](https://crates.io/crates/zbus_macros/5.19.0), [zbus_names 4.3.4](https://crates.io/crates/zbus_names/4.3.4), [zvariant 5.15.0](https://crates.io/crates/zvariant/5.15.0), [zvariant_derive 5.15.0](https://crates.io/crates/zvariant_derive/5.15.0).
+Used by: [zbus 5.19.0](https://crates.io/crates/zbus/5.19.0), [zbus_macros 5.19.0](https://crates.io/crates/zbus_macros/5.19.0), [zbus_names 4.3.5](https://crates.io/crates/zbus_names/4.3.5), [zvariant 5.15.1](https://crates.io/crates/zvariant/5.15.1), [zvariant_derive 5.15.1](https://crates.io/crates/zvariant_derive/5.15.1).
 
 ```text
 Copyright (c) 2024 Zeeshan Ali Khan & zbus contributors
@@ -2996,7 +2996,7 @@ DEALINGS IN THE SOFTWARE.
 <details>
 <summary>MIT License (MIT)</summary>
 
-Used by: [zcheapstr 1.1.0](https://crates.io/crates/zcheapstr/1.1.0).
+Used by: [zcheapstr 1.2.0](https://crates.io/crates/zcheapstr/1.2.0).
 
 ```text
 Copyright (c) 2026 Zeeshan Ali Khan & zcheapstr contributors
@@ -3032,7 +3032,7 @@ DEALINGS IN THE SOFTWARE.
 <details>
 <summary>MIT License (MIT)</summary>
 
-Used by: [serde_spanned 1.1.1](https://crates.io/crates/serde_spanned/1.1.1), [toml 1.1.6+spec-1.1.0](https://crates.io/crates/toml/1.1.6+spec-1.1.0), [toml_datetime 1.1.1+spec-1.1.0](https://crates.io/crates/toml_datetime/1.1.1+spec-1.1.0), [toml_edit 0.25.15+spec-1.1.0](https://crates.io/crates/toml_edit/0.25.15+spec-1.1.0), [toml_parser 1.1.3+spec-1.1.0](https://crates.io/crates/toml_parser/1.1.3+spec-1.1.0), [toml_writer 1.1.2+spec-1.1.0](https://crates.io/crates/toml_writer/1.1.2+spec-1.1.0).
+Used by: [serde_spanned 1.1.2](https://crates.io/crates/serde_spanned/1.1.2), [toml 1.1.8+spec-1.1.0](https://crates.io/crates/toml/1.1.8+spec-1.1.0), [toml_datetime 1.1.2+spec-1.1.0](https://crates.io/crates/toml_datetime/1.1.2+spec-1.1.0), [toml_edit 0.25.17+spec-1.1.0](https://crates.io/crates/toml_edit/0.25.17+spec-1.1.0), [toml_parser 1.1.5+spec-1.1.0](https://crates.io/crates/toml_parser/1.1.5+spec-1.1.0), [toml_writer 1.1.3+spec-1.1.0](https://crates.io/crates/toml_writer/1.1.3+spec-1.1.0).
 
 ```text
 Copyright (c) Individual contributors
@@ -3122,7 +3122,7 @@ SOFTWARE.
 <details>
 <summary>MIT License (MIT)</summary>
 
-Used by: [libc 0.2.190](https://crates.io/crates/libc/0.2.190).
+Used by: [libc 0.2.191](https://crates.io/crates/libc/0.2.191).
 
 ```text
 Copyright (c) The Rust Project Developers
@@ -3248,7 +3248,7 @@ DEALINGS IN THE SOFTWARE.
 <details>
 <summary>MIT License (MIT)</summary>
 
-Used by: [utf8_iter 1.0.4](https://crates.io/crates/utf8_iter/1.0.4).
+Used by: [utf8_iter 1.1.0](https://crates.io/crates/utf8_iter/1.1.0), [utf_types 1.0.0](https://crates.io/crates/utf_types/1.0.0).
 
 ```text
 Copyright Mozilla Foundation
@@ -3379,7 +3379,7 @@ SOFTWARE.
 <details>
 <summary>MIT License (MIT)</summary>
 
-Used by: [crc32fast 1.5.2](https://crates.io/crates/crc32fast/1.5.2).
+Used by: [crc32fast 1.5.4](https://crates.io/crates/crc32fast/1.5.4).
 
 ```text
 MIT License
@@ -3751,7 +3751,7 @@ SOFTWARE.
 <details>
 <summary>MIT License (MIT)</summary>
 
-Used by: [rio-graphics 0.5.28](https://crates.io/crates/rio-graphics/0.5.28), [rio-unicode 0.5.28](https://crates.io/crates/rio-unicode/0.5.28), [rio-vt 0.5.28](https://crates.io/crates/rio-vt/0.5.28).
+Used by: [rio-graphics 0.5.29](https://crates.io/crates/rio-graphics/0.5.29), [rio-unicode 0.5.29](https://crates.io/crates/rio-unicode/0.5.29), [rio-vt 0.5.29](https://crates.io/crates/rio-vt/0.5.29).
 
 ```text
 MIT License
@@ -3846,7 +3846,7 @@ SOFTWARE.
 <details>
 <summary>MIT License (MIT)</summary>
 
-Used by: [tokio-stream 0.1.19](https://crates.io/crates/tokio-stream/0.1.19), [tokio 1.53.2](https://crates.io/crates/tokio/1.53.2).
+Used by: [tokio-stream 0.1.19](https://crates.io/crates/tokio-stream/0.1.19), [tokio 1.54.1](https://crates.io/crates/tokio/1.54.1).
 
 ```text
 MIT License
@@ -4011,7 +4011,7 @@ SOFTWARE.
 <details>
 <summary>MIT License (MIT)</summary>
 
-Used by: [rio-grapheme-width 0.5.28](https://crates.io/crates/rio-grapheme-width/0.5.28).
+Used by: [rio-grapheme-width 0.5.29](https://crates.io/crates/rio-grapheme-width/0.5.29).
 
 ```text
 MIT License
@@ -4120,7 +4120,7 @@ DEALINGS IN THE SOFTWARE.
 <details>
 <summary>MIT License (MIT)</summary>
 
-Used by: [adler2 2.0.1](https://crates.io/crates/adler2/2.0.1), [anyhow 1.0.104](https://crates.io/crates/anyhow/1.0.104), [async-trait 0.1.92](https://crates.io/crates/async-trait/0.1.92), [displaydoc 0.2.7](https://crates.io/crates/displaydoc/0.2.7), [endi 1.1.1](https://crates.io/crates/endi/1.1.1), [event-listener-strategy 0.5.4](https://crates.io/crates/event-listener-strategy/0.5.4), [event-listener 5.4.2](https://crates.io/crates/event-listener/5.4.2), [fastrand 2.5.0](https://crates.io/crates/fastrand/2.5.0), [futures-lite 2.6.1](https://crates.io/crates/futures-lite/2.6.1), [indoc 2.0.7](https://crates.io/crates/indoc/2.0.7), [itoa 1.0.18](https://crates.io/crates/itoa/1.0.18), [lazy_static 1.5.1](https://crates.io/crates/lazy_static/1.5.1), [linux-raw-sys 0.12.1](https://crates.io/crates/linux-raw-sys/0.12.1), [once_cell 1.21.4](https://crates.io/crates/once_cell/1.21.4), [ordered-stream 0.2.0](https://crates.io/crates/ordered-stream/0.2.0), [parking 2.2.1](https://crates.io/crates/parking/2.2.1), [pin-project-lite 0.2.17](https://crates.io/crates/pin-project-lite/0.2.17), [proc-macro-crate 3.5.0](https://crates.io/crates/proc-macro-crate/3.5.0), [proc-macro2 1.0.107](https://crates.io/crates/proc-macro2/1.0.107), [quote 1.0.47](https://crates.io/crates/quote/1.0.47), [rustix 1.1.5](https://crates.io/crates/rustix/1.1.5), [rustversion 1.0.23](https://crates.io/crates/rustversion/1.0.23), [semver 1.0.28](https://crates.io/crates/semver/1.0.28), [serde 1.0.229](https://crates.io/crates/serde/1.0.229), [serde_core 1.0.229](https://crates.io/crates/serde_core/1.0.229), [serde_derive 1.0.229](https://crates.io/crates/serde_derive/1.0.229), [serde_json 1.0.151](https://crates.io/crates/serde_json/1.0.151), [serde_repr 0.1.21](https://crates.io/crates/serde_repr/0.1.21), [syn 2.0.119](https://crates.io/crates/syn/2.0.119), [syn 3.0.6](https://crates.io/crates/syn/3.0.6), [thiserror-impl 1.0.69](https://crates.io/crates/thiserror-impl/1.0.69), [thiserror-impl 2.0.21](https://crates.io/crates/thiserror-impl/2.0.21), [thiserror 1.0.69](https://crates.io/crates/thiserror/1.0.69), [thiserror 2.0.21](https://crates.io/crates/thiserror/2.0.21), [unicode-ident 1.0.26](https://crates.io/crates/unicode-ident/1.0.26), [unsafe-libyaml 0.2.11](https://crates.io/crates/unsafe-libyaml/0.2.11), [zmij 1.0.23](https://crates.io/crates/zmij/1.0.23), [zvariant_utils 4.2.0](https://crates.io/crates/zvariant_utils/4.2.0).
+Used by: [adler2 2.0.1](https://crates.io/crates/adler2/2.0.1), [anyhow 1.0.104](https://crates.io/crates/anyhow/1.0.104), [async-trait 0.1.92](https://crates.io/crates/async-trait/0.1.92), [displaydoc 0.2.7](https://crates.io/crates/displaydoc/0.2.7), [endi 1.1.1](https://crates.io/crates/endi/1.1.1), [event-listener-strategy 0.5.4](https://crates.io/crates/event-listener-strategy/0.5.4), [event-listener 5.4.2](https://crates.io/crates/event-listener/5.4.2), [fastrand 2.5.0](https://crates.io/crates/fastrand/2.5.0), [futures-lite 2.6.1](https://crates.io/crates/futures-lite/2.6.1), [indoc 2.0.8](https://crates.io/crates/indoc/2.0.8), [itoa 1.0.18](https://crates.io/crates/itoa/1.0.18), [lazy_static 1.5.1](https://crates.io/crates/lazy_static/1.5.1), [linux-raw-sys 0.12.1](https://crates.io/crates/linux-raw-sys/0.12.1), [once_cell 1.21.4](https://crates.io/crates/once_cell/1.21.4), [ordered-stream 0.2.0](https://crates.io/crates/ordered-stream/0.2.0), [parking 2.2.1](https://crates.io/crates/parking/2.2.1), [pin-project-lite 0.2.17](https://crates.io/crates/pin-project-lite/0.2.17), [proc-macro-crate 3.5.0](https://crates.io/crates/proc-macro-crate/3.5.0), [proc-macro2 1.0.107](https://crates.io/crates/proc-macro2/1.0.107), [quote 1.0.47](https://crates.io/crates/quote/1.0.47), [rustix 1.1.6](https://crates.io/crates/rustix/1.1.6), [rustversion 1.0.23](https://crates.io/crates/rustversion/1.0.23), [semver 1.0.28](https://crates.io/crates/semver/1.0.28), [serde 1.0.229](https://crates.io/crates/serde/1.0.229), [serde_core 1.0.229](https://crates.io/crates/serde_core/1.0.229), [serde_derive 1.0.229](https://crates.io/crates/serde_derive/1.0.229), [serde_json 1.0.154](https://crates.io/crates/serde_json/1.0.154), [serde_repr 0.1.21](https://crates.io/crates/serde_repr/0.1.21), [syn 2.0.119](https://crates.io/crates/syn/2.0.119), [syn 3.0.9](https://crates.io/crates/syn/3.0.9), [thiserror-impl 1.0.69](https://crates.io/crates/thiserror-impl/1.0.69), [thiserror-impl 2.0.21](https://crates.io/crates/thiserror-impl/2.0.21), [thiserror 1.0.69](https://crates.io/crates/thiserror/1.0.69), [thiserror 2.0.21](https://crates.io/crates/thiserror/2.0.21), [unicode-ident 1.0.27](https://crates.io/crates/unicode-ident/1.0.27), [unsafe-libyaml 0.2.11](https://crates.io/crates/unsafe-libyaml/0.2.11), [zmij 1.0.23](https://crates.io/crates/zmij/1.0.23), [zvariant_utils 4.2.0](https://crates.io/crates/zvariant_utils/4.2.0).
 
 ```text
 Permission is hereby granted, free of charge, to any
@@ -4523,7 +4523,7 @@ THE SOFTWARE.
 <details>
 <summary>MIT License (MIT)</summary>
 
-Used by: [kasuari 0.4.12](https://crates.io/crates/kasuari/0.4.12).
+Used by: [kasuari 0.4.13](https://crates.io/crates/kasuari/0.4.13).
 
 ```text
 The MIT License (MIT)
@@ -5204,7 +5204,7 @@ Exhibit B - "Incompatible With Secondary Licenses" Notice
 <details>
 <summary>Unicode License v3 (Unicode-3.0)</summary>
 
-Used by: [unicode-ident 1.0.26](https://crates.io/crates/unicode-ident/1.0.26).
+Used by: [unicode-ident 1.0.27](https://crates.io/crates/unicode-ident/1.0.27).
 
 ```text
 UNICODE LICENSE V3
@@ -5254,7 +5254,7 @@ authorization of the copyright holder.
 <details>
 <summary>Unicode License v3 (Unicode-3.0)</summary>
 
-Used by: [icu_collections 2.3.0](https://crates.io/crates/icu_collections/2.3.0), [icu_locale_core 2.3.0](https://crates.io/crates/icu_locale_core/2.3.0), [icu_normalizer 2.3.0](https://crates.io/crates/icu_normalizer/2.3.0), [icu_normalizer_data 2.3.0](https://crates.io/crates/icu_normalizer_data/2.3.0), [icu_properties 2.3.0](https://crates.io/crates/icu_properties/2.3.0), [icu_properties_data 2.3.0](https://crates.io/crates/icu_properties_data/2.3.0), [icu_provider 2.3.1](https://crates.io/crates/icu_provider/2.3.1), [litemap 0.8.3](https://crates.io/crates/litemap/0.8.3), [potential_utf 0.1.6](https://crates.io/crates/potential_utf/0.1.6), [tinystr 0.8.4](https://crates.io/crates/tinystr/0.8.4), [writeable 0.6.4](https://crates.io/crates/writeable/0.6.4), [yoke-derive 0.8.4](https://crates.io/crates/yoke-derive/0.8.4), [yoke 0.8.3](https://crates.io/crates/yoke/0.8.3), [zerofrom-derive 0.1.8](https://crates.io/crates/zerofrom-derive/0.1.8), [zerofrom 0.1.8](https://crates.io/crates/zerofrom/0.1.8), [zerotrie 0.2.5](https://crates.io/crates/zerotrie/0.2.5), [zerovec-derive 0.11.6](https://crates.io/crates/zerovec-derive/0.11.6), [zerovec 0.11.8](https://crates.io/crates/zerovec/0.11.8).
+Used by: [icu_collections 2.4.0](https://crates.io/crates/icu_collections/2.4.0), [icu_locale_core 2.4.0](https://crates.io/crates/icu_locale_core/2.4.0), [icu_normalizer 2.4.0](https://crates.io/crates/icu_normalizer/2.4.0), [icu_normalizer_data 2.4.0](https://crates.io/crates/icu_normalizer_data/2.4.0), [icu_properties 2.4.0](https://crates.io/crates/icu_properties/2.4.0), [icu_properties_data 2.4.0](https://crates.io/crates/icu_properties_data/2.4.0), [icu_provider 2.4.0](https://crates.io/crates/icu_provider/2.4.0), [litemap 0.8.3](https://crates.io/crates/litemap/0.8.3), [potential_utf 0.1.6](https://crates.io/crates/potential_utf/0.1.6), [tinystr 0.8.5](https://crates.io/crates/tinystr/0.8.5), [writeable 0.6.4](https://crates.io/crates/writeable/0.6.4), [yoke-derive 0.8.4](https://crates.io/crates/yoke-derive/0.8.4), [yoke 0.8.4](https://crates.io/crates/yoke/0.8.4), [zerofrom-derive 0.1.8](https://crates.io/crates/zerofrom-derive/0.1.8), [zerofrom 0.1.8](https://crates.io/crates/zerofrom/0.1.8), [zerotrie 0.2.5](https://crates.io/crates/zerotrie/0.2.5), [zerovec-derive 0.11.7](https://crates.io/crates/zerovec-derive/0.11.7), [zerovec 0.11.9](https://crates.io/crates/zerovec/0.11.9).
 
 ```text
 UNICODE LICENSE V3

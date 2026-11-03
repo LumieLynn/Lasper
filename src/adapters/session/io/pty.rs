@@ -116,7 +116,7 @@ pub(crate) fn spawn_machine_terminal(
             std::io::Error::last_os_error()
         )));
     }
-    let master = tokio::io::unix::AsyncFd::new(master)
+    let master = unsafe { tokio::io::unix::AsyncFd::register(master) }
         .map_err(|error| SessionError::new(format!("watch machine PTY: {error}")))?;
     let (handle, endpoint) = terminal_session_channel(id, TerminalAttachmentKind::Login);
     tokio::spawn(async move {
