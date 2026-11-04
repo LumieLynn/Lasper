@@ -1,6 +1,7 @@
 use lasper_guest_protocol::{
-    ControlFrameError, ControlFrameHeader, ControlFrameHeaderError,
-    CONTROL_FRAME_DESCRIPTOR_ANCHOR_BYTES, CONTROL_FRAME_HEADER_BYTES, MAX_CONTROL_DESCRIPTORS,
+    ControlFrameError, ControlFrameHeader, ControlFrameHeaderError, ControlSessionError,
+    ControlSessionState, EnforcedControlLimits, CONTROL_FRAME_DESCRIPTOR_ANCHOR_BYTES,
+    CONTROL_FRAME_HEADER_BYTES, MAX_CONTROL_DESCRIPTORS,
 };
 use std::io;
 use std::mem::{size_of, zeroed};
@@ -20,6 +21,7 @@ struct AncillaryBuffer([usize; 16]);
 pub struct UnixControlStream {
     stream: UnixStream,
     poisoned: bool,
+    session: ControlSessionState,
 }
 
 impl UnixControlStream {
@@ -27,7 +29,19 @@ impl UnixControlStream {
         Self {
             stream,
             poisoned: false,
+            session: ControlSessionState::host(),
         }
+    }
+
+    /// Starts enforcing the limits negotiated from this connection's Hello pair.
+    ///
+    /// Pass the result of negotiating the `HelloRequest` and `HelloResponse`
+    /// exchanged on this stream. The transport verifies the handshake phase,
+    /// but cannot associate this value with that specific exchange.
+    pub fn complete_hello(&mut self, limits: EnforcedControlLimits) -> io::Result<()> {
+        self.session
+            .complete_hello(limits)
+            .map_err(invalid_outbound_session)
     }
 
     /// Returns true while the stream is still aligned to a frame boundary.
@@ -55,12 +69,17 @@ impl UnixControlStream {
         header
             .validate_shape(payload.len(), descriptors.len())
             .map_err(invalid_outbound_frame)?;
+        let next_session = self
+            .session
+            .next_outbound(header)
+            .map_err(invalid_outbound_session)?;
 
         let (stream, poisoned) = (&self.stream, &mut self.poisoned);
         let mut operation = StreamOperation::new(stream, poisoned)?;
         let result = send_frame_inner(operation.stream(), header, payload, descriptors).await;
         if result.is_ok() {
             operation.finish();
+            self.session = next_session;
         } else {
             operation.poison();
         }
@@ -72,15 +91,20 @@ impl UnixControlStream {
     /// Descriptor ownership is established before the rest of the frame is
     /// validated, so cancellation or malformed input cannot leak them.
     pub async fn receive_frame(&mut self) -> io::Result<ReceivedControlFrame> {
+        let session = self.session;
         let (stream, poisoned) = (&self.stream, &mut self.poisoned);
         let mut operation = StreamOperation::new(stream, poisoned)?;
-        let result = receive_frame_inner(operation.stream()).await;
-        if result.is_ok() {
-            operation.finish();
-        } else {
-            operation.poison();
+        match receive_frame_inner(operation.stream(), session).await {
+            Ok((frame, next_session)) => {
+                operation.finish();
+                self.session = next_session;
+                Ok(frame)
+            }
+            Err(error) => {
+                operation.poison();
+                Err(error)
+            }
         }
-        result
     }
 }
 
@@ -200,7 +224,10 @@ async fn write_all(stream: &UnixStream, mut bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-async fn receive_frame_inner(stream: &UnixStream) -> io::Result<ReceivedControlFrame> {
+async fn receive_frame_inner(
+    stream: &UnixStream,
+    session: ControlSessionState,
+) -> io::Result<(ReceivedControlFrame, ControlSessionState)> {
     // `SCM_RIGHTS` is tied to a byte position on a stream socket. Reading the
     // anchor alone prevents rights from a later byte being accepted by this frame.
     let mut first = [0; CONTROL_FRAME_DESCRIPTOR_ANCHOR_BYTES];
@@ -220,15 +247,21 @@ async fn receive_frame_inner(stream: &UnixStream) -> io::Result<ReceivedControlF
     )
     .await?;
     let header = ControlFrameHeader::decode(&encoded_header).map_err(invalid_header)?;
+    let next_session = session
+        .next_inbound(header)
+        .map_err(invalid_inbound_session)?;
     let descriptors = validate_descriptors(descriptors, header.descriptor_count())?;
 
     let mut payload = vec![0; header.payload_bytes() as usize];
     read_exact_without_descriptors(stream, &mut payload).await?;
-    Ok(ReceivedControlFrame {
-        header,
-        payload,
-        descriptors,
-    })
+    Ok((
+        ReceivedControlFrame {
+            header,
+            payload,
+            descriptors,
+        },
+        next_session,
+    ))
 }
 
 async fn read_exact_without_descriptors(
@@ -503,6 +536,18 @@ fn invalid_outbound_frame(error: ControlFrameError) -> io::Error {
     invalid_input(format!("invalid outbound guest control frame: {error:?}"))
 }
 
+fn invalid_outbound_session(error: ControlSessionError) -> io::Error {
+    invalid_input(format!(
+        "outbound guest control frame violates the session contract: {error:?}"
+    ))
+}
+
+fn invalid_inbound_session(error: ControlSessionError) -> io::Error {
+    invalid_data(format!(
+        "inbound guest control frame violates the session contract: {error:?}"
+    ))
+}
+
 fn invalid_input(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
 }
@@ -521,13 +566,16 @@ fn shutdown_stream(stream: &UnixStream) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lasper_guest_protocol::MessageKind;
+    use lasper_guest_protocol::{
+        BrokerId, ControlLimits, FeatureSet, HelloRequest, HelloResponse, MessageKind,
+    };
     use std::fs::File;
     use std::io::Read;
     use std::os::fd::{AsFd, IntoRawFd};
     use std::os::unix::net::UnixStream as StdUnixStream;
-    use tokio::io::AsyncWriteExt;
     use tokio::time::{timeout, Duration};
+
+    const TEST_CONTROL_FRAME_BYTES: u32 = CONTROL_FRAME_HEADER_BYTES as u32 + 8;
 
     fn test_header(payload_bytes: usize, descriptor_count: u16) -> ControlFrameHeader {
         ControlFrameHeader::new(
@@ -537,6 +585,95 @@ mod tests {
             descriptor_count,
         )
         .unwrap()
+    }
+
+    fn negotiated_limits(max_descriptors: u16) -> EnforcedControlLimits {
+        negotiated_limits_for(TEST_CONTROL_FRAME_BYTES, max_descriptors)
+    }
+
+    fn negotiated_current_limits(max_descriptors: u16) -> EnforcedControlLimits {
+        negotiated_limits_for(
+            lasper_guest_protocol::MAX_CONTROL_FRAME_BYTES,
+            max_descriptors,
+        )
+    }
+
+    fn negotiated_limits_for(max_frame_bytes: u32, max_descriptors: u16) -> EnforcedControlLimits {
+        let limits = ControlLimits::new(max_frame_bytes, max_descriptors).unwrap();
+        HelloRequest::new(FeatureSet::EMPTY, limits)
+            .unwrap()
+            .negotiate(
+                lasper_guest_protocol::PROTOCOL_MAJOR,
+                HelloResponse::new(FeatureSet::EMPTY, BrokerId::new([1; 16]), limits).unwrap(),
+            )
+            .unwrap()
+    }
+
+    fn established_stream(stream: UnixStream) -> UnixControlStream {
+        established_stream_with_descriptor_limit(stream, 2)
+    }
+
+    fn established_stream_with_descriptor_limit(
+        stream: UnixStream,
+        max_descriptors: u16,
+    ) -> UnixControlStream {
+        established_stream_with_negotiated_limits(stream, negotiated_limits(max_descriptors))
+    }
+
+    fn established_stream_with_current_limits(
+        stream: UnixStream,
+        max_descriptors: u16,
+    ) -> UnixControlStream {
+        established_stream_with_negotiated_limits(
+            stream,
+            negotiated_current_limits(max_descriptors),
+        )
+    }
+
+    fn established_stream_with_negotiated_limits(
+        stream: UnixStream,
+        limits: EnforcedControlLimits,
+    ) -> UnixControlStream {
+        let mut stream = UnixControlStream::new(stream);
+        let request = ControlFrameHeader::new(MessageKind::HelloRequest, 1, 0, 0).unwrap();
+        let response = ControlFrameHeader::new(MessageKind::HelloResponse, 1, 0, 0).unwrap();
+        stream.session = stream
+            .session
+            .next_outbound(request)
+            .unwrap()
+            .next_inbound(response)
+            .unwrap();
+        stream.complete_hello(limits).unwrap();
+        stream
+    }
+
+    #[tokio::test]
+    async fn host_transport_allows_only_one_outbound_hello_request() {
+        let (stream, _peer) = UnixStream::pair().unwrap();
+        let mut host = UnixControlStream::new(stream);
+        let request = ControlFrameHeader::new(MessageKind::HelloRequest, 7, 0, 0).unwrap();
+        let response = ControlFrameHeader::new(MessageKind::HelloResponse, 7, 0, 0).unwrap();
+
+        let error = host.send_frame(response, &[], &[]).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(host.can_continue());
+
+        host.send_frame(request, &[], &[]).await.unwrap();
+        let error = host.send_frame(request, &[], &[]).await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(host.can_continue());
+    }
+
+    #[tokio::test]
+    async fn host_transport_rejects_inbound_hello_request() {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        let mut host = UnixControlStream::new(stream);
+        let request = ControlFrameHeader::new(MessageKind::HelloRequest, 7, 0, 0).unwrap();
+        sendmsg_raw(&peer, &request.encode(), &[], &[]).unwrap();
+
+        let error = host.receive_frame().await.unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!host.can_continue());
     }
 
     fn rights_message(control: &mut AncillaryBuffer, descriptors: &[RawFd]) -> libc::msghdr {
@@ -608,8 +745,8 @@ mod tests {
     #[tokio::test]
     async fn frames_round_trip_and_pass_owned_close_on_exec_descriptors() {
         let (sender, receiver) = UnixStream::pair().unwrap();
-        let mut sender = UnixControlStream::new(sender);
-        let mut receiver = UnixControlStream::new(receiver);
+        let mut sender = established_stream(sender);
+        let mut receiver = established_stream(receiver);
         let file = File::open("/dev/null").unwrap();
         let payload = b"prepare";
         let header = test_header(payload.len(), 1);
@@ -647,8 +784,8 @@ mod tests {
         };
         assert_eq!(result, 0);
 
-        let mut sender = UnixControlStream::new(sender);
-        let mut receiver = UnixControlStream::new(receiver);
+        let mut sender = established_stream_with_current_limits(sender, 2);
+        let mut receiver = established_stream_with_current_limits(receiver, 2);
         let file = File::open("/dev/null").unwrap();
         let payload = vec![b'x'; 512 * 1024];
         let header = test_header(payload.len(), 1);
@@ -669,8 +806,8 @@ mod tests {
     #[tokio::test]
     async fn coalesced_frames_are_received_individually() {
         let (sender, receiver) = UnixStream::pair().unwrap();
-        let mut sender = UnixControlStream::new(sender);
-        let mut receiver = UnixControlStream::new(receiver);
+        let mut sender = established_stream(sender);
+        let mut receiver = established_stream(receiver);
         let first = test_header(5, 0);
         let second = test_header(6, 0);
 
@@ -682,9 +819,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn negotiated_limits_reject_outbound_frames_before_io() {
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        let mut sender = established_stream_with_descriptor_limit(sender, 0);
+        let mut receiver = established_stream_with_descriptor_limit(receiver, 0);
+        let oversized = vec![0; TEST_CONTROL_FRAME_BYTES as usize - CONTROL_FRAME_HEADER_BYTES + 1];
+
+        let error = sender
+            .send_frame(test_header(oversized.len(), 0), &oversized, &[])
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(sender.can_continue());
+
+        sender
+            .send_frame(test_header(2, 0), b"ok", &[])
+            .await
+            .unwrap();
+        assert_eq!(receiver.receive_frame().await.unwrap().payload(), b"ok");
+    }
+
+    #[tokio::test]
+    async fn negotiated_limits_reject_outbound_descriptors_before_io() {
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        let mut sender = established_stream_with_descriptor_limit(sender, 0);
+        let mut receiver = established_stream_with_descriptor_limit(receiver, 0);
+        let file = File::open("/dev/null").unwrap();
+
+        let error = sender
+            .send_frame(test_header(0, 1), &[], &[file.as_fd()])
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(sender.can_continue());
+
+        sender
+            .send_frame(test_header(2, 0), b"ok", &[])
+            .await
+            .unwrap();
+        assert_eq!(receiver.receive_frame().await.unwrap().payload(), b"ok");
+    }
+
+    #[tokio::test]
+    async fn negotiated_limits_reject_inbound_header_before_payload() {
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        let mut receiver = established_stream_with_descriptor_limit(receiver, 0);
+        let oversized_payload = TEST_CONTROL_FRAME_BYTES as usize - CONTROL_FRAME_HEADER_BYTES + 1;
+        sendmsg_raw(
+            &sender,
+            &test_header(oversized_payload, 0).encode(),
+            &[],
+            &[],
+        )
+        .unwrap();
+
+        let result = timeout(Duration::from_millis(20), receiver.receive_frame()).await;
+        let error = result.expect("receiver must reject the header without waiting for payload");
+        assert_eq!(error.unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert!(!receiver.can_continue());
+    }
+
+    #[tokio::test]
+    async fn negotiated_descriptor_limit_closes_received_rights() {
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        let mut receiver = established_stream_with_descriptor_limit(receiver, 0);
+        let (transferred, peer) = StdUnixStream::pair().unwrap();
+        let header = test_header(0, 1).encode();
+
+        sendmsg_raw(&sender, &header, &[], &[transferred.as_raw_fd()]).unwrap();
+        drop(transferred);
+        let error = receiver.receive_frame().await.unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!receiver.can_continue());
+        assert_peer_observes_close(peer);
+    }
+
+    #[tokio::test]
     async fn descriptor_count_mismatch_rejects_and_poison_closes_the_stream() {
         let (sender, receiver) = UnixStream::pair().unwrap();
-        let mut receiver = UnixControlStream::new(receiver);
+        let mut receiver = established_stream(receiver);
         let file = File::open("/dev/null").unwrap();
         let header = test_header(0, 0).encode();
 
@@ -701,11 +915,11 @@ mod tests {
 
     #[tokio::test]
     async fn descriptors_attached_after_the_first_frame_byte_are_rejected() {
-        let (mut sender, receiver) = UnixStream::pair().unwrap();
-        let mut receiver = UnixControlStream::new(receiver);
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        let mut receiver = established_stream(receiver);
         let file = File::open("/dev/null").unwrap();
         let header = test_header(1, 0).encode();
-        sender.write_all(&header).await.unwrap();
+        sendmsg_raw(&sender, &header, &[], &[]).unwrap();
         sendmsg_once(&sender, &[], b"x", &[file.as_fd()])
             .await
             .unwrap();
@@ -718,7 +932,7 @@ mod tests {
     #[tokio::test]
     async fn truncated_rights_are_rejected() {
         let (sender, receiver) = UnixStream::pair().unwrap();
-        let mut receiver = UnixControlStream::new(receiver);
+        let mut receiver = established_stream(receiver);
         let (transferred, peers): (Vec<_>, Vec<_>) =
             (0..5).map(|_| StdUnixStream::pair().unwrap()).unzip();
         let raw_fds = transferred
@@ -741,9 +955,9 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_a_partial_frame_receive_invalidates_the_stream() {
-        let (mut sender, receiver) = UnixStream::pair().unwrap();
+        let (sender, receiver) = UnixStream::pair().unwrap();
         let mut receiver = UnixControlStream::new(receiver);
-        sender.write_all(&[0x4c]).await.unwrap();
+        sendmsg_raw(&sender, &[0x4c], &[], &[]).unwrap();
 
         let result = timeout(Duration::from_millis(20), receiver.receive_frame()).await;
 

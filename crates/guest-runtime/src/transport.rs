@@ -3,8 +3,9 @@ use core::ffi::c_void;
 use core::mem::{size_of, zeroed};
 use core::ptr;
 use lasper_guest_protocol::{
-    ControlFrameError, ControlFrameHeader, ControlFrameHeaderError,
-    CONTROL_FRAME_DESCRIPTOR_ANCHOR_BYTES, CONTROL_FRAME_HEADER_BYTES, MAX_CONTROL_DESCRIPTORS,
+    ControlFrameError, ControlFrameHeader, ControlFrameHeaderError, ControlSessionError,
+    ControlSessionState, EnforcedControlLimits, CONTROL_FRAME_DESCRIPTOR_ANCHOR_BYTES,
+    CONTROL_FRAME_HEADER_BYTES, MAX_CONTROL_DESCRIPTORS,
 };
 
 const MAX_RECEIVED_DESCRIPTORS: usize = MAX_CONTROL_DESCRIPTORS as usize + 1;
@@ -49,6 +50,7 @@ struct AncillaryBuffer([usize; 4]);
 pub enum TransportError {
     InvalidFrame(ControlFrameError),
     InvalidHeader(ControlFrameHeaderError),
+    Session(ControlSessionError),
     PayloadBufferTooSmall { required: usize, available: usize },
     DescriptorCountMismatch { declared: u16, actual: usize },
     UnexpectedDescriptors,
@@ -67,6 +69,7 @@ pub enum TransportError {
 pub struct GuestControlStream {
     fd: i32,
     poisoned: bool,
+    session: ControlSessionState,
 }
 
 impl GuestControlStream {
@@ -80,7 +83,19 @@ impl GuestControlStream {
         Self {
             fd,
             poisoned: false,
+            session: ControlSessionState::guest(),
         }
+    }
+
+    /// Starts enforcing the limits negotiated from this connection's Hello pair.
+    ///
+    /// Pass the result of negotiating the `HelloRequest` and `HelloResponse`
+    /// exchanged on this stream. The transport verifies the handshake phase,
+    /// but cannot associate this value with that specific exchange.
+    pub fn complete_hello(&mut self, limits: EnforcedControlLimits) -> Result<(), TransportError> {
+        self.session
+            .complete_hello(limits)
+            .map_err(TransportError::Session)
     }
 
     /// Returns true while the stream is still aligned to a frame boundary.
@@ -100,12 +115,22 @@ impl GuestControlStream {
         header
             .validate_shape(payload.len(), descriptors.len())
             .map_err(TransportError::InvalidFrame)?;
+        let next_session = self
+            .session
+            .next_outbound(header)
+            .map_err(TransportError::Session)?;
 
         let result = send_frame(self.fd, header, payload, descriptors);
-        if result.is_err() {
-            self.poison();
+        match result {
+            Ok(()) => {
+                self.session = next_session;
+                Ok(())
+            }
+            Err(error) => {
+                self.poison();
+                Err(error)
+            }
         }
-        result
     }
 
     /// Receives one frame into caller-provided payload storage.
@@ -117,11 +142,16 @@ impl GuestControlStream {
         payload: &'a mut [u8],
     ) -> Result<GuestReceivedFrame<'a>, TransportError> {
         self.ensure_usable()?;
-        let result = receive_frame(self.fd, payload);
-        if result.is_err() {
-            self.poison();
+        match receive_frame(self.fd, payload, self.session) {
+            Ok((frame, next_session)) => {
+                self.session = next_session;
+                Ok(frame)
+            }
+            Err(error) => {
+                self.poison();
+                Err(error)
+            }
         }
-        result
     }
 
     fn ensure_usable(&self) -> Result<(), TransportError> {
@@ -300,7 +330,8 @@ where
 fn receive_frame<'a>(
     fd: i32,
     payload: &'a mut [u8],
-) -> Result<GuestReceivedFrame<'a>, TransportError> {
+    session: ControlSessionState,
+) -> Result<(GuestReceivedFrame<'a>, ControlSessionState), TransportError> {
     let mut first = [0; CONTROL_FRAME_DESCRIPTOR_ANCHOR_BYTES];
     let (read, descriptors) = receive_chunk(fd, &mut first)?;
     if read == 0 {
@@ -315,6 +346,9 @@ fn receive_frame<'a>(
     )?;
     let header =
         ControlFrameHeader::decode(&encoded_header).map_err(TransportError::InvalidHeader)?;
+    let next_session = session
+        .next_inbound(header)
+        .map_err(TransportError::Session)?;
     let required = header.payload_bytes() as usize;
     if payload.len() < required {
         return Err(TransportError::PayloadBufferTooSmall {
@@ -325,11 +359,14 @@ fn receive_frame<'a>(
     let descriptors = descriptors.finish(header.descriptor_count())?;
     receive_exact_without_descriptors(fd, &mut payload[..required])?;
 
-    Ok(GuestReceivedFrame {
-        header,
-        payload: &payload[..required],
-        descriptors,
-    })
+    Ok((
+        GuestReceivedFrame {
+            header,
+            payload: &payload[..required],
+            descriptors,
+        },
+        next_session,
+    ))
 }
 
 fn receive_exact_without_descriptors(fd: i32, mut bytes: &mut [u8]) -> Result<(), TransportError> {
@@ -700,9 +737,116 @@ mod tests {
     extern crate std;
 
     use super::*;
-    use std::io::Read;
-    use std::os::fd::IntoRawFd;
+    use lasper_guest_protocol::{ControlLimitError, ControlLimits};
+    use std::io::{Read, Write};
+    use std::os::fd::{AsRawFd, IntoRawFd};
     use std::os::unix::net::UnixStream;
+
+    const TEST_CONTROL_FRAME_BYTES: u32 = CONTROL_FRAME_HEADER_BYTES as u32 + 8;
+
+    fn negotiated_limits(max_descriptors: u16) -> EnforcedControlLimits {
+        let limits = ControlLimits::new(TEST_CONTROL_FRAME_BYTES, max_descriptors).unwrap();
+        lasper_guest_protocol::HelloRequest::new(lasper_guest_protocol::FeatureSet::EMPTY, limits)
+            .unwrap()
+            .negotiate(
+                lasper_guest_protocol::PROTOCOL_MAJOR,
+                lasper_guest_protocol::HelloResponse::new(
+                    lasper_guest_protocol::FeatureSet::EMPTY,
+                    lasper_guest_protocol::BrokerId::new([1; 16]),
+                    limits,
+                )
+                .unwrap(),
+            )
+            .unwrap()
+    }
+
+    fn guest_with_limits(stream: UnixStream, max_descriptors: u16) -> GuestControlStream {
+        let mut guest = unsafe { GuestControlStream::from_raw_fd(stream.into_raw_fd()) };
+        let request =
+            ControlFrameHeader::new(lasper_guest_protocol::MessageKind::HelloRequest, 1, 0, 0)
+                .unwrap();
+        let response =
+            ControlFrameHeader::new(lasper_guest_protocol::MessageKind::HelloResponse, 1, 0, 0)
+                .unwrap();
+        guest.session = guest
+            .session
+            .next_inbound(request)
+            .unwrap()
+            .next_outbound(response)
+            .unwrap();
+        guest
+            .complete_hello(negotiated_limits(max_descriptors))
+            .unwrap();
+        guest
+    }
+
+    #[test]
+    fn guest_transport_requires_a_request_before_sending_hello_response() {
+        let (guest, _peer) = UnixStream::pair().unwrap();
+        let mut guest = unsafe { GuestControlStream::from_raw_fd(guest.into_raw_fd()) };
+        let response =
+            ControlFrameHeader::new(lasper_guest_protocol::MessageKind::HelloResponse, 1, 0, 0)
+                .unwrap();
+
+        assert!(matches!(
+            guest.send_frame(response, &[], &[]),
+            Err(TransportError::Session(
+                ControlSessionError::ExpectedInbound(
+                    lasper_guest_protocol::MessageKind::HelloRequest
+                )
+            ))
+        ));
+        assert!(guest.can_continue());
+    }
+
+    #[test]
+    fn guest_transport_rejects_receiving_hello_response() {
+        let (guest, mut peer) = UnixStream::pair().unwrap();
+        let mut guest = unsafe { GuestControlStream::from_raw_fd(guest.into_raw_fd()) };
+        let response =
+            ControlFrameHeader::new(lasper_guest_protocol::MessageKind::HelloResponse, 1, 0, 0)
+                .unwrap();
+        let mut payload = [];
+
+        peer.write_all(&response.encode()).unwrap();
+
+        assert!(matches!(
+            guest.receive_frame(&mut payload),
+            Err(TransportError::Session(
+                ControlSessionError::UnexpectedMessage {
+                    expected: lasper_guest_protocol::MessageKind::HelloRequest,
+                    actual: lasper_guest_protocol::MessageKind::HelloResponse,
+                }
+            ))
+        ));
+        assert!(!guest.can_continue());
+    }
+
+    #[test]
+    fn guest_transport_rejects_a_second_request_before_hello_completes() {
+        let (guest, mut peer) = UnixStream::pair().unwrap();
+        let mut guest = unsafe { GuestControlStream::from_raw_fd(guest.into_raw_fd()) };
+        let request =
+            ControlFrameHeader::new(lasper_guest_protocol::MessageKind::HelloRequest, 1, 0, 0)
+                .unwrap();
+        let mut payload = [];
+        peer.write_all(&request.encode()).unwrap();
+        assert_eq!(
+            guest.receive_frame(&mut payload).unwrap().header().kind(),
+            lasper_guest_protocol::MessageKind::HelloRequest
+        );
+
+        peer.write_all(&request.encode()).unwrap();
+        assert!(matches!(
+            guest.receive_frame(&mut payload),
+            Err(TransportError::Session(
+                ControlSessionError::ExpectedOutbound(
+                    lasper_guest_protocol::MessageKind::HelloResponse
+                )
+            ))
+        ));
+        assert!(!guest.can_continue());
+    }
 
     fn rights_message(control: &mut AncillaryBuffer, descriptors: &[i32]) -> MessageHeader {
         // The test fills the only control fields read by the parser below.
@@ -802,5 +946,135 @@ mod tests {
         assert_eq!(calls.first().unwrap(), &descriptors);
         assert!(calls.iter().skip(1).all(std::vec::Vec::is_empty));
         assert!(calls.len() > 2);
+    }
+
+    #[test]
+    fn negotiated_limits_reject_outbound_frames_without_poisoning() {
+        let (guest, mut peer) = UnixStream::pair().unwrap();
+        let mut guest = guest_with_limits(guest, 0);
+        let payload_bytes = TEST_CONTROL_FRAME_BYTES as usize - CONTROL_FRAME_HEADER_BYTES + 1;
+        let payload = std::vec![0; payload_bytes];
+        let header = ControlFrameHeader::new(
+            lasper_guest_protocol::MessageKind::PrepareRequest,
+            31,
+            payload_bytes as u32,
+            0,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            guest.send_frame(header, &payload, &[]),
+            Err(TransportError::Session(ControlSessionError::Limit(
+                ControlLimitError::FrameTooLarge { .. }
+            )))
+        ));
+        assert!(guest.can_continue());
+
+        let valid =
+            ControlFrameHeader::new(lasper_guest_protocol::MessageKind::PrepareRequest, 32, 2, 0)
+                .unwrap();
+        guest.send_frame(valid, b"ok", &[]).unwrap();
+        let mut bytes = [0; CONTROL_FRAME_HEADER_BYTES + 2];
+        peer.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes[CONTROL_FRAME_HEADER_BYTES..], b"ok");
+    }
+
+    #[test]
+    fn negotiated_limits_reject_outbound_descriptors_without_poisoning() {
+        let (guest, mut peer) = UnixStream::pair().unwrap();
+        let mut guest = guest_with_limits(guest, 0);
+        let header =
+            ControlFrameHeader::new(lasper_guest_protocol::MessageKind::PrepareReady, 31, 0, 1)
+                .unwrap();
+
+        assert!(matches!(
+            guest.send_frame(header, &[], &[peer.as_raw_fd()]),
+            Err(TransportError::Session(ControlSessionError::Limit(
+                ControlLimitError::TooManyDescriptors { .. }
+            )))
+        ));
+        assert!(guest.can_continue());
+
+        let valid =
+            ControlFrameHeader::new(lasper_guest_protocol::MessageKind::PrepareRequest, 32, 2, 0)
+                .unwrap();
+        guest.send_frame(valid, b"ok", &[]).unwrap();
+        let mut bytes = [0; CONTROL_FRAME_HEADER_BYTES + 2];
+        peer.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes[CONTROL_FRAME_HEADER_BYTES..], b"ok");
+    }
+
+    #[test]
+    fn negotiated_limits_reject_inbound_header_before_payload() {
+        let (guest, mut peer) = UnixStream::pair().unwrap();
+        let mut guest = guest_with_limits(guest, 0);
+        let payload_bytes = TEST_CONTROL_FRAME_BYTES as usize - CONTROL_FRAME_HEADER_BYTES + 1;
+        let header = ControlFrameHeader::new(
+            lasper_guest_protocol::MessageKind::PrepareRequest,
+            31,
+            payload_bytes as u32,
+            0,
+        )
+        .unwrap();
+        peer.write_all(&header.encode()).unwrap();
+        let mut payload = [0; 512];
+
+        assert!(matches!(
+            guest.receive_frame(&mut payload),
+            Err(TransportError::Session(ControlSessionError::Limit(
+                ControlLimitError::FrameTooLarge { .. }
+            )))
+        ));
+        assert!(!guest.can_continue());
+    }
+
+    #[test]
+    fn negotiated_descriptor_limit_closes_received_rights() {
+        let (guest, sender) = UnixStream::pair().unwrap();
+        let mut guest = guest_with_limits(guest, 0);
+        let (transferred, peer) = UnixStream::pair().unwrap();
+        let header =
+            ControlFrameHeader::new(lasper_guest_protocol::MessageKind::PrepareReady, 31, 0, 1)
+                .unwrap();
+        send_message(
+            sender.as_raw_fd(),
+            &header.encode(),
+            &[],
+            &[transferred.as_raw_fd()],
+        )
+        .unwrap();
+        drop(transferred);
+        let mut payload = [];
+
+        assert!(matches!(
+            guest.receive_frame(&mut payload),
+            Err(TransportError::Session(ControlSessionError::Limit(
+                ControlLimitError::TooManyDescriptors { .. }
+            )))
+        ));
+        assert_peer_observes_close(peer);
+    }
+
+    #[test]
+    fn hello_phase_rejects_oversized_request_before_reading_payload() {
+        let (guest, mut peer) = UnixStream::pair().unwrap();
+        let mut guest = unsafe { GuestControlStream::from_raw_fd(guest.into_raw_fd()) };
+        let header = ControlFrameHeader::new(
+            lasper_guest_protocol::MessageKind::HelloRequest,
+            31,
+            lasper_guest_protocol::HELLO_PAYLOAD_BUFFER_BYTES as u32 + 1,
+            0,
+        )
+        .unwrap();
+        peer.write_all(&header.encode()).unwrap();
+        let mut payload = [0; lasper_guest_protocol::HELLO_PAYLOAD_BUFFER_BYTES + 1];
+
+        assert!(matches!(
+            guest.receive_frame(&mut payload),
+            Err(TransportError::Session(ControlSessionError::Limit(
+                ControlLimitError::FrameTooLarge { .. }
+            )))
+        ));
+        assert!(!guest.can_continue());
     }
 }

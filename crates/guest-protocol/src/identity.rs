@@ -1,4 +1,5 @@
 use crate::{MAX_CONTROL_FRAME_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR};
+use serde::{Deserialize, Serialize};
 
 const IDENTITY_MAGIC: [u8; 8] = *b"LSPRGRT1";
 const IDENTITY_FORMAT: u16 = 1;
@@ -21,7 +22,8 @@ impl Architecture {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
 pub struct FeatureSet(u64);
 
 impl FeatureSet {
