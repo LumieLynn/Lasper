@@ -1173,6 +1173,7 @@ dependencies = [
 name = "lasper-guest-protocol"
 version = "0.1.0"
 dependencies = [
+ "heapless",
  "serde",
  "serde-json-core",
 ]

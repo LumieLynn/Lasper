@@ -494,10 +494,11 @@ pub enum PayloadCodecError {
     OutputTooSmall,
     InvalidJson,
     InvalidLimits,
+    InvalidRequest,
 }
 
 /// Serializes a control payload into caller-owned storage without allocating.
-fn encode_json_payload<T: Serialize + ?Sized>(
+pub(crate) fn encode_json_payload<T: Serialize + ?Sized>(
     value: &T,
     output: &mut [u8],
 ) -> Result<usize, PayloadCodecError> {
@@ -513,11 +514,26 @@ fn encode_json_payload<T: Serialize + ?Sized>(
 }
 
 /// Deserializes one bounded JSON payload.
-fn decode_json_payload<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, PayloadCodecError> {
+pub(crate) fn decode_json_payload<T: DeserializeOwned>(
+    bytes: &[u8],
+) -> Result<T, PayloadCodecError> {
     if bytes.len() > crate::MAX_CONTROL_PAYLOAD_BYTES as usize {
         return Err(PayloadCodecError::PayloadTooLarge);
     }
     serde_json_core::from_slice(bytes)
+        .map(|(value, _consumed)| value)
+        .map_err(|_| PayloadCodecError::InvalidJson)
+}
+
+/// Deserializes a bounded JSON payload, using caller storage to unescape strings.
+pub(crate) fn decode_json_payload_escaped<'de, T: Deserialize<'de>>(
+    bytes: &'de [u8],
+    unescape_buffer: &mut [u8],
+) -> Result<T, PayloadCodecError> {
+    if bytes.len() > crate::MAX_CONTROL_PAYLOAD_BYTES as usize {
+        return Err(PayloadCodecError::PayloadTooLarge);
+    }
+    serde_json_core::from_slice_escaped(bytes, unescape_buffer)
         .map(|(value, _consumed)| value)
         .map_err(|_| PayloadCodecError::InvalidJson)
 }

@@ -4,6 +4,7 @@
 mod control;
 mod identity;
 mod messages;
+mod prepare;
 
 pub use control::{
     ControlFrame, ControlFrameError, ControlFrameHeader, ControlFrameHeaderError, MessageKind,
@@ -19,6 +20,12 @@ pub use messages::{
     EnforcedControlLimits, HelloNegotiationError, HelloRequest, HelloResponse, PayloadCodecError,
     HELLO_CONTROL_FRAME_BYTES, HELLO_CONTROL_LIMITS, HELLO_PAYLOAD_BUFFER_BYTES,
     MIN_NEGOTIATED_CONTROL_FRAME_BYTES,
+};
+pub use prepare::{
+    CommandArgv, ExecutionKind, GuestProcess, PrepareRequest, ProjectionRequests,
+    TerminalEnvironment, TerminalSize, WaylandProjectionRequest, X11ProjectionRequest,
+    MAX_COMMAND_ARGUMENTS, MAX_COMMAND_ARGUMENT_BYTES, MAX_COMMAND_TOTAL_BYTES,
+    MAX_GUEST_USER_NAME_BYTES, MAX_PROJECTION_PATH_BYTES,
 };
 
 pub const PROTOCOL_MAJOR: u16 = 1;
