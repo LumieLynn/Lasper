@@ -6,7 +6,10 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json_core::str::{EscapedStr, EscapedStringFragment};
 
 use crate::messages::{decode_json_payload_escaped, encode_json_payload};
-use crate::PayloadCodecError;
+use crate::{
+    ControlFrame, ControlFrameError, ControlFrameHeader, ControlFrameHeaderError, MessageKind,
+    PayloadCodecError, CONTROL_FRAME_HEADER_BYTES,
+};
 
 pub const MAX_GUEST_USER_NAME_BYTES: usize = 32;
 pub const MAX_PROJECTION_PATH_BYTES: usize = 4096;
@@ -18,6 +21,9 @@ pub const MAX_COMMAND_TOTAL_BYTES: usize = 64 * 1024;
 const MAX_ARGV_ITEMS: usize = MAX_COMMAND_ARGUMENTS + 1;
 const MAX_TERM_BYTES: usize = 256;
 const MAX_TERMINAL_ENVIRONMENT_VALUE_BYTES: usize = 4096;
+const PREPARATION_ID_BYTES: usize = 16;
+
+pub const MAX_PREPARED_LEASE_MS: u32 = 45_000;
 
 /// How the prepared process will receive input and output.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -608,6 +614,8 @@ impl<'a> WirePrepareRequest<'a> {
 }
 
 impl<'a> PrepareRequest<'a> {
+    pub const KIND: MessageKind = MessageKind::PrepareRequest;
+
     pub fn new(
         user: &str,
         execution: ExecutionKind,
@@ -693,6 +701,344 @@ impl<'a> PrepareRequest<'a> {
         }
         Ok(())
     }
+}
+
+/// Identifies one prepared guest process within a broker generation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct PreparationId([u8; PREPARATION_ID_BYTES]);
+
+impl PreparationId {
+    pub const fn new(bytes: [u8; PREPARATION_ID_BYTES]) -> Self {
+        Self(bytes)
+    }
+
+    pub const fn as_bytes(&self) -> &[u8; PREPARATION_ID_BYTES] {
+        &self.0
+    }
+}
+
+/// Guest acknowledgement that resources for one request have been prepared.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+pub struct PrepareReady {
+    preparation_id: PreparationId,
+    broker_id: crate::BrokerId,
+    remaining_lease_ms: u32,
+}
+
+impl PrepareReady {
+    pub const KIND: crate::MessageKind = crate::MessageKind::PrepareReady;
+
+    pub fn new(
+        preparation_id: PreparationId,
+        broker_id: crate::BrokerId,
+        remaining_lease_ms: u32,
+    ) -> Result<Self, PayloadCodecError> {
+        let response = Self {
+            preparation_id,
+            broker_id,
+            remaining_lease_ms,
+        };
+        response.validate()?;
+        Ok(response)
+    }
+
+    pub const fn preparation_id(self) -> PreparationId {
+        self.preparation_id
+    }
+
+    pub const fn broker_id(self) -> crate::BrokerId {
+        self.broker_id
+    }
+
+    pub const fn remaining_lease_ms(self) -> u32 {
+        self.remaining_lease_ms
+    }
+
+    /// Descriptor count attached to PrepareReady for this request type.
+    pub const fn descriptor_count_for(execution: ExecutionKind) -> u16 {
+        match execution {
+            ExecutionKind::Interactive => 2,
+            ExecutionKind::Bounded => 1,
+        }
+    }
+
+    /// Descriptor roles are ordered as PTY master then identity channel for
+    /// interactive requests, and identity channel alone for bounded requests.
+    pub const fn descriptor_role_for(
+        execution: ExecutionKind,
+        index: u16,
+    ) -> Option<PrepareReadyDescriptorRole> {
+        match (execution, index) {
+            (ExecutionKind::Interactive, 0) => Some(PrepareReadyDescriptorRole::PtyMaster),
+            (ExecutionKind::Interactive, 1) | (ExecutionKind::Bounded, 0) => {
+                Some(PrepareReadyDescriptorRole::IdentityChannel)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn encode_payload(self, output: &mut [u8]) -> Result<usize, PayloadCodecError> {
+        self.validate()?;
+        encode_json_payload(&self, output)
+    }
+
+    pub fn decode_payload(bytes: &[u8]) -> Result<Self, PayloadCodecError> {
+        let wire: WirePrepareReady = crate::messages::decode_json_payload(bytes)?;
+        Self::new(
+            PreparationId::new(wire.preparation_id),
+            wire.broker_id,
+            wire.remaining_lease_ms,
+        )
+    }
+
+    fn validate(self) -> Result<(), PayloadCodecError> {
+        if self.remaining_lease_ms == 0 || self.remaining_lease_ms > MAX_PREPARED_LEASE_MS {
+            return Err(PayloadCodecError::InvalidRequest);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WirePrepareReady {
+    preparation_id: [u8; PREPARATION_ID_BYTES],
+    broker_id: crate::BrokerId,
+    remaining_lease_ms: u32,
+}
+
+/// Meaning of one descriptor attached to a `PrepareReady` frame.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrepareReadyDescriptorRole {
+    PtyMaster,
+    IdentityChannel,
+}
+
+/// A complete Prepare request frame: its correlation ID, payload, and zero-FD contract.
+/// `broker_id` comes from the completed Hello exchange and binds this request to that generation.
+#[derive(Clone, Debug)]
+pub struct PrepareRequestFrame<'a> {
+    request_id: u64,
+    broker_id: crate::BrokerId,
+    request: PrepareRequest<'a>,
+}
+
+impl<'a> PrepareRequestFrame<'a> {
+    pub const fn new(
+        request_id: u64,
+        broker_id: crate::BrokerId,
+        request: PrepareRequest<'a>,
+    ) -> Self {
+        Self {
+            request_id,
+            broker_id,
+            request,
+        }
+    }
+
+    pub const fn request_id(&self) -> u64 {
+        self.request_id
+    }
+
+    pub const fn broker_id(&self) -> crate::BrokerId {
+        self.broker_id
+    }
+
+    pub const fn request(&self) -> &PrepareRequest<'a> {
+        &self.request
+    }
+
+    /// Encodes the header and JSON payload. The caller sends no descriptors.
+    pub fn encode_into(&self, output: &mut [u8]) -> Result<usize, PrepareFrameError> {
+        encode_prepare_frame(
+            PrepareRequest::KIND,
+            self.request_id,
+            0,
+            &self.request,
+            output,
+        )
+    }
+
+    /// Decodes one request after the transport has associated its received FDs.
+    pub fn decode(
+        bytes: &'a [u8],
+        received_descriptors: usize,
+        broker_id: crate::BrokerId,
+    ) -> Result<Self, PrepareFrameError> {
+        let (header, payload) =
+            decode_prepare_frame(bytes, received_descriptors, PrepareRequest::KIND, 0)?;
+        let request =
+            PrepareRequest::decode_payload(payload).map_err(PrepareFrameError::Payload)?;
+        Ok(Self::new(header.request_id(), broker_id, request))
+    }
+
+    pub fn ready_frame(
+        &self,
+        response: PrepareReady,
+    ) -> Result<PrepareReadyFrame, PrepareFrameError> {
+        if response.broker_id() != self.broker_id {
+            return Err(PrepareFrameError::MismatchedBrokerId {
+                expected: self.broker_id,
+                actual: response.broker_id(),
+            });
+        }
+        Ok(PrepareReadyFrame {
+            request_id: self.request_id,
+            execution: self.request.execution(),
+            response,
+        })
+    }
+
+    /// Decodes the response to this request, enforcing correlation and its FD contract.
+    pub fn decode_ready(
+        &self,
+        bytes: &[u8],
+        received_descriptors: usize,
+    ) -> Result<PrepareReadyFrame, PrepareFrameError> {
+        PrepareReadyFrame::decode_for(self, bytes, received_descriptors)
+    }
+}
+
+/// A complete `PrepareReady` response paired with the request that defines its FD contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PrepareReadyFrame {
+    request_id: u64,
+    execution: ExecutionKind,
+    response: PrepareReady,
+}
+
+impl PrepareReadyFrame {
+    pub const fn request_id(self) -> u64 {
+        self.request_id
+    }
+
+    pub const fn response(self) -> PrepareReady {
+        self.response
+    }
+
+    pub const fn descriptor_count(self) -> u16 {
+        PrepareReady::descriptor_count_for(self.execution)
+    }
+
+    pub const fn descriptor_role(self, index: u16) -> Option<PrepareReadyDescriptorRole> {
+        PrepareReady::descriptor_role_for(self.execution, index)
+    }
+
+    /// Encodes the response metadata. The caller attaches FDs in `descriptor_role` order.
+    pub fn encode_into(self, output: &mut [u8]) -> Result<usize, PrepareFrameError> {
+        encode_prepare_frame(
+            PrepareReady::KIND,
+            self.request_id,
+            self.descriptor_count(),
+            &self.response,
+            output,
+        )
+    }
+
+    fn decode_for(
+        request: &PrepareRequestFrame<'_>,
+        bytes: &[u8],
+        received_descriptors: usize,
+    ) -> Result<Self, PrepareFrameError> {
+        let expected_descriptors = PrepareReady::descriptor_count_for(request.request.execution());
+        let (header, payload) = decode_prepare_frame(
+            bytes,
+            received_descriptors,
+            PrepareReady::KIND,
+            expected_descriptors,
+        )?;
+        if header.request_id() != request.request_id {
+            return Err(PrepareFrameError::MismatchedRequestId {
+                expected: request.request_id,
+                actual: header.request_id(),
+            });
+        }
+        let response = PrepareReady::decode_payload(payload).map_err(PrepareFrameError::Payload)?;
+        if response.broker_id() != request.broker_id {
+            return Err(PrepareFrameError::MismatchedBrokerId {
+                expected: request.broker_id,
+                actual: response.broker_id(),
+            });
+        }
+        Ok(PrepareReadyFrame {
+            request_id: request.request_id,
+            execution: request.request.execution(),
+            response,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrepareFrameError {
+    Frame(ControlFrameError),
+    Header(ControlFrameHeaderError),
+    Payload(PayloadCodecError),
+    UnexpectedMessageKind {
+        expected: MessageKind,
+        actual: MessageKind,
+    },
+    UnexpectedDescriptorCount {
+        expected: u16,
+        actual: u16,
+    },
+    MismatchedRequestId {
+        expected: u64,
+        actual: u64,
+    },
+    MismatchedBrokerId {
+        expected: crate::BrokerId,
+        actual: crate::BrokerId,
+    },
+}
+
+fn encode_prepare_frame<T: Serialize + ?Sized>(
+    kind: MessageKind,
+    request_id: u64,
+    descriptor_count: u16,
+    payload: &T,
+    output: &mut [u8],
+) -> Result<usize, PrepareFrameError> {
+    if output.len() < CONTROL_FRAME_HEADER_BYTES {
+        return Err(PrepareFrameError::Frame(
+            ControlFrameError::OutputTooSmall {
+                required: CONTROL_FRAME_HEADER_BYTES,
+                available: output.len(),
+            },
+        ));
+    }
+    let payload_bytes = encode_json_payload(payload, &mut output[CONTROL_FRAME_HEADER_BYTES..])
+        .map_err(PrepareFrameError::Payload)?;
+    let header = ControlFrameHeader::new(kind, request_id, payload_bytes as u32, descriptor_count)
+        .map_err(PrepareFrameError::Header)?;
+    output[..CONTROL_FRAME_HEADER_BYTES].copy_from_slice(&header.encode());
+    Ok(CONTROL_FRAME_HEADER_BYTES + payload_bytes)
+}
+
+fn decode_prepare_frame(
+    bytes: &[u8],
+    received_descriptors: usize,
+    expected_kind: MessageKind,
+    expected_descriptors: u16,
+) -> Result<(ControlFrameHeader, &[u8]), PrepareFrameError> {
+    let frame = ControlFrame::decode(bytes).map_err(PrepareFrameError::Frame)?;
+    let header = frame.header();
+    if header.kind() != expected_kind {
+        return Err(PrepareFrameError::UnexpectedMessageKind {
+            expected: expected_kind,
+            actual: header.kind(),
+        });
+    }
+    if header.descriptor_count() != expected_descriptors {
+        return Err(PrepareFrameError::UnexpectedDescriptorCount {
+            expected: expected_descriptors,
+            actual: header.descriptor_count(),
+        });
+    }
+    header
+        .validate_shape(frame.payload().len(), received_descriptors)
+        .map_err(PrepareFrameError::Frame)?;
+    Ok((header, frame.payload()))
 }
 
 fn bounded_string<const N: usize>(value: &str) -> Result<String<N>, PayloadCodecError> {
@@ -802,6 +1148,318 @@ mod tests {
         let decoded = PrepareRequest::decode_payload(&payload[..length]).unwrap();
         assert_eq!(decoded.user(), "root");
         assert!(matches!(decoded.process(), GuestProcess::Command(_)));
+    }
+
+    #[test]
+    fn interactive_prepare_frame_round_trips_request_response_and_descriptor_order() {
+        let broker_id = crate::BrokerId::new([0xa5; 16]);
+        let request = PrepareRequestFrame::new(41, broker_id, interactive_request());
+        let mut request_bytes = [0; 4096];
+
+        let request_length = request.encode_into(&mut request_bytes).unwrap();
+        let decoded_request =
+            PrepareRequestFrame::decode(&request_bytes[..request_length], 0, broker_id).unwrap();
+        let request_header = ControlFrame::decode(&request_bytes[..request_length])
+            .unwrap()
+            .header();
+        assert_eq!(request_header.kind(), MessageKind::PrepareRequest);
+        assert_eq!(request_header.request_id(), 41);
+        assert_eq!(request_header.descriptor_count(), 0);
+        assert_eq!(decoded_request.request().user(), "alice");
+
+        let ready = PrepareReady::new(
+            PreparationId::new([0x5a; PREPARATION_ID_BYTES]),
+            broker_id,
+            30_000,
+        )
+        .unwrap();
+        let ready_frame = decoded_request.ready_frame(ready).unwrap();
+        assert_eq!(ready_frame.descriptor_count(), 2);
+        assert_eq!(
+            ready_frame.descriptor_role(0),
+            Some(PrepareReadyDescriptorRole::PtyMaster)
+        );
+        assert_eq!(
+            ready_frame.descriptor_role(1),
+            Some(PrepareReadyDescriptorRole::IdentityChannel)
+        );
+        assert_eq!(ready_frame.descriptor_role(2), None);
+
+        let mut ready_bytes = [0; 256];
+        let ready_length = ready_frame.encode_into(&mut ready_bytes).unwrap();
+        let ready_header = ControlFrame::decode(&ready_bytes[..ready_length])
+            .unwrap()
+            .header();
+        assert_eq!(ready_header.kind(), MessageKind::PrepareReady);
+        assert_eq!(ready_header.request_id(), 41);
+        assert_eq!(ready_header.descriptor_count(), 2);
+
+        let decoded_ready = decoded_request
+            .decode_ready(&ready_bytes[..ready_length], 2)
+            .unwrap();
+        assert_eq!(decoded_ready.request_id(), 41);
+        assert_eq!(decoded_ready.response(), ready);
+        assert_eq!(decoded_ready.response().broker_id(), broker_id);
+    }
+
+    #[test]
+    fn bounded_prepare_frame_carries_only_the_identity_descriptor() {
+        let request = PrepareRequest::new(
+            "root",
+            ExecutionKind::Bounded,
+            GuestProcess::Command(CommandArgv::new(&["/sbin/poweroff"]).unwrap()),
+            None,
+            None,
+            ProjectionRequests::default(),
+        )
+        .unwrap();
+        let broker_id = crate::BrokerId::new([9; 16]);
+        let request = PrepareRequestFrame::new(92, broker_id, request);
+        let mut request_bytes = [0; 1024];
+        let request_length = request.encode_into(&mut request_bytes).unwrap();
+        let decoded_request =
+            PrepareRequestFrame::decode(&request_bytes[..request_length], 0, broker_id).unwrap();
+
+        let ready = PrepareReady::new(
+            PreparationId::new([7; PREPARATION_ID_BYTES]),
+            broker_id,
+            MAX_PREPARED_LEASE_MS,
+        )
+        .unwrap();
+        let ready_frame = decoded_request.ready_frame(ready).unwrap();
+        assert_eq!(ready_frame.descriptor_count(), 1);
+        assert_eq!(
+            ready_frame.descriptor_role(0),
+            Some(PrepareReadyDescriptorRole::IdentityChannel)
+        );
+        assert_eq!(ready_frame.descriptor_role(1), None);
+
+        let mut ready_bytes = [0; 256];
+        let ready_length = ready_frame.encode_into(&mut ready_bytes).unwrap();
+        let decoded_ready = decoded_request
+            .decode_ready(&ready_bytes[..ready_length], 1)
+            .unwrap();
+        assert_eq!(decoded_ready.response(), ready);
+    }
+
+    #[test]
+    fn prepare_ready_frame_rejects_wrong_request_id_and_descriptor_contract() {
+        let broker_id = crate::BrokerId::new([4; 16]);
+        let request = PrepareRequestFrame::new(101, broker_id, interactive_request());
+        let response = PrepareReady::new(
+            PreparationId::new([3; PREPARATION_ID_BYTES]),
+            broker_id,
+            1_000,
+        )
+        .unwrap();
+        let mut bytes = [0; 256];
+
+        let other_request = PrepareRequestFrame::new(102, broker_id, interactive_request());
+        let other_length = other_request
+            .ready_frame(response)
+            .unwrap()
+            .encode_into(&mut bytes)
+            .unwrap();
+        assert_eq!(
+            request.decode_ready(&bytes[..other_length], 2),
+            Err(PrepareFrameError::MismatchedRequestId {
+                expected: 101,
+                actual: 102,
+            })
+        );
+
+        let valid_length = request
+            .ready_frame(response)
+            .unwrap()
+            .encode_into(&mut bytes)
+            .unwrap();
+        assert_eq!(
+            request.decode_ready(&bytes[..valid_length], 1),
+            Err(PrepareFrameError::Frame(
+                ControlFrameError::DescriptorCountMismatch {
+                    declared: 2,
+                    actual: 1,
+                }
+            ))
+        );
+
+        let frame = ControlFrame::decode(&bytes[..valid_length]).unwrap();
+        let wrong_header = ControlFrameHeader::new(
+            MessageKind::PrepareReady,
+            request.request_id(),
+            frame.payload().len() as u32,
+            1,
+        )
+        .unwrap();
+        let mut wrong_contract = [0; 256];
+        let wrong_length = wrong_header
+            .encode_frame(frame.payload(), &mut wrong_contract)
+            .unwrap();
+        assert_eq!(
+            request.decode_ready(&wrong_contract[..wrong_length], 1),
+            Err(PrepareFrameError::UnexpectedDescriptorCount {
+                expected: 2,
+                actual: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn prepare_ready_frame_rejects_a_different_broker_generation() {
+        let expected_broker = crate::BrokerId::new([1; 16]);
+        let other_broker = crate::BrokerId::new([2; 16]);
+        let request = PrepareRequestFrame::new(27, expected_broker, interactive_request());
+        let response = PrepareReady::new(
+            PreparationId::new([3; PREPARATION_ID_BYTES]),
+            other_broker,
+            1_000,
+        )
+        .unwrap();
+
+        assert_eq!(
+            request.ready_frame(response),
+            Err(PrepareFrameError::MismatchedBrokerId {
+                expected: expected_broker,
+                actual: other_broker,
+            })
+        );
+
+        let mut bytes = [0; 256];
+        let length = encode_prepare_frame(
+            PrepareReady::KIND,
+            request.request_id(),
+            PrepareReady::descriptor_count_for(ExecutionKind::Interactive),
+            &response,
+            &mut bytes,
+        )
+        .unwrap();
+        assert_eq!(
+            request.decode_ready(&bytes[..length], 2),
+            Err(PrepareFrameError::MismatchedBrokerId {
+                expected: expected_broker,
+                actual: other_broker,
+            })
+        );
+    }
+
+    #[test]
+    fn prepare_request_frame_rejects_wrong_kind_and_any_descriptor() {
+        let broker_id = crate::BrokerId::new([8; 16]);
+        let request = PrepareRequestFrame::new(15, broker_id, interactive_request());
+        let mut bytes = [0; 4096];
+        let length = request.encode_into(&mut bytes).unwrap();
+        let frame = ControlFrame::decode(&bytes[..length]).unwrap();
+
+        let wrong_kind = ControlFrameHeader::new(
+            MessageKind::PrepareReady,
+            request.request_id(),
+            frame.payload().len() as u32,
+            0,
+        )
+        .unwrap();
+        let mut wrong_kind_bytes = [0; 4096];
+        let wrong_kind_length = wrong_kind
+            .encode_frame(frame.payload(), &mut wrong_kind_bytes)
+            .unwrap();
+        assert!(matches!(
+            PrepareRequestFrame::decode(&wrong_kind_bytes[..wrong_kind_length], 0, broker_id),
+            Err(PrepareFrameError::UnexpectedMessageKind {
+                expected: MessageKind::PrepareRequest,
+                actual: MessageKind::PrepareReady,
+            })
+        ));
+
+        let declared_descriptor = ControlFrameHeader::new(
+            MessageKind::PrepareRequest,
+            request.request_id(),
+            frame.payload().len() as u32,
+            1,
+        )
+        .unwrap();
+        let mut declared_descriptor_bytes = [0; 4096];
+        let declared_length = declared_descriptor
+            .encode_frame(frame.payload(), &mut declared_descriptor_bytes)
+            .unwrap();
+        assert!(matches!(
+            PrepareRequestFrame::decode(
+                &declared_descriptor_bytes[..declared_length],
+                1,
+                broker_id
+            ),
+            Err(PrepareFrameError::UnexpectedDescriptorCount {
+                expected: 0,
+                actual: 1,
+            })
+        ));
+
+        assert!(matches!(
+            PrepareRequestFrame::decode(&bytes[..length], 1, broker_id),
+            Err(PrepareFrameError::Frame(
+                ControlFrameError::DescriptorCountMismatch {
+                    declared: 0,
+                    actual: 1,
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn prepare_ready_round_trips_ids_lease_and_fd_contract() {
+        let ready = PrepareReady::new(
+            PreparationId::new([0x5a; PREPARATION_ID_BYTES]),
+            crate::BrokerId::new([0xa5; 16]),
+            MAX_PREPARED_LEASE_MS,
+        )
+        .unwrap();
+        let mut payload = [0; 256];
+
+        let length = ready.encode_payload(&mut payload).unwrap();
+        let decoded = PrepareReady::decode_payload(&payload[..length]).unwrap();
+
+        assert_eq!(decoded, ready);
+        assert_eq!(decoded.preparation_id().as_bytes(), &[0x5a; 16]);
+        assert_eq!(decoded.broker_id().as_bytes(), &[0xa5; 16]);
+        assert_eq!(decoded.remaining_lease_ms(), MAX_PREPARED_LEASE_MS);
+        assert_eq!(
+            PrepareReady::descriptor_count_for(ExecutionKind::Interactive),
+            2
+        );
+        assert_eq!(
+            PrepareReady::descriptor_count_for(ExecutionKind::Bounded),
+            1
+        );
+    }
+
+    #[test]
+    fn prepare_ready_rejects_zero_and_overlong_leases() {
+        assert!(matches!(
+            PrepareReady::new(
+                PreparationId::new([1; PREPARATION_ID_BYTES]),
+                crate::BrokerId::new([2; 16]),
+                0,
+            ),
+            Err(PayloadCodecError::InvalidRequest)
+        ));
+        assert!(matches!(
+            PrepareReady::new(
+                PreparationId::new([1; PREPARATION_ID_BYTES]),
+                crate::BrokerId::new([2; 16]),
+                MAX_PREPARED_LEASE_MS + 1,
+            ),
+            Err(PayloadCodecError::InvalidRequest)
+        ));
+
+        let zeros = std::iter::repeat_n("0", PREPARATION_ID_BYTES)
+            .collect::<std::vec::Vec<_>>()
+            .join(",");
+        let overlong_lease = std::format!(
+            r#"{{"preparation_id":[{zeros}],"broker_id":[{zeros}],"remaining_lease_ms":{}}}"#,
+            MAX_PREPARED_LEASE_MS + 1
+        );
+        assert!(matches!(
+            PrepareReady::decode_payload(overlong_lease.as_bytes()),
+            Err(PayloadCodecError::InvalidRequest)
+        ));
     }
 
     #[test]
