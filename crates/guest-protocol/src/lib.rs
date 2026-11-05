@@ -3,6 +3,7 @@
 
 mod control;
 mod identity;
+mod identity_channel;
 mod messages;
 mod prepare;
 
@@ -14,6 +15,11 @@ pub use control::{
 pub use identity::{
     Architecture, FeatureSet, IdentityDecodeError, RuntimeCompatibilityError, RuntimeIdentity,
     RuntimeRequirements, IDENTITY_FRAME_BYTES,
+};
+pub use identity_channel::{
+    GuestIdentityReply, IdentityChallenge, IdentityChannelError, ProjectionObservations,
+    SocketPathAccess, SocketPathIdentity, SocketPathObservation, X11PathObservations,
+    IDENTITY_CHALLENGE_BYTES, MAX_IDENTITY_MESSAGE_BYTES,
 };
 pub use messages::{
     BrokerId, ControlLimitError, ControlLimits, ControlSessionError, ControlSessionState,

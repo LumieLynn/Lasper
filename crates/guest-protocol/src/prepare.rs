@@ -704,7 +704,7 @@ impl<'a> PrepareRequest<'a> {
 }
 
 /// Identifies one prepared guest process within a broker generation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct PreparationId([u8; PREPARATION_ID_BYTES]);
 
@@ -923,6 +923,15 @@ impl PrepareReadyFrame {
 
     pub const fn descriptor_role(self, index: u16) -> Option<PrepareReadyDescriptorRole> {
         PrepareReady::descriptor_role_for(self.execution, index)
+    }
+
+    /// The host supplies a fresh random nonce on every check, including Recheck,
+    /// so an earlier reply from the same prepared worker cannot satisfy it.
+    pub const fn identity_challenge(
+        self,
+        nonce: [u8; crate::IDENTITY_CHALLENGE_BYTES],
+    ) -> crate::IdentityChallenge {
+        crate::IdentityChallenge::new(self.response.preparation_id(), nonce)
     }
 
     /// Encodes the response metadata. The caller attaches FDs in `descriptor_role` order.
@@ -1174,6 +1183,9 @@ mod tests {
         )
         .unwrap();
         let ready_frame = decoded_request.ready_frame(ready).unwrap();
+        let challenge = ready_frame.identity_challenge([0x7c; crate::IDENTITY_CHALLENGE_BYTES]);
+        assert_eq!(challenge.preparation_id(), ready.preparation_id());
+        assert_eq!(challenge.nonce(), &[0x7c; crate::IDENTITY_CHALLENGE_BYTES]);
         assert_eq!(ready_frame.descriptor_count(), 2);
         assert_eq!(
             ready_frame.descriptor_role(0),
