@@ -142,7 +142,7 @@ jobs:
       - name: Exercise guest transport on runner architecture
         run: |
           cargo test -p lasper-guest-runtime --lib --locked
-          cargo test -p lasper-guest-host-transport --test interop --locked
+          cargo test -p lasper-guest-host-transport --test interop --test identity --locked
 
       - name: Check guest runtime binary
         run: >-

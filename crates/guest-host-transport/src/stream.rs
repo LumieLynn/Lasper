@@ -8,6 +8,8 @@ use std::mem::{size_of, zeroed};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use tokio::net::UnixStream;
 
+use crate::SCM_PIDFD;
+
 const MAX_RECEIVED_DESCRIPTORS: usize = MAX_CONTROL_DESCRIPTORS as usize + 1;
 
 #[repr(C, align(16))]
@@ -398,19 +400,26 @@ fn collect_descriptors(
             return Err(invalid_data("ancillary record exceeds receive buffer"));
         }
 
-        if level == libc::SOL_SOCKET && kind == libc::SCM_RIGHTS {
-            if rights_seen || data_length == 0 || data_length % size_of::<RawFd>() != 0 {
+        if level == libc::SOL_SOCKET && matches!(kind, libc::SCM_RIGHTS | SCM_PIDFD) {
+            if kind == SCM_PIDFD
+                || rights_seen
+                || data_length == 0
+                || data_length % size_of::<RawFd>() != 0
+            {
                 unexpected_control = true;
             }
             rights_seen = true;
-            // The complete `SCM_RIGHTS` payload lies inside the checked record.
+            // Both FD-bearing record types must be owned before rejecting one.
             let data = unsafe { libc::CMSG_DATA(header).cast::<RawFd>() };
             for index in 0..data_length / size_of::<RawFd>() {
                 // This slot lies inside the checked descriptor payload.
                 let raw_fd = unsafe { data.add(index).read_unaligned() };
-                // `SCM_RIGHTS` installs a new descriptor; `OwnedFd` assumes its
-                // ownership here so every later error closes it.
-                descriptors.push(unsafe { OwnedFd::from_raw_fd(raw_fd) });
+                if raw_fd >= 0 {
+                    // SAFETY: This slot came from a kernel FD-bearing record.
+                    descriptors.push(unsafe { OwnedFd::from_raw_fd(raw_fd) });
+                } else {
+                    unexpected_control = true;
+                }
             }
         } else {
             unexpected_control = true;
@@ -712,6 +721,22 @@ mod tests {
         let error = decode_ancillary(&mut message, &control).unwrap_err();
 
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn unexpected_pidfd_is_closed_even_on_truncation() {
+        for flags in [0, libc::MSG_CTRUNC] {
+            let (received, peer) = StdUnixStream::pair().unwrap();
+            let mut control = AncillaryBuffer([0; 16]);
+            let mut message = rights_message(&mut control, &[received.into_raw_fd()]);
+            // SAFETY: rights_message installed this complete record in control.
+            unsafe {
+                (*message.msg_control.cast::<libc::cmsghdr>()).cmsg_type = SCM_PIDFD;
+            }
+            message.msg_flags = flags;
+            assert!(decode_ancillary(&mut message, &control).is_err());
+            assert_peer_observes_close(peer);
+        }
     }
 
     #[test]

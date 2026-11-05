@@ -1,5 +1,3 @@
-use core::arch::asm;
-use core::ffi::c_void;
 use core::mem::{size_of, zeroed};
 use core::ptr;
 use lasper_guest_protocol::{
@@ -8,41 +6,14 @@ use lasper_guest_protocol::{
     CONTROL_FRAME_HEADER_BYTES, MAX_CONTROL_DESCRIPTORS,
 };
 
+use crate::socket::{
+    close, cmsg_align, cmsg_data, cmsg_len, cmsg_space, recvmsg, sendmsg, shutdown,
+    ControlMessageHeader, Iovec, MessageHeader, EINTR, MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_NOSIGNAL,
+    MSG_TRUNC, SCM_PIDFD, SCM_RIGHTS, SOL_SOCKET,
+};
+
 const MAX_RECEIVED_DESCRIPTORS: usize = MAX_CONTROL_DESCRIPTORS as usize + 1;
 const INVALID_FD: i32 = -1;
-const EINTR: isize = 4;
-const MSG_CTRUNC: u32 = 8;
-const MSG_TRUNC: u32 = 32;
-const MSG_NOSIGNAL: usize = 0x4000;
-const MSG_CMSG_CLOEXEC: usize = 0x4000_0000;
-const SCM_RIGHTS: i32 = 1;
-const SOL_SOCKET: i32 = 1;
-const SHUT_RDWR: usize = 2;
-
-#[repr(C)]
-struct Iovec {
-    base: *mut c_void,
-    length: usize,
-}
-
-#[repr(C)]
-struct MessageHeader {
-    name: *mut c_void,
-    name_length: u32,
-    vectors: *mut Iovec,
-    vector_count: usize,
-    control: *mut c_void,
-    control_length: usize,
-    flags: u32,
-}
-
-#[repr(C)]
-struct ControlMessageHeader {
-    length: usize,
-    level: i32,
-    kind: i32,
-}
-
 #[repr(C, align(16))]
 struct AncillaryBuffer([usize; 4]);
 
@@ -540,8 +511,8 @@ fn parse_descriptors(
         {
             return Err(TransportError::Truncated);
         }
-        if level == SOL_SOCKET && kind == SCM_RIGHTS {
-            if rights_seen {
+        if level == SOL_SOCKET && matches!(kind, SCM_RIGHTS | SCM_PIDFD) {
+            if kind == SCM_PIDFD || rights_seen {
                 unexpected_control = true;
             }
             rights_seen = true;
@@ -552,7 +523,12 @@ fn parse_descriptors(
             let data = data_start as *const i32;
             for index in 0..data_bytes / size_of::<i32>() {
                 // The record bounds above cover this complete descriptor slot.
-                descriptors.push(unsafe { data.add(index).read_unaligned() });
+                let fd = unsafe { data.add(index).read_unaligned() };
+                if fd >= 0 {
+                    descriptors.push(fd);
+                } else {
+                    unexpected_control = true;
+                }
             }
         } else {
             unexpected_control = true;
@@ -573,26 +549,6 @@ fn parse_descriptors(
     }
 }
 
-const fn cmsg_align(length: usize) -> usize {
-    (length + size_of::<usize>() - 1) & !(size_of::<usize>() - 1)
-}
-
-const fn cmsg_space(data_bytes: usize) -> usize {
-    cmsg_align(size_of::<ControlMessageHeader>()) + cmsg_align(data_bytes)
-}
-
-const fn cmsg_len(data_bytes: usize) -> usize {
-    cmsg_align(size_of::<ControlMessageHeader>()) + data_bytes
-}
-
-unsafe fn cmsg_data(header: *mut ControlMessageHeader) -> *mut u8 {
-    unsafe {
-        header
-            .cast::<u8>()
-            .add(cmsg_align(size_of::<ControlMessageHeader>()))
-    }
-}
-
 fn syscall_result(result: isize) -> Result<usize, TransportError> {
     if result < 0 {
         Err(TransportError::Syscall((-result) as i32))
@@ -600,137 +556,6 @@ fn syscall_result(result: isize) -> Result<usize, TransportError> {
         Ok(result as usize)
     }
 }
-
-fn sendmsg(fd: i32, message: &MessageHeader, flags: usize) -> isize {
-    unsafe {
-        syscall3(
-            SYS_SENDMSG,
-            fd as usize,
-            message as *const _ as usize,
-            flags,
-        )
-    }
-}
-
-fn recvmsg(fd: i32, message: &mut MessageHeader, flags: usize) -> isize {
-    unsafe { syscall3(SYS_RECVMSG, fd as usize, message as *mut _ as usize, flags) }
-}
-
-fn shutdown(fd: i32) -> isize {
-    unsafe { syscall2(SYS_SHUTDOWN, fd as usize, SHUT_RDWR) }
-}
-
-fn close(fd: i32) -> isize {
-    unsafe { syscall1(SYS_CLOSE, fd as usize) }
-}
-
-#[cfg(target_arch = "x86_64")]
-unsafe fn syscall1(number: usize, first: usize) -> isize {
-    let result: isize;
-    unsafe {
-        asm!(
-            "syscall",
-            inlateout("rax") number as isize => result,
-            in("rdi") first,
-            lateout("rcx") _,
-            lateout("r11") _,
-        );
-    }
-    result
-}
-
-#[cfg(target_arch = "x86_64")]
-unsafe fn syscall2(number: usize, first: usize, second: usize) -> isize {
-    let result: isize;
-    unsafe {
-        asm!(
-            "syscall",
-            inlateout("rax") number as isize => result,
-            in("rdi") first,
-            in("rsi") second,
-            lateout("rcx") _,
-            lateout("r11") _,
-        );
-    }
-    result
-}
-
-#[cfg(target_arch = "x86_64")]
-unsafe fn syscall3(number: usize, first: usize, second: usize, third: usize) -> isize {
-    let result: isize;
-    unsafe {
-        asm!(
-            "syscall",
-            inlateout("rax") number as isize => result,
-            in("rdi") first,
-            in("rsi") second,
-            in("rdx") third,
-            lateout("rcx") _,
-            lateout("r11") _,
-        );
-    }
-    result
-}
-
-#[cfg(target_arch = "aarch64")]
-unsafe fn syscall1(number: usize, first: usize) -> isize {
-    let result: isize;
-    unsafe {
-        asm!(
-            "svc 0",
-            inlateout("x0") first as isize => result,
-            in("x8") number,
-        );
-    }
-    result
-}
-
-#[cfg(target_arch = "aarch64")]
-unsafe fn syscall2(number: usize, first: usize, second: usize) -> isize {
-    let result: isize;
-    unsafe {
-        asm!(
-            "svc 0",
-            inlateout("x0") first as isize => result,
-            in("x1") second,
-            in("x8") number,
-        );
-    }
-    result
-}
-
-#[cfg(target_arch = "aarch64")]
-unsafe fn syscall3(number: usize, first: usize, second: usize, third: usize) -> isize {
-    let result: isize;
-    unsafe {
-        asm!(
-            "svc 0",
-            inlateout("x0") first as isize => result,
-            in("x1") second,
-            in("x2") third,
-            in("x8") number,
-        );
-    }
-    result
-}
-
-#[cfg(target_arch = "x86_64")]
-const SYS_CLOSE: usize = 3;
-#[cfg(target_arch = "x86_64")]
-const SYS_SENDMSG: usize = 46;
-#[cfg(target_arch = "x86_64")]
-const SYS_RECVMSG: usize = 47;
-#[cfg(target_arch = "x86_64")]
-const SYS_SHUTDOWN: usize = 48;
-
-#[cfg(target_arch = "aarch64")]
-const SYS_CLOSE: usize = 57;
-#[cfg(target_arch = "aarch64")]
-const SYS_SHUTDOWN: usize = 210;
-#[cfg(target_arch = "aarch64")]
-const SYS_SENDMSG: usize = 211;
-#[cfg(target_arch = "aarch64")]
-const SYS_RECVMSG: usize = 212;
 
 #[cfg(test)]
 mod tests {
@@ -883,6 +708,22 @@ mod tests {
             decode_ancillary(&mut message, &control),
             Err(TransportError::UnexpectedDescriptors)
         ));
+    }
+
+    #[test]
+    fn unexpected_pidfd_is_closed_even_on_truncation() {
+        for flags in [0, MSG_CTRUNC] {
+            let (received, peer) = UnixStream::pair().unwrap();
+            let mut control = AncillaryBuffer([0; 4]);
+            let mut message = rights_message(&mut control, &[received.into_raw_fd()]);
+            // SAFETY: rights_message installed this complete record in control.
+            unsafe {
+                (*message.control.cast::<ControlMessageHeader>()).kind = SCM_PIDFD;
+            }
+            message.flags = flags;
+            assert!(decode_ancillary(&mut message, &control).is_err());
+            assert_peer_observes_close(peer);
+        }
     }
 
     #[test]
