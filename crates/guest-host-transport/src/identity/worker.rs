@@ -5,8 +5,10 @@ use lasper_guest_protocol::{GuestIdentityReply, PrepareRequest, IDENTITY_CHALLEN
 use std::io;
 
 /// Keeps the identity channel and its request together for Prepare and Recheck.
-/// The worker is assigned before the first reply. Machine membership and ID
-/// mapping still need checking before desktop authorization.
+/// The worker is assigned before the first reply. Reported guest IDs must map
+/// to its kernel credentials; machine membership still needs checking before
+/// desktop authorization. Account-name resolution belongs to the trusted
+/// guest helper, not this credential check.
 pub struct IdentityWorker<'request, 'payload> {
     channel: UnixIdentityChannel,
     request: &'request PrepareRequest<'payload>,
@@ -80,8 +82,10 @@ impl<'request, 'payload> IdentityWorker<'request, 'payload> {
     }
 }
 
-/// A guest report paired with the kernel credentials of its live sender.
-/// These credentials have not yet been matched to a target machine.
+/// A guest report whose IDs map to the kernel credentials of its live sender.
+/// The process has not yet been matched to a target machine. The account name
+/// matches the request, but its relationship to these IDs relies on the guest
+/// helper resolving and switching to that account correctly.
 #[derive(Debug)]
 pub struct WorkerObservation {
     reply: GuestIdentityReply,
@@ -108,7 +112,7 @@ async fn observe_worker(
 ) -> io::Result<WorkerObservation> {
     process.recheck()?;
     let (reply, credentials) = channel.observe(fresh_nonce()?, request).await?;
-    process.verify_sender(&credentials)?;
+    process.verify_identity(&credentials, reply.guest_uid(), reply.guest_gid())?;
     Ok(WorkerObservation {
         reply,
         host_uid: credentials.uid(),
@@ -284,8 +288,8 @@ mod tests {
             challenge,
             &request(),
             "alice",
-            1000,
-            2000,
+            unsafe { libc::getuid() },
+            unsafe { libc::getgid() },
             Default::default(),
         ) else {
             return false;
@@ -374,7 +378,8 @@ mod tests {
         let mut owner = owner(host, &request, pid);
         owner.observe().await.unwrap();
         parent.read_exact(&mut [0; 1]).unwrap();
-        let replacement = tokio::task::spawn_blocking(move || reply(&mut guest, 1000));
+        let replacement =
+            tokio::task::spawn_blocking(move || reply(&mut guest, unsafe { libc::getuid() }));
         let error = tokio::time::timeout(Duration::from_secs(2), owner.observe())
             .await
             .unwrap()
@@ -409,7 +414,8 @@ mod tests {
         drop(child_gate);
         let request = request();
         let mut owner = owner(host, &request, pid);
-        let replacement = tokio::task::spawn_blocking(move || reply(&mut guest, 1000));
+        let replacement =
+            tokio::task::spawn_blocking(move || reply(&mut guest, unsafe { libc::getuid() }));
         let error = owner.observe().await.unwrap_err();
         assert!(error.to_string().contains("different worker"));
         assert!(!owner.can_continue());
@@ -441,19 +447,37 @@ mod tests {
     }
 
     fn reply(guest: &mut GuestIdentityChannel, uid: u32) -> [u8; 32] {
+        reply_with_ids(guest, uid, unsafe { libc::getgid() })
+    }
+
+    fn reply_with_ids(guest: &mut GuestIdentityChannel, uid: u32, gid: u32) -> [u8; 32] {
         let mut bytes = [0; MAX_IDENTITY_MESSAGE_BYTES];
         let challenge = guest.receive_challenge(&mut bytes).unwrap();
-        let response = GuestIdentityReply::new(
-            challenge,
-            &request(),
-            "alice",
-            uid,
-            2000,
-            Default::default(),
-        )
-        .unwrap();
+        let response =
+            GuestIdentityReply::new(challenge, &request(), "alice", uid, gid, Default::default())
+                .unwrap();
         guest.send_reply(&response, &mut bytes).unwrap();
         *challenge.nonce()
+    }
+
+    #[tokio::test]
+    async fn first_reply_cannot_substitute_another_uid_or_gid() {
+        let uid = unsafe { libc::getuid() };
+        let gid = unsafe { libc::getgid() };
+        for (reported_uid, reported_gid, field) in
+            [(uid ^ 1, gid, "guest UID"), (uid, gid ^ 1, "guest GID")]
+        {
+            let (host, mut guest, _, _) = channels(true);
+            let task = tokio::task::spawn_blocking(move || {
+                reply_with_ids(&mut guest, reported_uid, reported_gid);
+            });
+            let request = request();
+            let mut owner = owner(host, &request, std::process::id() as i32);
+            let error = owner.observe().await.unwrap_err();
+            assert!(error.to_string().contains(field), "{error}");
+            assert!(!owner.can_continue());
+            task.await.unwrap();
+        }
     }
 
     #[tokio::test]
@@ -461,7 +485,10 @@ mod tests {
         let (host, mut guest, _, _) = channels(true);
         let request = request();
         let worker = tokio::task::spawn_blocking(move || {
-            let nonces = [reply(&mut guest, 1000), reply(&mut guest, 1000)];
+            let nonces = [
+                reply(&mut guest, unsafe { libc::getuid() }),
+                reply(&mut guest, unsafe { libc::getuid() }),
+            ];
             assert_ne!(nonces[0], nonces[1]);
             nonces
         });
@@ -473,7 +500,7 @@ mod tests {
         assert_eq!(owner.process().pid(), std::process::id() as i32);
         assert_eq!(first.host_uid(), unsafe { libc::getuid() });
         assert_eq!(first.host_gid(), unsafe { libc::getgid() });
-        assert_eq!(first.reply().guest_uid(), 1000);
+        assert_eq!(first.reply().guest_uid(), unsafe { libc::getuid() });
         let fd = owner.process().directory().as_raw_fd();
         let second = tokio::time::timeout(Duration::from_secs(2), owner.observe())
             .await
@@ -485,17 +512,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn changed_reported_ids_invalidate_the_owner() {
+    async fn a_reported_uid_that_does_not_map_invalidates_the_owner() {
         let (host, mut guest, _, _) = channels(true);
         let worker = tokio::task::spawn_blocking(move || {
-            reply(&mut guest, 1000);
-            reply(&mut guest, 1001);
+            reply(&mut guest, unsafe { libc::getuid() });
+            reply(&mut guest, unsafe { libc::getuid() } ^ 1);
         });
         let request = request();
         let mut owner = owner(host, &request, std::process::id() as i32);
         owner.observe().await.unwrap();
         let error = owner.observe().await.unwrap_err();
-        assert!(error.to_string().contains("identity changed"));
+        assert!(error.to_string().contains("guest UID does not map"));
         assert!(!owner.can_continue());
         assert!(owner.observe().await.is_err());
         worker.await.unwrap();
@@ -526,5 +553,162 @@ mod tests {
         drop(observation);
         assert!(!owner.can_continue());
         worker.await.unwrap();
+    }
+    #[tokio::test]
+    #[ignore = "requires unprivileged user namespaces; CI runs this explicitly"]
+    async fn child_user_namespace_maps_packet_and_proc_credentials() {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::net::UnixStream;
+
+        let host_uid = unsafe { libc::getuid() };
+        let host_gid = unsafe { libc::getgid() };
+        let guest_uid = host_uid ^ 1;
+        let guest_gid = host_gid ^ 1;
+        for wrong_field in [None, Some("guest UID"), Some("guest GID")] {
+            let (host, mut guest, _, host_fd) = channels(true);
+            let (mut parent, child_gate) = UnixStream::pair().unwrap();
+            parent
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            parent
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            // SAFETY: The child uses raw syscalls and the allocation-free guest
+            // codec, then _exit; it never resumes the inherited Tokio runtime.
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0);
+            if pid == 0 {
+                unsafe {
+                    libc::close(host_fd);
+                    libc::close(parent.as_raw_fd());
+                    let error: i32 = if libc::unshare(libc::CLONE_NEWUSER) == 0 {
+                        0
+                    } else {
+                        *libc::__errno_location()
+                    };
+                    if libc::write(child_gate.as_raw_fd(), (&error as *const i32).cast(), 4) != 4
+                        || error != 0
+                    {
+                        libc::_exit(1);
+                    }
+                    let mut gate = 0u8;
+                    if libc::read(child_gate.as_raw_fd(), (&mut gate as *mut u8).cast(), 1) != 1
+                        || libc::getuid() != guest_uid
+                        || libc::getgid() != guest_gid
+                    {
+                        libc::_exit(2);
+                    }
+                    let mut bytes = [0; MAX_IDENTITY_MESSAGE_BYTES];
+                    let Ok(challenge) = guest.receive_challenge(&mut bytes) else {
+                        libc::_exit(3);
+                    };
+                    let uid = if wrong_field == Some("guest UID") {
+                        guest_uid ^ 1
+                    } else {
+                        guest_uid
+                    };
+                    let gid = if wrong_field == Some("guest GID") {
+                        guest_gid ^ 1
+                    } else {
+                        guest_gid
+                    };
+                    let Ok(reply) = GuestIdentityReply::new(
+                        challenge,
+                        &request(),
+                        "alice",
+                        uid,
+                        gid,
+                        Default::default(),
+                    ) else {
+                        libc::_exit(4);
+                    };
+                    if guest.send_reply(&reply, &mut bytes).is_err() {
+                        libc::_exit(5);
+                    }
+                    // Keep the assigned process alive until host verification
+                    // finishes, including on the rejection paths.
+                    if libc::read(child_gate.as_raw_fd(), (&mut gate as *mut u8).cast(), 1) != 1 {
+                        libc::_exit(6);
+                    }
+                    libc::_exit(0);
+                }
+            }
+            let mut child = Child(pid);
+            drop(child_gate);
+            drop(guest);
+            let mut error = [0; 4];
+            parent.read_exact(&mut error).unwrap();
+            let error = i32::from_ne_bytes(error);
+            assert_eq!(
+                error,
+                0,
+                "create user namespace: {}",
+                io::Error::from_raw_os_error(error)
+            );
+            let proc = format!("/proc/{pid}");
+            std::fs::write(format!("{proc}/setgroups"), "deny").unwrap();
+            std::fs::write(
+                format!("{proc}/uid_map"),
+                format!("{guest_uid} {host_uid} 1\n"),
+            )
+            .unwrap();
+            std::fs::write(
+                format!("{proc}/gid_map"),
+                format!("{guest_gid} {host_gid} 1\n"),
+            )
+            .unwrap();
+            parent.write_all(&[1]).unwrap();
+
+            let reader_ns = std::fs::metadata("/proc/thread-self/ns/user").unwrap();
+            let worker_ns = std::fs::metadata(format!("{proc}/ns/user")).unwrap();
+            assert_ne!(
+                (reader_ns.dev(), reader_ns.ino()),
+                (worker_ns.dev(), worker_ns.ino())
+            );
+            for (file, inside, outside) in [
+                ("uid_map", guest_uid, host_uid),
+                ("gid_map", guest_gid, host_gid),
+            ] {
+                let fields: Vec<u32> = std::fs::read_to_string(format!("{proc}/{file}"))
+                    .unwrap()
+                    .split_ascii_whitespace()
+                    .map(|field| field.parse().unwrap())
+                    .collect();
+                assert_eq!(fields, [inside, outside, 1]);
+            }
+            let status = std::fs::read_to_string(format!("{proc}/status")).unwrap();
+            for (key, id) in [("Uid:", host_uid), ("Gid:", host_gid)] {
+                let ids: Vec<u32> = status
+                    .lines()
+                    .find_map(|line| line.strip_prefix(key))
+                    .unwrap()
+                    .split_ascii_whitespace()
+                    .map(|id| id.parse().unwrap())
+                    .collect();
+                assert_eq!(ids, [id; 4]);
+            }
+            let request = request();
+            let mut owner = owner(host, &request, pid);
+            let result = tokio::time::timeout(Duration::from_secs(5), owner.observe())
+                .await
+                .unwrap();
+            if let Some(field) = wrong_field {
+                let error = result.unwrap_err();
+                assert!(error.to_string().contains(field), "{error}");
+                assert!(!owner.can_continue());
+            } else {
+                let observed = result.unwrap();
+                assert_eq!(
+                    (observed.host_uid(), observed.host_gid()),
+                    (host_uid, host_gid)
+                );
+                assert_eq!(
+                    (observed.reply().guest_uid(), observed.reply().guest_gid()),
+                    (guest_uid, guest_gid)
+                );
+            }
+            parent.write_all(&[1]).unwrap();
+            child.wait();
+        }
     }
 }

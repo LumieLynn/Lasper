@@ -68,6 +68,14 @@ jobs:
           cargo test -p lasper-guest-runtime --lib --locked
           cargo test -p lasper-guest-host-transport --lib --test interop --test identity --test preparation --locked
 
+      - name: Verify worker identity across user namespaces
+        shell: bash
+        run: |
+          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          cargo test -p lasper-guest-host-transport --lib child_user_namespace_maps_packet_and_proc_credentials --locked -- --ignored
+
       - name: Check guest runtime binary
         run: >-
           cargo clippy

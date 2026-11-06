@@ -11,6 +11,7 @@ use crate::application::sessions::{
 use crate::domain::machine::MachineName;
 use std::fs::File;
 use std::io::Read;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use super::NativeExecution;
@@ -109,10 +110,8 @@ fn observation_error(machine: &MachineName, error: impl std::fmt::Display) -> Se
 fn read_instance(leader: u32) -> std::io::Result<MachineInstanceSnapshot> {
     let proc = PathBuf::from(format!("/proc/{leader}"));
     let before = crate::adapters::runtime::registration::observe_machine_instance(leader)?;
-    let uid_map = read_id_map(&proc.join("uid_map"))?;
-    let gid_map = read_id_map(&proc.join("gid_map"))?;
-    let current_uid_map = read_id_map(&proc.join("uid_map"))?;
-    let current_gid_map = read_id_map(&proc.join("gid_map"))?;
+    let (uid_map, gid_map) = read_identity_maps(&proc, before)?;
+    let (current_uid_map, current_gid_map) = read_identity_maps(&proc, before)?;
     let after = crate::adapters::runtime::registration::observe_machine_instance(leader)?;
     if before != after || uid_map != current_uid_map || gid_map != current_gid_map {
         return Err(std::io::Error::new(
@@ -132,6 +131,31 @@ struct IdMapExtent {
     inside: u64,
     outside: u64,
     length: u64,
+}
+
+fn read_identity_maps(
+    proc: &Path,
+    instance: ObservedMachineInstance,
+) -> std::io::Result<(Vec<IdMapExtent>, Vec<IdMapExtent>)> {
+    let reader = std::fs::metadata("/proc/thread-self/ns/user")?;
+    let reader = ObservedNamespaceIdentity::new(reader.dev(), reader.ino());
+    if instance
+        .namespaces()
+        .is_some_and(|(_, user)| user == reader)
+    {
+        // In the same user namespace, map files describe the parent namespace;
+        // guest and host credentials already use the same numeric IDs.
+        let identity = vec![IdMapExtent {
+            inside: 0,
+            outside: 0,
+            length: u64::from(u32::MAX),
+        }];
+        return Ok((identity.clone(), identity));
+    }
+    Ok((
+        read_id_map(&proc.join("uid_map"))?,
+        read_id_map(&proc.join("gid_map"))?,
+    ))
 }
 
 fn read_id_map(path: &Path) -> std::io::Result<Vec<IdMapExtent>> {
@@ -289,5 +313,25 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(parse_id_map(&excessive).is_err());
+    }
+
+    #[test]
+    fn native_mapping_uses_local_ids_when_the_guest_shares_the_readers_namespace() {
+        let proc = Path::new("/proc/self");
+        let revision =
+            crate::adapters::runtime::registration::observe_machine_instance(std::process::id())
+                .unwrap();
+        let (uid_map, gid_map) = read_identity_maps(proc, revision).unwrap();
+        let snapshot = MachineInstanceSnapshot {
+            revision,
+            uid_map,
+            gid_map,
+        };
+        let namespace = revision.namespaces().unwrap().1;
+        let guest =
+            ObservedGuestIdentity::new(unsafe { libc::getuid() }, unsafe { libc::getgid() });
+        let identity = snapshot.mapped_identity(guest, namespace).unwrap();
+        assert_eq!(identity.host_uid(), guest.uid());
+        assert_eq!(identity.host_gid(), guest.gid());
     }
 }

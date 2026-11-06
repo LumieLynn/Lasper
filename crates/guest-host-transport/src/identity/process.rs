@@ -1,5 +1,5 @@
 use super::channel::invalid_data;
-use super::IdentityPeerCredentials;
+use super::{IdMap, IdentityPeerCredentials};
 use std::ffi::CStr;
 use std::fs::File;
 use std::io::{self, Read};
@@ -95,7 +95,12 @@ impl WorkerProcess {
         check_pidfd(self.pidfd())
     }
 
-    pub(super) fn verify_sender(&self, peer: &IdentityPeerCredentials) -> io::Result<()> {
+    pub(super) fn verify_identity(
+        &self,
+        peer: &IdentityPeerCredentials,
+        guest_uid: u32,
+        guest_gid: u32,
+    ) -> io::Result<()> {
         self.recheck()?;
         if peer.pid() != self.pid {
             return Err(invalid_data("identity reply came from a different worker"));
@@ -118,7 +123,43 @@ impl WorkerProcess {
             ));
         }
         check_status(&status, self.pid, peer.uid(), peer.gid())?;
+        let reader_namespace = File::open("/proc/thread-self/ns/user")?.metadata()?;
+        let worker_namespace = self.user_namespace.metadata()?;
+        let same_namespace = reader_namespace.dev() == worker_namespace.dev()
+            && reader_namespace.ino() == worker_namespace.ino();
+        // When the reader shares the worker's user namespace, uid_map's
+        // second column points to the parent, not back to the reader.
+        // SCM_CREDENTIALS already uses the reader's namespace in either case.
+        for (path, guest_id, host_id, description) in [
+            (c"uid_map", guest_uid, peer.uid(), "guest UID"),
+            (c"gid_map", guest_gid, peer.gid(), "guest GID"),
+        ] {
+            let mapping = if same_namespace {
+                None
+            } else {
+                Some(IdMap::read(open_at(
+                    &self.directory,
+                    path,
+                    libc::O_RDONLY,
+                )?)?)
+            };
+            if mapped_id(guest_id, mapping.as_ref()) != Some(host_id) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "{description} does not map to the identity packet's kernel credentials"
+                    ),
+                ));
+            }
+        }
         self.recheck()
+    }
+}
+
+fn mapped_id(id: u32, mapping: Option<&IdMap>) -> Option<u32> {
+    match mapping {
+        Some(mapping) => mapping.map(id),
+        None => (id != u32::MAX).then_some(id),
     }
 }
 
@@ -246,6 +287,15 @@ fn same_ids(text: &str, expected: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_user_namespace_keeps_ids_in_the_readers_namespace() {
+        let parent_map = IdMap::parse("0 100000 65536\n").unwrap();
+        assert_eq!(mapped_id(1000, None), Some(1000));
+        assert_eq!(mapped_id(1000, Some(&parent_map)), Some(101000));
+        assert_eq!(mapped_id(u32::MAX, None), None);
+        assert_eq!(mapped_id(65536, Some(&parent_map)), None);
+    }
 
     #[test]
     fn status_accepts_non_utf8_names_but_requires_complete_final_credentials() {

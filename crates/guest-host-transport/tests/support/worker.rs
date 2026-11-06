@@ -139,8 +139,8 @@ impl TestWorker {
                     challenge,
                     &request,
                     "alice",
-                    1000,
-                    2000,
+                    unsafe { libc::getuid() },
+                    unsafe { libc::getgid() },
                     Default::default(),
                 ) else {
                     unsafe { libc::_exit(5) };

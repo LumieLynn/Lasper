@@ -258,7 +258,8 @@ impl GuestIdentityReply {
 
     /// Before using the reply, the host must verify the sender's SCM_CREDENTIALS,
     /// machine membership and ID mappings, then match the observed sockets to
-    /// the expected host projections.
+    /// the expected host projections. The account name only matches the request;
+    /// resolving it to UID/GID is the trusted guest helper's responsibility.
     pub fn decode_for(
         bytes: &[u8],
         challenge: IdentityChallenge,
