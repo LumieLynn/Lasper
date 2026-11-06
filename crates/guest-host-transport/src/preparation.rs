@@ -1,10 +1,11 @@
 use crate::{
-    IdentityWorker, ReceivedControlFrame, UnixIdentityChannel, WorkerObservation, WorkerProcess,
-    WorkerReadiness,
+    IdentityWorker, MachineTarget, ReceivedControlFrame, UnixIdentityChannel, WorkerObservation,
+    WorkerProcess, WorkerReadiness,
 };
 use lasper_guest_protocol::{PrepareReadyFrame, PrepareRequestFrame};
 use std::io;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::sync::Arc;
 
 /// Resources delivered together by one PrepareReady response. This checks the
 /// response correlation and descriptor roles; identity observation still has
@@ -15,12 +16,14 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 /// the guardian's assignment history from a pidfd.
 pub struct PreparedWorker<'request, 'payload> {
     ready: PrepareReadyFrame,
+    target: Arc<MachineTarget>,
     terminal: Option<OwnedFd>,
     identity: IdentityWorker<'request, 'payload>,
 }
 
 impl<'request, 'payload> PreparedWorker<'request, 'payload> {
     pub fn from_frame(
+        target: Arc<MachineTarget>,
         readiness: &WorkerReadiness,
         request: &'request PrepareRequestFrame<'payload>,
         frame: ReceivedControlFrame,
@@ -52,12 +55,14 @@ impl<'request, 'payload> PreparedWorker<'request, 'payload> {
         let channel = descriptors.next().expect("PrepareReady identity channel");
         let pidfd = descriptors.next().expect("PrepareReady worker pidfd");
         let process = WorkerProcess::open(pidfd)?;
+        target.verify_worker(&process)?;
         if let Some(terminal) = &terminal {
             verify_terminal(terminal.as_fd(), &process)?;
         }
         let channel = UnixIdentityChannel::new(channel, ready)?;
         Ok(Self {
             ready,
+            target,
             terminal,
             identity: IdentityWorker::new(channel, request.request(), process),
         })
@@ -75,17 +80,20 @@ impl<'request, 'payload> PreparedWorker<'request, 'payload> {
         self.identity.process()
     }
 
+    /// No check has failed or been cancelled. This does not replace a fresh
+    /// observation of the target and worker before Start.
     pub fn can_continue(&self) -> bool {
         self.identity.can_continue()
     }
 
     /// Checks the reply and, for interactive workers, the terminal assignment.
+    /// The same target instance is checked before and after the reply.
     /// The caller supplies the deadline; cancellation invalidates preparation.
     pub async fn observe(&mut self) -> io::Result<WorkerObservation> {
         let result = async {
-            self.verify_terminal()?;
+            self.verify_resources()?;
             let observation = self.identity.observe().await?;
-            self.verify_terminal()?;
+            self.verify_resources()?;
             Ok(observation)
         }
         .await;
@@ -95,7 +103,8 @@ impl<'request, 'payload> PreparedWorker<'request, 'payload> {
         result
     }
 
-    fn verify_terminal(&self) -> io::Result<()> {
+    fn verify_resources(&self) -> io::Result<()> {
+        self.target.verify_worker(self.process())?;
         if let Some(terminal) = &self.terminal {
             verify_terminal(terminal.as_fd(), self.process())?;
         }

@@ -1,4 +1,4 @@
-use crate::WorkerProcess;
+use crate::process::ProcessHandle;
 use lasper_guest_protocol::{
     BrokerId, ControlLimits, EnforcedControlLimits, FeatureSet, HelloNegotiationError,
     HelloRequest, HelloResponse, PrepareReady, PrepareRequest, PrepareRequestFrame,
@@ -25,7 +25,7 @@ impl WorkerHello {
         }
         // SAFETY: pidfd_open returned a new descriptor with no other owner.
         let pidfd = unsafe { OwnedFd::from_raw_fd(descriptor as i32) };
-        WorkerProcess::open(pidfd).map_err(WorkerReadinessError::HostInspectionUnavailable)?;
+        ProcessHandle::open(pidfd).map_err(WorkerReadinessError::HostInspectionUnavailable)?;
         let request = HelloRequest::new(FeatureSet::WORKER_PIDFD, limits).map_err(|error| {
             WorkerReadinessError::Negotiation(HelloNegotiationError::InvalidLimits(error))
         })?;

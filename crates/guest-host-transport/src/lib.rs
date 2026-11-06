@@ -5,8 +5,10 @@ compile_error!("Lasper guest transport currently supports Linux only");
 
 mod identity;
 mod preparation;
+mod process;
 mod readiness;
 mod stream;
+mod target;
 
 const SCM_PIDFD: libc::c_int = 4;
 
@@ -16,3 +18,4 @@ pub use identity::{
 pub use preparation::PreparedWorker;
 pub use readiness::{WorkerHello, WorkerReadiness, WorkerReadinessError};
 pub use stream::{ReceivedControlFrame, UnixControlStream};
+pub use target::{MachineRegistration, MachineTarget, MachineTargetSource};

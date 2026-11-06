@@ -565,6 +565,7 @@ mod tests {
         let guest_uid = host_uid ^ 1;
         let guest_gid = host_gid ^ 1;
         for wrong_field in [None, Some("guest UID"), Some("guest GID")] {
+            let changed_root = File::open("/tmp").unwrap();
             let (host, mut guest, _, host_fd) = channels(true);
             let (mut parent, child_gate) = UnixStream::pair().unwrap();
             parent
@@ -630,6 +631,19 @@ mod tests {
                     if libc::read(child_gate.as_raw_fd(), (&mut gate as *mut u8).cast(), 1) != 1 {
                         libc::_exit(6);
                     }
+                    if gate == 2 {
+                        if libc::fchdir(changed_root.as_raw_fd()) < 0
+                            || libc::chroot(c".".as_ptr()) < 0
+                        {
+                            libc::_exit(7);
+                        }
+                        if libc::write(child_gate.as_raw_fd(), [1u8].as_ptr().cast(), 1) != 1
+                            || libc::read(child_gate.as_raw_fd(), (&mut gate as *mut u8).cast(), 1)
+                                != 1
+                        {
+                            libc::_exit(8);
+                        }
+                    }
                     libc::_exit(0);
                 }
             }
@@ -689,6 +703,20 @@ mod tests {
             }
             let request = request();
             let mut owner = owner(host, &request, pid);
+            // Same PID/mount namespace and root, but a different user namespace
+            // must not qualify as the reader's target process.
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, std::process::id(), 0) };
+            assert!(fd >= 0);
+            let reader = crate::MachineTarget::from_leader(
+                unsafe { OwnedFd::from_raw_fd(fd as i32) },
+                std::path::Path::new("/"),
+            )
+            .unwrap();
+            let mismatch = reader.verify_worker(owner.process()).unwrap_err();
+            assert!(
+                mismatch.to_string().contains("target user namespace"),
+                "{mismatch}"
+            );
             let result = tokio::time::timeout(Duration::from_secs(5), owner.observe())
                 .await
                 .unwrap();
@@ -706,6 +734,14 @@ mod tests {
                     (observed.reply().guest_uid(), observed.reply().guest_gid()),
                     (guest_uid, guest_gid)
                 );
+                parent.write_all(&[2]).unwrap();
+                parent.read_exact(&mut [0]).unwrap();
+                let error = owner.observe().await.unwrap_err();
+                assert!(
+                    error.to_string().contains("changed root filesystem"),
+                    "{error}"
+                );
+                assert!(!owner.can_continue());
             }
             parent.write_all(&[1]).unwrap();
             child.wait();

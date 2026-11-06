@@ -1,98 +1,62 @@
 use super::channel::invalid_data;
 use super::{IdMap, IdentityPeerCredentials};
-use std::ffi::CStr;
+use crate::process::{check_pidfd, open_at, pidfd_pid, ProcessHandle};
 use std::fs::File;
-use std::io::{self, Read};
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::io;
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::unix::fs::MetadataExt;
 
 const MAX_STATUS_BYTES: u64 = 64 * 1024;
 
 /// Process handles acquired from the worker pidfd supplied in PrepareReady.
-/// The pidfd is checked for exit around procfs access: a proc directory opened
-/// after PID reuse cannot become evidence for the assigned worker.
+/// The assigned process stays fixed across identity observations.
 pub struct WorkerProcess {
-    pidfd: OwnedFd,
-    pid: i32,
-    directory: File,
-    pid_namespace: File,
-    mount_namespace: File,
-    user_namespace: File,
-    root: File,
+    process: ProcessHandle,
 }
 
 impl WorkerProcess {
     pub fn pidfd(&self) -> BorrowedFd<'_> {
-        self.pidfd.as_fd()
+        self.process.pidfd()
     }
 
     pub const fn pid(&self) -> i32 {
-        self.pid
+        self.process.pid()
     }
 
     pub fn directory(&self) -> BorrowedFd<'_> {
-        self.directory.as_fd()
+        self.process.directory()
     }
 
     pub fn pid_namespace(&self) -> BorrowedFd<'_> {
-        self.pid_namespace.as_fd()
+        self.process.pid_namespace()
     }
 
     pub fn mount_namespace(&self) -> BorrowedFd<'_> {
-        self.mount_namespace.as_fd()
+        self.process.mount_namespace()
     }
 
     pub fn user_namespace(&self) -> BorrowedFd<'_> {
-        self.user_namespace.as_fd()
+        self.process.user_namespace().as_fd()
     }
 
     pub fn root(&self) -> BorrowedFd<'_> {
-        self.root.as_fd()
+        self.process.root()
     }
 
     pub(crate) fn open(pidfd: OwnedFd) -> io::Result<Self> {
-        let pid = pidfd_pid(pidfd.as_fd())?;
-        check_pidfd(pidfd.as_fd())?;
-        let directory = File::options()
-            .read(true)
-            .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
-            .open(format!("/proc/{pid}"))?;
-        let process = Self {
-            pid_namespace: open_at(&directory, c"ns/pid", libc::O_RDONLY)?,
-            mount_namespace: open_at(&directory, c"ns/mnt", libc::O_RDONLY)?,
-            user_namespace: open_at(&directory, c"ns/user", libc::O_RDONLY)?,
-            root: open_at(&directory, c"root", libc::O_PATH | libc::O_DIRECTORY)?,
-            directory,
-            pidfd,
-            pid,
-        };
-        process.recheck()?;
-        Ok(process)
+        Ok(Self {
+            process: ProcessHandle::open(pidfd)?,
+        })
+    }
+
+    pub(crate) fn handle(&self) -> &ProcessHandle {
+        &self.process
     }
 
     /// Checks process lifetime, namespaces and root. Machine membership and
     /// the requested guest account must still be verified by the caller.
     pub fn recheck(&self) -> io::Result<()> {
-        check_pidfd(self.pidfd())?;
-        for (handle, path) in [
-            (&self.pid_namespace, c"ns/pid"),
-            (&self.mount_namespace, c"ns/mnt"),
-            (&self.user_namespace, c"ns/user"),
-            (&self.root, c"root"),
-        ] {
-            let observed = open_at(&self.directory, path, libc::O_PATH)?;
-            let expected = handle.metadata()?;
-            let actual = observed.metadata()?;
-            if expected.dev() != actual.dev() || expected.ino() != actual.ino() {
-                return Err(invalid_data(match path.to_bytes() {
-                    b"ns/pid" => "identity worker changed PID namespace",
-                    b"ns/mnt" => "identity worker changed mount namespace",
-                    b"ns/user" => "identity worker changed user namespace",
-                    _ => "identity worker changed root filesystem",
-                }));
-            }
-        }
-        check_pidfd(self.pidfd())
+        self.process.recheck()
     }
 
     pub(super) fn verify_identity(
@@ -102,29 +66,21 @@ impl WorkerProcess {
         guest_gid: u32,
     ) -> io::Result<()> {
         self.recheck()?;
-        if peer.pid() != self.pid {
+        if peer.pid() != self.pid() {
             return Err(invalid_data("identity reply came from a different worker"));
         }
         if let Some(sender) = peer.pidfd() {
             check_pidfd(sender)?;
-            if pidfd_pid(sender)? != self.pid {
+            if pidfd_pid(sender)? != self.pid() {
                 return Err(invalid_data(
                     "identity packet pidfd does not match its sender",
                 ));
             }
         }
-        let mut status = Vec::new();
-        open_at(&self.directory, c"status", libc::O_RDONLY)?
-            .take(MAX_STATUS_BYTES + 1)
-            .read_to_end(&mut status)?;
-        if status.len() as u64 > MAX_STATUS_BYTES {
-            return Err(invalid_data(
-                "worker process status exceeded its size limit",
-            ));
-        }
-        check_status(&status, self.pid, peer.uid(), peer.gid())?;
+        let status = self.process.read(c"status", MAX_STATUS_BYTES)?;
+        check_status(&status, self.pid(), peer.uid(), peer.gid())?;
         let reader_namespace = File::open("/proc/thread-self/ns/user")?.metadata()?;
-        let worker_namespace = self.user_namespace.metadata()?;
+        let worker_namespace = self.process.user_namespace().metadata()?;
         let same_namespace = reader_namespace.dev() == worker_namespace.dev()
             && reader_namespace.ino() == worker_namespace.ino();
         // When the reader shares the worker's user namespace, uid_map's
@@ -138,7 +94,7 @@ impl WorkerProcess {
                 None
             } else {
                 Some(IdMap::read(open_at(
-                    &self.directory,
+                    self.directory(),
                     path,
                     libc::O_RDONLY,
                 )?)?)
@@ -160,79 +116,6 @@ fn mapped_id(id: u32, mapping: Option<&IdMap>) -> Option<u32> {
     match mapping {
         Some(mapping) => mapping.map(id),
         None => (id != u32::MAX).then_some(id),
-    }
-}
-
-fn open_at(directory: &File, path: &CStr, flags: i32) -> io::Result<File> {
-    // SAFETY: The directory stays open. Each path is a fixed relative procfs
-    // entry, and the returned descriptor is taken into one File owner.
-    let fd = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            path.as_ptr(),
-            flags | libc::O_CLOEXEC,
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    // SAFETY: openat returned a new descriptor; File takes its sole ownership.
-    Ok(unsafe { File::from_raw_fd(fd) })
-}
-
-fn pidfd_pid(pidfd: BorrowedFd<'_>) -> io::Result<i32> {
-    // fdinfo translates the pidfd into the PID namespace of the host procfs,
-    // unlike the guardian's PID number in the guest. Pid is absent on other
-    // descriptor types and becomes -1 after the assigned process is reaped.
-    let mut info = String::new();
-    File::open(format!("/proc/self/fdinfo/{}", pidfd.as_raw_fd()))?
-        .take(4097)
-        .read_to_string(&mut info)?;
-    if info.len() > 4096 {
-        return Err(invalid_data(
-            "worker pidfd information exceeded its size limit",
-        ));
-    }
-    let pid = info
-        .lines()
-        .find_map(|line| line.strip_prefix("Pid:"))
-        .ok_or_else(|| invalid_data("PrepareReady worker descriptor is not a pidfd"))?
-        .trim()
-        .parse::<i32>()
-        .map_err(|_| invalid_data("worker pidfd contains an invalid PID"))?;
-    if pid <= 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "assigned worker has exited or is outside the host PID namespace",
-        ));
-    }
-    Ok(pid)
-}
-
-fn check_pidfd(pidfd: BorrowedFd<'_>) -> io::Result<()> {
-    let mut descriptor = libc::pollfd {
-        fd: pidfd.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    loop {
-        // SAFETY: poll borrows the live pidfd for this nonblocking check.
-        let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
-        if result < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error);
-        }
-        return if result == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "identity worker has exited",
-            ))
-        };
     }
 }
 
