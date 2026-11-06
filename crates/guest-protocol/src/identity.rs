@@ -29,6 +29,12 @@ pub struct FeatureSet(u64);
 impl FeatureSet {
     pub const EMPTY: Self = Self(0);
 
+    /// The guardian can acquire and retain a pidfd for its worker before
+    /// publishing PrepareReady. Advertise only after checking runtime support.
+    /// Hosts must also require this bit: it opts into the PrepareReady FD
+    /// layout containing a worker pidfd. Brokers reject requests without it.
+    pub const WORKER_PIDFD: Self = Self(1 << 0);
+
     pub const fn from_bits(bits: u64) -> Self {
         Self(bits)
     }

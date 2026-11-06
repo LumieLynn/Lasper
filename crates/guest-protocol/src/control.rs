@@ -5,7 +5,7 @@ const CONTROL_FRAME_FORMAT: u16 = 1;
 pub const CONTROL_FRAME_HEADER_BYTES: usize = 32;
 /// The byte that anchors descriptor rights to a frame.
 pub const CONTROL_FRAME_DESCRIPTOR_ANCHOR_BYTES: usize = 1;
-pub const MAX_CONTROL_DESCRIPTORS: u16 = 2;
+pub const MAX_CONTROL_DESCRIPTORS: u16 = 3;
 pub const MAX_CONTROL_PAYLOAD_BYTES: u32 =
     MAX_CONTROL_FRAME_BYTES - CONTROL_FRAME_HEADER_BYTES as u32;
 

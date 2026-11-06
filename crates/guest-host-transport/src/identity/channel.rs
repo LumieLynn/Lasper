@@ -41,8 +41,8 @@ impl IdentityPeerCredentials {
     /// This handle identifies the sender even after exit; it does not reserve
     /// the numeric PID. Check for exit around acquiring proc/namespace handles.
     ///
-    /// None means the kernel lacks SO_PASSPIDFD. Retain a proc handle and confirm
-    /// with a fresh challenge while it is still live before accepting identity.
+    /// When SO_PASSPIDFD is unavailable, IdentityWorker still checks the sender
+    /// against the live worker pidfd assigned in PrepareReady.
     pub fn pidfd(&self) -> Option<BorrowedFd<'_>> {
         self.pidfd.as_ref().map(AsFd::as_fd)
     }
@@ -78,6 +78,21 @@ impl UnixIdentityChannel {
 
     pub const fn can_continue(&self) -> bool {
         !self.poisoned
+    }
+
+    pub(super) fn invalidate(&mut self) {
+        self.poisoned = true;
+        // SAFETY: The channel retains ownership of this socket.
+        let _ = unsafe { libc::shutdown(self.socket.as_raw_fd(), libc::SHUT_RDWR) };
+    }
+
+    #[cfg(test)]
+    pub(super) fn without_pidfd(mut self) -> io::Result<Self> {
+        if self.pass_pidfd {
+            set_socket_option(self.socket.as_raw_fd(), libc::SO_PASSPIDFD, 0)?;
+            self.pass_pidfd = false;
+        }
+        Ok(self)
     }
 
     /// The caller supplies a fresh random nonce for every observation and owns
@@ -267,7 +282,7 @@ fn receive_packet_once(
     message.msg_iov = &mut vector;
     message.msg_iovlen = 1;
     message.msg_control = control.0.as_mut_ptr().cast();
-    message.msg_controllen = size_of::<AncillaryBuffer>();
+    message.msg_controllen = size_of::<AncillaryBuffer>() as _;
     // SAFETY: Both receive buffers remain live and their lengths bound kernel writes.
     let received = unsafe {
         libc::recvmsg(
@@ -301,7 +316,8 @@ fn parse_credentials(
     control: &AncillaryBuffer,
     pass_pidfd: bool,
 ) -> io::Result<IdentityPeerCredentials> {
-    let length = message.msg_controllen.min(size_of::<AncillaryBuffer>());
+    let control_bytes: usize = message.msg_controllen as _;
+    let length = control_bytes.min(size_of::<AncillaryBuffer>());
     // CMSG_LEN(0) includes the native ABI padding before the record payload.
     let header_bytes = unsafe { libc::CMSG_LEN(0) as usize };
     let alignment = size_of::<usize>();
@@ -321,7 +337,7 @@ fn parse_credentials(
                 .cast::<libc::cmsghdr>()
                 .read_unaligned()
         };
-        let record_bytes = header.cmsg_len;
+        let record_bytes: usize = header.cmsg_len as _;
         if record_bytes < header_bytes || record_bytes > length - offset {
             return Err(invalid_data(
                 "identity ancillary record exceeded its buffer",
@@ -375,7 +391,7 @@ fn parse_credentials(
         }
         offset += (record_bytes + alignment - 1) & !(alignment - 1);
     }
-    if message.msg_controllen > size_of::<AncillaryBuffer>() {
+    if control_bytes > size_of::<AncillaryBuffer>() {
         return Err(invalid_data("identity ancillary data exceeded its buffer"));
     }
     if unexpected {
@@ -405,7 +421,7 @@ fn invalid_identity(error: IdentityChannelError) -> io::Error {
     )
 }
 
-fn invalid_data(message: &str) -> io::Error {
+pub(super) fn invalid_data(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
@@ -477,7 +493,7 @@ mod tests {
         // SAFETY: Only msg_controllen is used by this parser.
         let mut message: libc::msghdr = unsafe { zeroed() };
         assert!(parse_credentials(&message, &control, false).is_err());
-        message.msg_controllen = credentials_record(&mut control, 0, 10);
+        message.msg_controllen = credentials_record(&mut control, 0, 10) as _;
         assert_eq!(
             parse_credentials(&message, &control, false).unwrap().pid(),
             10
@@ -487,9 +503,10 @@ mod tests {
             .pidfd()
             .is_none());
         assert!(parse_credentials(&message, &control, true).is_err());
-        message.msg_controllen += credentials_record(&mut control, message.msg_controllen, 20);
+        let offset: usize = message.msg_controllen as _;
+        message.msg_controllen = (offset + credentials_record(&mut control, offset, 20)) as _;
         assert!(parse_credentials(&message, &control, false).is_err());
-        message.msg_controllen = credentials_record(&mut control, 0, 0);
+        message.msg_controllen = credentials_record(&mut control, 0, 0) as _;
         assert!(parse_credentials(&message, &control, false).is_err());
         message.msg_controllen -= 8;
         assert!(parse_credentials(&message, &control, false).is_err());
@@ -511,7 +528,7 @@ mod tests {
             (*header).cmsg_len = libc::CMSG_LEN(0) as _;
             (*header).cmsg_level = libc::SOL_SOCKET;
             (*header).cmsg_type = libc::SCM_RIGHTS;
-            message.msg_controllen = offset + libc::CMSG_SPACE(0) as usize;
+            message.msg_controllen = (offset + libc::CMSG_SPACE(0) as usize) as _;
         }
         assert!(parse_credentials(&message, &control, false).is_err());
     }
@@ -524,7 +541,7 @@ mod tests {
         let mut message: libc::msghdr = unsafe { zeroed() };
         let offset = credentials_record(&mut control, 0, 10);
         message.msg_controllen =
-            offset + fd_record(&mut control, offset, SCM_PIDFD, &[received.into_raw_fd()]);
+            (offset + fd_record(&mut control, offset, SCM_PIDFD, &[received.into_raw_fd()])) as _;
         let credentials = parse_credentials(&message, &control, true).unwrap();
         assert!(credentials.pidfd().is_some());
         drop(credentials);
@@ -550,7 +567,8 @@ mod tests {
                 peers.push(peer);
                 offset += fd_record(&mut control, offset, SCM_PIDFD, &[received.into_raw_fd()]);
             }
-            message.msg_controllen = offset + fd_record(&mut control, offset, SCM_PIDFD, &fds);
+            message.msg_controllen =
+                (offset + fd_record(&mut control, offset, SCM_PIDFD, &fds)) as _;
             assert!(parse_credentials(&message, &control, expected).is_err());
             for peer in peers {
                 assert_closed(peer);
@@ -567,13 +585,13 @@ mod tests {
         offset += fd_record(&mut control, offset, 0x7fff, &[]);
         // SAFETY: The parser only reads msg_controllen from the message header.
         let mut message: libc::msghdr = unsafe { zeroed() };
-        message.msg_controllen = offset
+        message.msg_controllen = (offset
             + fd_record(
                 &mut control,
                 offset,
                 libc::SCM_RIGHTS,
                 &[received.into_raw_fd()],
-            );
+            )) as _;
         assert!(parse_credentials(&message, &control, true).is_err());
         assert_closed(peer);
     }

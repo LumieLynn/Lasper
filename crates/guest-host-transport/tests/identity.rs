@@ -98,7 +98,7 @@ fn send_packet(fd: RawFd, bytes: &[u8], descriptors: &[RawFd]) {
         let space = unsafe { libc::CMSG_SPACE(count as _) as usize };
         assert!(space <= size_of_val(&control));
         message.msg_control = control.as_mut_ptr().cast();
-        message.msg_controllen = space;
+        message.msg_controllen = space as _;
         // SAFETY: The reserved buffer holds a header and all descriptor slots.
         unsafe {
             let header = libc::CMSG_FIRSTHDR(&message);

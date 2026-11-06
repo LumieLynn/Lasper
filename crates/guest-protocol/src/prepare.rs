@@ -758,13 +758,14 @@ impl PrepareReady {
     /// Descriptor count attached to PrepareReady for this request type.
     pub const fn descriptor_count_for(execution: ExecutionKind) -> u16 {
         match execution {
-            ExecutionKind::Interactive => 2,
-            ExecutionKind::Bounded => 1,
+            ExecutionKind::Interactive => 3,
+            ExecutionKind::Bounded => 2,
         }
     }
 
-    /// Descriptor roles are ordered as PTY master then identity channel for
-    /// interactive requests, and identity channel alone for bounded requests.
+    /// Interactive requests add a PTY master before the identity channel and
+    /// assigned worker pidfd. The guardian must obtain that pidfd while it
+    /// still owns the child, before reaping can release the child's PID.
     pub const fn descriptor_role_for(
         execution: ExecutionKind,
         index: u16,
@@ -773,6 +774,9 @@ impl PrepareReady {
             (ExecutionKind::Interactive, 0) => Some(PrepareReadyDescriptorRole::PtyMaster),
             (ExecutionKind::Interactive, 1) | (ExecutionKind::Bounded, 0) => {
                 Some(PrepareReadyDescriptorRole::IdentityChannel)
+            }
+            (ExecutionKind::Interactive, 2) | (ExecutionKind::Bounded, 1) => {
+                Some(PrepareReadyDescriptorRole::WorkerPidfd)
             }
             _ => None,
         }
@@ -813,6 +817,7 @@ struct WirePrepareReady {
 pub enum PrepareReadyDescriptorRole {
     PtyMaster,
     IdentityChannel,
+    WorkerPidfd,
 }
 
 /// A complete Prepare request frame: its correlation ID, payload, and zero-FD contract.
@@ -898,6 +903,24 @@ impl<'a> PrepareRequestFrame<'a> {
     ) -> Result<PrepareReadyFrame, PrepareFrameError> {
         PrepareReadyFrame::decode_for(self, bytes, received_descriptors)
     }
+
+    /// Validates a response already split into header, payload and owned FDs
+    /// by the control transport, without rebuilding its serialized header.
+    pub fn decode_ready_parts(
+        &self,
+        header: ControlFrameHeader,
+        payload: &[u8],
+        received_descriptors: usize,
+    ) -> Result<PrepareReadyFrame, PrepareFrameError> {
+        validate_prepare_parts(
+            header,
+            payload,
+            received_descriptors,
+            PrepareReady::KIND,
+            PrepareReady::descriptor_count_for(self.request.execution()),
+        )?;
+        PrepareReadyFrame::from_validated_parts(self, header, payload)
+    }
 }
 
 /// A complete `PrepareReady` response paired with the request that defines its FD contract.
@@ -950,13 +973,15 @@ impl PrepareReadyFrame {
         bytes: &[u8],
         received_descriptors: usize,
     ) -> Result<Self, PrepareFrameError> {
-        let expected_descriptors = PrepareReady::descriptor_count_for(request.request.execution());
-        let (header, payload) = decode_prepare_frame(
-            bytes,
-            received_descriptors,
-            PrepareReady::KIND,
-            expected_descriptors,
-        )?;
+        let frame = ControlFrame::decode(bytes).map_err(PrepareFrameError::Frame)?;
+        request.decode_ready_parts(frame.header(), frame.payload(), received_descriptors)
+    }
+
+    fn from_validated_parts(
+        request: &PrepareRequestFrame<'_>,
+        header: ControlFrameHeader,
+        payload: &[u8],
+    ) -> Result<Self, PrepareFrameError> {
         if header.request_id() != request.request_id {
             return Err(PrepareFrameError::MismatchedRequestId {
                 expected: request.request_id,
@@ -1032,6 +1057,23 @@ fn decode_prepare_frame(
 ) -> Result<(ControlFrameHeader, &[u8]), PrepareFrameError> {
     let frame = ControlFrame::decode(bytes).map_err(PrepareFrameError::Frame)?;
     let header = frame.header();
+    validate_prepare_parts(
+        header,
+        frame.payload(),
+        received_descriptors,
+        expected_kind,
+        expected_descriptors,
+    )?;
+    Ok((header, frame.payload()))
+}
+
+fn validate_prepare_parts(
+    header: ControlFrameHeader,
+    payload: &[u8],
+    received_descriptors: usize,
+    expected_kind: MessageKind,
+    expected_descriptors: u16,
+) -> Result<(), PrepareFrameError> {
     if header.kind() != expected_kind {
         return Err(PrepareFrameError::UnexpectedMessageKind {
             expected: expected_kind,
@@ -1045,9 +1087,9 @@ fn decode_prepare_frame(
         });
     }
     header
-        .validate_shape(frame.payload().len(), received_descriptors)
+        .validate_shape(payload.len(), received_descriptors)
         .map_err(PrepareFrameError::Frame)?;
-    Ok((header, frame.payload()))
+    Ok(())
 }
 
 fn bounded_string<const N: usize>(value: &str) -> Result<String<N>, PayloadCodecError> {
@@ -1186,7 +1228,7 @@ mod tests {
         let challenge = ready_frame.identity_challenge([0x7c; crate::IDENTITY_CHALLENGE_BYTES]);
         assert_eq!(challenge.preparation_id(), ready.preparation_id());
         assert_eq!(challenge.nonce(), &[0x7c; crate::IDENTITY_CHALLENGE_BYTES]);
-        assert_eq!(ready_frame.descriptor_count(), 2);
+        assert_eq!(ready_frame.descriptor_count(), 3);
         assert_eq!(
             ready_frame.descriptor_role(0),
             Some(PrepareReadyDescriptorRole::PtyMaster)
@@ -1195,7 +1237,11 @@ mod tests {
             ready_frame.descriptor_role(1),
             Some(PrepareReadyDescriptorRole::IdentityChannel)
         );
-        assert_eq!(ready_frame.descriptor_role(2), None);
+        assert_eq!(
+            ready_frame.descriptor_role(2),
+            Some(PrepareReadyDescriptorRole::WorkerPidfd)
+        );
+        assert_eq!(ready_frame.descriptor_role(3), None);
 
         let mut ready_bytes = [0; 256];
         let ready_length = ready_frame.encode_into(&mut ready_bytes).unwrap();
@@ -1204,10 +1250,10 @@ mod tests {
             .header();
         assert_eq!(ready_header.kind(), MessageKind::PrepareReady);
         assert_eq!(ready_header.request_id(), 41);
-        assert_eq!(ready_header.descriptor_count(), 2);
+        assert_eq!(ready_header.descriptor_count(), 3);
 
         let decoded_ready = decoded_request
-            .decode_ready(&ready_bytes[..ready_length], 2)
+            .decode_ready(&ready_bytes[..ready_length], 3)
             .unwrap();
         assert_eq!(decoded_ready.request_id(), 41);
         assert_eq!(decoded_ready.response(), ready);
@@ -1215,7 +1261,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_prepare_frame_carries_only_the_identity_descriptor() {
+    fn bounded_prepare_frame_carries_identity_channel_and_assigned_worker() {
         let request = PrepareRequest::new(
             "root",
             ExecutionKind::Bounded,
@@ -1239,17 +1285,21 @@ mod tests {
         )
         .unwrap();
         let ready_frame = decoded_request.ready_frame(ready).unwrap();
-        assert_eq!(ready_frame.descriptor_count(), 1);
+        assert_eq!(ready_frame.descriptor_count(), 2);
         assert_eq!(
             ready_frame.descriptor_role(0),
             Some(PrepareReadyDescriptorRole::IdentityChannel)
         );
-        assert_eq!(ready_frame.descriptor_role(1), None);
+        assert_eq!(
+            ready_frame.descriptor_role(1),
+            Some(PrepareReadyDescriptorRole::WorkerPidfd)
+        );
+        assert_eq!(ready_frame.descriptor_role(2), None);
 
         let mut ready_bytes = [0; 256];
         let ready_length = ready_frame.encode_into(&mut ready_bytes).unwrap();
         let decoded_ready = decoded_request
-            .decode_ready(&ready_bytes[..ready_length], 1)
+            .decode_ready(&ready_bytes[..ready_length], 2)
             .unwrap();
         assert_eq!(decoded_ready.response(), ready);
     }
@@ -1273,7 +1323,7 @@ mod tests {
             .encode_into(&mut bytes)
             .unwrap();
         assert_eq!(
-            request.decode_ready(&bytes[..other_length], 2),
+            request.decode_ready(&bytes[..other_length], 3),
             Err(PrepareFrameError::MismatchedRequestId {
                 expected: 101,
                 actual: 102,
@@ -1289,7 +1339,7 @@ mod tests {
             request.decode_ready(&bytes[..valid_length], 1),
             Err(PrepareFrameError::Frame(
                 ControlFrameError::DescriptorCountMismatch {
-                    declared: 2,
+                    declared: 3,
                     actual: 1,
                 }
             ))
@@ -1310,7 +1360,7 @@ mod tests {
         assert_eq!(
             request.decode_ready(&wrong_contract[..wrong_length], 1),
             Err(PrepareFrameError::UnexpectedDescriptorCount {
-                expected: 2,
+                expected: 3,
                 actual: 1,
             })
         );
@@ -1346,7 +1396,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            request.decode_ready(&bytes[..length], 2),
+            request.decode_ready(&bytes[..length], 3),
             Err(PrepareFrameError::MismatchedBrokerId {
                 expected: expected_broker,
                 actual: other_broker,
@@ -1434,11 +1484,11 @@ mod tests {
         assert_eq!(decoded.remaining_lease_ms(), MAX_PREPARED_LEASE_MS);
         assert_eq!(
             PrepareReady::descriptor_count_for(ExecutionKind::Interactive),
-            2
+            3
         );
         assert_eq!(
             PrepareReady::descriptor_count_for(ExecutionKind::Bounded),
-            1
+            2
         );
     }
 

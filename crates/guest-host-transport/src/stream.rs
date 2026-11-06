@@ -328,7 +328,7 @@ fn recvmsg_once(stream: &UnixStream, bytes: &mut [u8]) -> io::Result<(usize, Vec
     message.msg_iovlen = 1;
     message.msg_control = control.0.as_mut_ptr().cast();
     message.msg_controllen =
-        unsafe { libc::CMSG_SPACE((MAX_RECEIVED_DESCRIPTORS * size_of::<RawFd>()) as _) as usize };
+        unsafe { libc::CMSG_SPACE((MAX_RECEIVED_DESCRIPTORS * size_of::<RawFd>()) as _) as _ };
 
     // The byte and control buffers stay live for the call and bound every write.
     let received =
@@ -345,9 +345,10 @@ fn decode_ancillary(
     message: &mut libc::msghdr,
     control: &AncillaryBuffer,
 ) -> io::Result<Vec<OwnedFd>> {
-    let control_overflow = message.msg_controllen > size_of::<AncillaryBuffer>();
+    let control_bytes: usize = message.msg_controllen as _;
+    let control_overflow = control_bytes > size_of::<AncillaryBuffer>();
     if control_overflow {
-        message.msg_controllen = size_of::<AncillaryBuffer>();
+        message.msg_controllen = size_of::<AncillaryBuffer>() as _;
     }
     let (descriptors, unexpected_control) = collect_descriptors(message, control)?;
     if control_overflow || message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
@@ -374,7 +375,8 @@ fn collect_descriptors(
     let mut unexpected_control = false;
     let mut rights_seen = false;
     let control_start = control.0.as_ptr() as usize;
-    let control_end = control_start.saturating_add(message.msg_controllen);
+    let control_bytes: usize = message.msg_controllen as _;
+    let control_end = control_start.saturating_add(control_bytes);
     // `msg_control` points at `control`, and its returned length fits the allocation.
     let mut header = unsafe { libc::CMSG_FIRSTHDR(message) };
 
@@ -492,7 +494,7 @@ fn sendmsg_raw(
     // `sendmsg` is filled below before the syscall.
     let mut message: libc::msghdr = unsafe { zeroed() };
     message.msg_iov = iov.as_mut_ptr();
-    message.msg_iovlen = iov.len();
+    message.msg_iovlen = iov.len() as _;
 
     if !descriptors.is_empty() {
         let data_bytes = std::mem::size_of_val(descriptors);
@@ -503,7 +505,7 @@ fn sendmsg_raw(
             ));
         }
         message.msg_control = control.0.as_mut_ptr().cast();
-        message.msg_controllen = control_bytes;
+        message.msg_controllen = control_bytes as _;
         // The control buffer is aligned and large enough for the requested record.
         let ancillary = unsafe { libc::CMSG_FIRSTHDR(&message) };
         if ancillary.is_null() {
@@ -690,7 +692,7 @@ mod tests {
         let mut message: libc::msghdr = unsafe { zeroed() };
         let data_bytes = std::mem::size_of_val(descriptors);
         message.msg_control = control.0.as_mut_ptr().cast();
-        message.msg_controllen = unsafe { libc::CMSG_SPACE(data_bytes as _) } as usize;
+        message.msg_controllen = unsafe { libc::CMSG_SPACE(data_bytes as _) } as _;
         // The test buffer is aligned and sized for the supplied descriptors.
         let header = unsafe { libc::CMSG_FIRSTHDR(&message) };
         assert!(!header.is_null());
@@ -759,7 +761,7 @@ mod tests {
         let fd = received.into_raw_fd();
         let mut control = AncillaryBuffer([0; 16]);
         let mut message = rights_message(&mut control, &[fd]);
-        message.msg_controllen = size_of::<AncillaryBuffer>() + 1;
+        message.msg_controllen = (size_of::<AncillaryBuffer>() + 1) as _;
 
         let error = decode_ancillary(&mut message, &control).unwrap_err();
 

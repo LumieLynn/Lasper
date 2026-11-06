@@ -7,7 +7,9 @@ compile_error!("the Lasper guest runtime is Linux-only");
 use lasper_guest_protocol::{Architecture, RuntimeIdentity};
 
 pub mod identity;
+pub mod readiness;
 mod socket;
+mod syscall;
 pub mod transport;
 
 #[cfg(target_arch = "x86_64")]

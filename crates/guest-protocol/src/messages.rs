@@ -554,7 +554,7 @@ mod tests {
         let length = request.encode_payload(&mut payload).unwrap();
         assert_eq!(
             &payload[..length],
-            br#"{"required_features":5,"limits":{"max_control_frame_bytes":1048576,"max_descriptors":2}}"#
+            br#"{"required_features":5,"limits":{"max_control_frame_bytes":1048576,"max_descriptors":3}}"#
         );
         let decoded = HelloRequest::decode_payload(&payload[..length]).unwrap();
 
@@ -635,7 +635,7 @@ mod tests {
     #[test]
     fn control_limits_are_validated_after_deserialization() {
         let too_large = br#"{"required_features":0,"limits":{"max_control_frame_bytes":1048577,"max_descriptors":2}}"#;
-        let too_many_fds = br#"{"required_features":0,"limits":{"max_control_frame_bytes":1048576,"max_descriptors":3}}"#;
+        let too_many_fds = br#"{"required_features":0,"limits":{"max_control_frame_bytes":1048576,"max_descriptors":4}}"#;
         let too_small = br#"{"required_features":0,"limits":{"max_control_frame_bytes":31,"max_descriptors":0}}"#;
 
         for payload in [&too_large[..], &too_many_fds[..], &too_small[..]] {
