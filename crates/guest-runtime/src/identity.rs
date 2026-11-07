@@ -58,6 +58,10 @@ impl GuestIdentityChannel {
         !self.poisoned
     }
 
+    pub(crate) const fn as_raw_fd(&self) -> i32 {
+        self.fd
+    }
+
     /// A buffer too small for the received packet discards that packet and
     /// invalidates the channel; seqpacket has no unread tail to recover.
     pub fn receive_challenge(

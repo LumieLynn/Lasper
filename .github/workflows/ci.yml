@@ -28,7 +28,7 @@ jobs:
       - run: cargo clippy --all-targets --all-features --locked -- -D warnings
       - run: cargo clippy -p lasper-guest-host-transport --all-targets --locked -- -D warnings
       - run: cargo clippy -p lasper-guest-protocol --all-targets --locked -- -D warnings
-      - run: cargo clippy -p lasper-guest-runtime --lib --locked -- -D warnings
+      - run: cargo clippy -p lasper-guest-runtime --all-targets --locked -- -D warnings
 
   test:
     name: test
@@ -40,7 +40,7 @@ jobs:
       - run: cargo test --all-targets --locked
       - run: cargo test -p lasper-guest-host-transport --all-targets --locked
       - run: cargo test -p lasper-guest-protocol --all-targets --locked
-      - run: cargo test -p lasper-guest-runtime --lib --locked
+      - run: cargo test -p lasper-guest-runtime --all-targets --locked
 
   guest-runtime:
     name: guest runtime (${{ matrix.target }})
@@ -65,7 +65,7 @@ jobs:
 
       - name: Exercise guest transport on runner architecture
         run: |
-          cargo test -p lasper-guest-runtime --lib --locked
+          cargo test -p lasper-guest-runtime --all-targets --locked
           cargo test -p lasper-guest-host-transport --lib --test interop --test identity --test preparation --locked
 
       - name: Verify worker identity across user namespaces

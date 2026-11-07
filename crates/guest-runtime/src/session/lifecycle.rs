@@ -3,8 +3,11 @@ use lasper_guest_protocol::{
     StartRequest, MAX_PREPARED_LEASE_MS,
 };
 
+const WORKER_SETUP_TIMEOUT_MS: u64 = 5_000;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionPhase {
+    Preparing,
     Prepared,
     Starting,
     Running,
@@ -15,15 +18,21 @@ pub enum SessionPhase {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CleanupReason {
+    PreparationExpired,
+    WorkerPreparationFailed,
+    WorkerObservationFailed,
     Cancelled,
     LeaseExpired,
     ClientClosed,
+    BrokerExited,
     WorkerExitedBeforeStart,
     WorkerExited,
     ExecFailed { errno: i32 },
     StartOutcomeUnknown,
 }
 
+/// Exec evidence is separate from worker termination. `Unknown` does not
+/// invalidate an exit code or signal obtained from wait.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ExecOutcome {
     Started,
@@ -32,7 +41,14 @@ pub enum ExecOutcome {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionConnection {
+    Client,
+    Broker,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionAction {
+    Prepared { deadline_ms: u64 },
     LeaseRenewed { deadline_ms: u64 },
     Recheck,
     StartAccepted,
@@ -54,6 +70,7 @@ pub enum SessionLifecycleError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum State {
+    Preparing,
     Prepared,
     Starting,
     Running,
@@ -69,6 +86,7 @@ pub struct SessionLifecycle {
     broker_id: BrokerId,
     preparation_id: PreparationId,
     deadline_ms: u64,
+    lease_ms: u32,
     state: State,
 }
 
@@ -89,12 +107,14 @@ impl SessionLifecycle {
             broker_id,
             preparation_id,
             deadline_ms,
+            lease_ms,
             state: State::Prepared,
         })
     }
 
     pub const fn phase(&self) -> SessionPhase {
         match self.state {
+            State::Preparing => SessionPhase::Preparing,
             State::Prepared => SessionPhase::Prepared,
             State::Starting => SessionPhase::Starting,
             State::Running => SessionPhase::Running,
@@ -104,6 +124,46 @@ impl SessionLifecycle {
         }
     }
 
+    pub const fn cleanup_reason(&self) -> Option<CleanupReason> {
+        match self.state {
+            State::Closing(reason) | State::CleanupPending(reason) | State::Closed(reason) => {
+                Some(reason)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn preparing(
+        broker_id: BrokerId,
+        preparation_id: PreparationId,
+        now_ms: u64,
+        lease_ms: u32,
+    ) -> Result<Self, SessionLifecycleError> {
+        let mut lifecycle = Self::new(broker_id, preparation_id, now_ms, lease_ms)?;
+        lifecycle.deadline_ms = now_ms
+            .checked_add(WORKER_SETUP_TIMEOUT_MS)
+            .ok_or(SessionLifecycleError::ClockOverflow)?;
+        lifecycle.state = State::Preparing;
+        Ok(lifecycle)
+    }
+
+    pub fn worker_prepared(&mut self, now_ms: u64) -> Result<SessionAction, SessionLifecycleError> {
+        if let Some(action) = self.tick(now_ms) {
+            return Ok(action);
+        }
+        if self.state != State::Preparing {
+            return Err(SessionLifecycleError::InvalidTransition {
+                phase: self.phase(),
+            });
+        }
+        let deadline_ms = now_ms
+            .checked_add(u64::from(self.lease_ms))
+            .ok_or(SessionLifecycleError::ClockOverflow)?;
+        self.deadline_ms = deadline_ms;
+        self.state = State::Prepared;
+        Ok(SessionAction::Prepared { deadline_ms })
+    }
+
     pub const fn deadline_ms(&self) -> u64 {
         self.deadline_ms
     }
@@ -111,10 +171,14 @@ impl SessionLifecycle {
     /// Expires only an unstarted preparation. Once Start wins, the lease no
     /// longer controls the lifetime of the running guest process.
     pub fn tick(&mut self, now_ms: u64) -> Option<SessionAction> {
-        if self.state == State::Prepared && now_ms >= self.deadline_ms {
-            Some(self.begin_cleanup(CleanupReason::LeaseExpired))
-        } else {
-            None
+        match self.state {
+            State::Preparing if now_ms >= self.deadline_ms => {
+                Some(self.begin_cleanup(CleanupReason::PreparationExpired))
+            }
+            State::Prepared if now_ms >= self.deadline_ms => {
+                Some(self.begin_cleanup(CleanupReason::LeaseExpired))
+            }
+            _ => None,
         }
     }
 
@@ -165,12 +229,13 @@ impl SessionLifecycle {
                 Ok(SessionAction::LeaseRenewed { deadline_ms })
             }
             (State::Prepared, PreparationControlKind::Recheck) => Ok(SessionAction::Recheck),
-            (State::Prepared, PreparationControlKind::Cancel) => {
+            (State::Preparing | State::Prepared, PreparationControlKind::Cancel) => {
                 Ok(self.begin_cleanup(CleanupReason::Cancelled))
             }
-            (State::Prepared | State::Starting | State::Running, PreparationControlKind::Close) => {
-                Ok(self.begin_cleanup(CleanupReason::ClientClosed))
-            }
+            (
+                State::Preparing | State::Prepared | State::Starting | State::Running,
+                PreparationControlKind::Close,
+            ) => Ok(self.begin_cleanup(CleanupReason::ClientClosed)),
             (
                 State::Closing(_) | State::CleanupPending(_) | State::Closed(_),
                 PreparationControlKind::Cancel | PreparationControlKind::Close,
@@ -209,9 +274,32 @@ impl SessionLifecycle {
 
     pub fn worker_exited(&mut self) -> SessionAction {
         match self.state {
-            State::Prepared => self.begin_cleanup(CleanupReason::WorkerExitedBeforeStart),
+            State::Preparing | State::Prepared => {
+                self.begin_cleanup(CleanupReason::WorkerExitedBeforeStart)
+            }
+            State::Starting | State::Running => self.begin_cleanup(CleanupReason::WorkerExited),
+            State::Closing(_) | State::CleanupPending(_) | State::Closed(_) => SessionAction::Noop,
+        }
+    }
+
+    pub fn worker_failed(&mut self) -> SessionAction {
+        match self.state {
+            State::Preparing | State::Prepared => {
+                self.begin_cleanup(CleanupReason::WorkerPreparationFailed)
+            }
             State::Starting => self.begin_cleanup(CleanupReason::StartOutcomeUnknown),
-            State::Running => self.begin_cleanup(CleanupReason::WorkerExited),
+            State::Running => self.begin_cleanup(CleanupReason::WorkerObservationFailed),
+            State::Closing(_) | State::CleanupPending(_) | State::Closed(_) => SessionAction::Noop,
+        }
+    }
+
+    pub fn connection_closed(&mut self, connection: SessionConnection) -> SessionAction {
+        match self.state {
+            State::Preparing | State::Prepared | State::Starting | State::Running => self
+                .begin_cleanup(match connection {
+                    SessionConnection::Broker => CleanupReason::BrokerExited,
+                    SessionConnection::Client => CleanupReason::ClientClosed,
+                }),
             State::Closing(_) | State::CleanupPending(_) | State::Closed(_) => SessionAction::Noop,
         }
     }
@@ -287,6 +375,10 @@ impl PreparedSession {
         self.lifecycle.phase()
     }
 
+    pub const fn cleanup_reason(&self) -> Option<CleanupReason> {
+        self.lifecycle.cleanup_reason()
+    }
+
     pub const fn deadline_ms(&self) -> u64 {
         self.lifecycle.deadline_ms()
     }
@@ -332,6 +424,18 @@ impl PreparedSession {
         self.lifecycle.worker_exited()
     }
 
+    pub fn worker_prepared(&mut self, now_ms: u64) -> Result<SessionAction, SessionLifecycleError> {
+        self.lifecycle.worker_prepared(now_ms)
+    }
+
+    pub fn worker_failed(&mut self) -> SessionAction {
+        self.lifecycle.worker_failed()
+    }
+
+    pub fn connection_closed(&mut self, connection: SessionConnection) -> SessionAction {
+        self.lifecycle.connection_closed(connection)
+    }
+
     pub fn cleanup_result(
         &mut self,
         complete: bool,
@@ -373,6 +477,59 @@ mod tests {
 
     fn lifecycle() -> SessionLifecycle {
         SessionLifecycle::new(BROKER, PREPARATION, 100, 10_000).unwrap()
+    }
+
+    #[test]
+    fn setup_deadline_is_separate_from_the_prepared_lease() {
+        let mut session = SessionLifecycle::preparing(BROKER, PREPARATION, 100, 30_000).unwrap();
+        assert_eq!(session.phase(), SessionPhase::Preparing);
+        assert_eq!(session.deadline_ms(), 5_100);
+        assert_eq!(
+            session.control(101, control(PreparationControlKind::KeepPrepared)),
+            Err(SessionLifecycleError::InvalidTransition {
+                phase: SessionPhase::Preparing
+            })
+        );
+        assert_eq!(
+            session.worker_prepared(5_099),
+            Ok(SessionAction::Prepared {
+                deadline_ms: 35_099
+            })
+        );
+        assert_eq!(session.phase(), SessionPhase::Prepared);
+
+        let mut expired = SessionLifecycle::preparing(BROKER, PREPARATION, 100, 30_000).unwrap();
+        assert_eq!(
+            expired.worker_prepared(5_100),
+            Ok(SessionAction::BeginCleanup(
+                CleanupReason::PreparationExpired
+            ))
+        );
+        assert_eq!(expired.phase(), SessionPhase::Closing);
+    }
+
+    #[test]
+    fn client_and_broker_loss_cancel_both_preparing_and_running_workers() {
+        for connection in [SessionConnection::Client, SessionConnection::Broker] {
+            let reason = match connection {
+                SessionConnection::Client => CleanupReason::ClientClosed,
+                SessionConnection::Broker => CleanupReason::BrokerExited,
+            };
+            let mut preparing =
+                SessionLifecycle::preparing(BROKER, PREPARATION, 100, 30_000).unwrap();
+            assert_eq!(
+                preparing.connection_closed(connection),
+                SessionAction::BeginCleanup(reason)
+            );
+            assert_eq!(preparing.connection_closed(connection), SessionAction::Noop);
+            let mut running = lifecycle();
+            running.accept_start(101, &start_frame()).unwrap();
+            running.exec_outcome(ExecOutcome::Started).unwrap();
+            assert_eq!(
+                running.connection_closed(connection),
+                SessionAction::BeginCleanup(reason)
+            );
+        }
     }
 
     fn start_frame() -> StartFrame {
@@ -486,6 +643,24 @@ mod tests {
             Ok(SessionAction::BeginCleanup(
                 CleanupReason::StartOutcomeUnknown
             )),
+        );
+    }
+
+    #[test]
+    fn worker_exit_does_not_require_a_running_observation() {
+        let mut session = lifecycle();
+        session.accept_start(101, &start_frame()).unwrap();
+        assert_eq!(
+            session.worker_exited(),
+            SessionAction::BeginCleanup(CleanupReason::WorkerExited)
+        );
+        assert_eq!(
+            session.exec_outcome(ExecOutcome::Unknown),
+            Ok(SessionAction::Noop)
+        );
+        assert_eq!(
+            session.cleanup_result(true),
+            Ok(SessionAction::Closed(CleanupReason::WorkerExited))
         );
     }
 
