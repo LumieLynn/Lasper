@@ -8,6 +8,7 @@ use lasper_guest_protocol::{Architecture, RuntimeIdentity};
 
 pub mod identity;
 pub mod readiness;
+pub mod session;
 mod socket;
 mod syscall;
 pub mod transport;

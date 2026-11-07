@@ -1117,7 +1117,7 @@ fn validate_user_name(value: &str) -> Result<(), PayloadCodecError> {
     Ok(())
 }
 
-fn validate_absolute_path(value: &str) -> Result<(), PayloadCodecError> {
+pub(crate) fn validate_absolute_path(value: &str) -> Result<(), PayloadCodecError> {
     if !value.starts_with('/')
         || value.is_empty()
         || value.chars().any(char::is_control)
