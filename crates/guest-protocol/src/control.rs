@@ -190,6 +190,14 @@ impl ControlFrameHeader {
             Ok(()) => {}
             Err(error) => return Err(error),
         }
+        self.validate_descriptor_count(descriptor_count)
+    }
+
+    /// Check attached FDs before allocating payload storage.
+    pub const fn validate_descriptor_count(
+        self,
+        descriptor_count: usize,
+    ) -> Result<(), ControlFrameError> {
         if descriptor_count != self.descriptor_count as usize {
             return Err(ControlFrameError::DescriptorCountMismatch {
                 declared: self.descriptor_count,

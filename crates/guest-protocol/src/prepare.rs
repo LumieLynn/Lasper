@@ -871,8 +871,38 @@ impl<'a> PrepareRequestFrame<'a> {
         received_descriptors: usize,
         broker_id: crate::BrokerId,
     ) -> Result<Self, PrepareFrameError> {
-        let (header, payload) =
-            decode_prepare_frame(bytes, received_descriptors, PrepareRequest::KIND, 0)?;
+        let frame = ControlFrame::decode(bytes).map_err(PrepareFrameError::Frame)?;
+        Self::decode_parts(
+            frame.header(),
+            frame.payload(),
+            received_descriptors,
+            broker_id,
+        )
+    }
+
+    /// Checks the envelope before allocating payload storage. The completed
+    /// payload must still pass `decode_parts`.
+    pub fn validate_header(
+        header: ControlFrameHeader,
+        received_descriptors: usize,
+    ) -> Result<(), PrepareFrameError> {
+        validate_prepare_header(header, received_descriptors, PrepareRequest::KIND, 0)
+    }
+
+    /// Decodes a request whose header and payload have separate storage.
+    pub fn decode_parts(
+        header: ControlFrameHeader,
+        payload: &'a [u8],
+        received_descriptors: usize,
+        broker_id: crate::BrokerId,
+    ) -> Result<Self, PrepareFrameError> {
+        validate_prepare_parts(
+            header,
+            payload,
+            received_descriptors,
+            PrepareRequest::KIND,
+            0,
+        )?;
         let request =
             PrepareRequest::decode_payload(payload).map_err(PrepareFrameError::Payload)?;
         Ok(Self::new(header.request_id(), broker_id, request))
@@ -1049,27 +1079,26 @@ fn encode_prepare_frame<T: Serialize + ?Sized>(
     Ok(CONTROL_FRAME_HEADER_BYTES + payload_bytes)
 }
 
-fn decode_prepare_frame(
-    bytes: &[u8],
+fn validate_prepare_parts(
+    header: ControlFrameHeader,
+    payload: &[u8],
     received_descriptors: usize,
     expected_kind: MessageKind,
     expected_descriptors: u16,
-) -> Result<(ControlFrameHeader, &[u8]), PrepareFrameError> {
-    let frame = ControlFrame::decode(bytes).map_err(PrepareFrameError::Frame)?;
-    let header = frame.header();
-    validate_prepare_parts(
+) -> Result<(), PrepareFrameError> {
+    validate_prepare_header(
         header,
-        frame.payload(),
         received_descriptors,
         expected_kind,
         expected_descriptors,
     )?;
-    Ok((header, frame.payload()))
+    header
+        .validate_payload_length(payload.len())
+        .map_err(PrepareFrameError::Frame)
 }
 
-fn validate_prepare_parts(
+fn validate_prepare_header(
     header: ControlFrameHeader,
-    payload: &[u8],
     received_descriptors: usize,
     expected_kind: MessageKind,
     expected_descriptors: u16,
@@ -1087,7 +1116,7 @@ fn validate_prepare_parts(
         });
     }
     header
-        .validate_shape(payload.len(), received_descriptors)
+        .validate_descriptor_count(received_descriptors)
         .map_err(PrepareFrameError::Frame)?;
     Ok(())
 }
