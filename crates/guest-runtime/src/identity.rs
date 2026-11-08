@@ -211,7 +211,7 @@ fn discard_ancillary(
     let length = message.control_length.min(size_of::<AncillaryBuffer>());
     let header_bytes = cmsg_align(size_of::<ControlMessageHeader>());
     let mut offset = 0;
-    while length.saturating_sub(offset) >= size_of::<ControlMessageHeader>() {
+    while length.saturating_sub(offset) >= header_bytes {
         // offset is inside the returned range and covers a complete header.
         let header = unsafe {
             control
@@ -222,13 +222,17 @@ fn discard_ancillary(
                 .cast::<ControlMessageHeader>()
                 .read_unaligned()
         };
-        if header.length < header_bytes || header.length > length - offset {
-            return Err(IdentityTransportError::Truncated);
-        }
+        let data_bytes = header
+            .length
+            .checked_sub(header_bytes)
+            .ok_or(IdentityTransportError::Truncated)?;
+        let available_bytes = length - offset - header_bytes;
+        let truncated = data_bytes > available_bytes;
         if header.level == SOL_SOCKET && matches!(header.kind, SCM_RIGHTS | SCM_PIDFD) {
-            let data_bytes = header.length - header_bytes;
-            for index in 0..data_bytes / size_of::<i32>() {
-                // Each complete FD slot fits the checked ancillary record.
+            // Rejected identity packets still own any delivered FD slots,
+            // including the complete prefix of a truncated record.
+            for index in 0..data_bytes.min(available_bytes) / size_of::<i32>() {
+                // SAFETY: This complete slot fits both the record and the buffer.
                 let fd = unsafe {
                     control
                         .0
@@ -242,6 +246,9 @@ fn discard_ancillary(
                     let _ = close(fd);
                 }
             }
+        }
+        if truncated {
+            return Err(IdentityTransportError::Truncated);
         }
         offset += cmsg_align(header.length);
     }
@@ -351,3 +358,7 @@ mod tests {
         assert_eq!(peer.read(&mut [0]).unwrap(), 0);
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/identity/ancillary.rs"]
+mod ancillary_tests;

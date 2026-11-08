@@ -326,7 +326,7 @@ fn parse_credentials(
     let mut pidfd = None;
     let mut pidfd_seen = false;
     let mut unexpected = false;
-    while length.saturating_sub(offset) >= size_of::<libc::cmsghdr>() {
+    while length.saturating_sub(offset) >= header_bytes {
         // SAFETY: This complete header lies in the returned control range.
         let header = unsafe {
             control
@@ -338,16 +338,16 @@ fn parse_credentials(
                 .read_unaligned()
         };
         let record_bytes: usize = header.cmsg_len as _;
-        if record_bytes < header_bytes || record_bytes > length - offset {
-            return Err(invalid_data(
-                "identity ancillary record exceeded its buffer",
-            ));
-        }
-        // SAFETY: The checked record covers its complete payload.
+        let declared_bytes = record_bytes
+            .checked_sub(header_bytes)
+            .ok_or_else(|| invalid_data("malformed identity ancillary header"))?;
+        let available_bytes = length - offset - header_bytes;
+        let truncated = declared_bytes > available_bytes;
+        let data_bytes = declared_bytes.min(available_bytes);
+        // SAFETY: The complete header fits; payload reads are bounded below.
         let data = unsafe { control.0.as_ptr().cast::<u8>().add(offset + header_bytes) };
-        let data_bytes = record_bytes - header_bytes;
         if header.cmsg_level == libc::SOL_SOCKET && header.cmsg_type == libc::SCM_CREDENTIALS {
-            if credentials.is_some() || data_bytes != size_of::<libc::ucred>() {
+            if truncated || credentials.is_some() || data_bytes != size_of::<libc::ucred>() {
                 unexpected = true;
             } else {
                 // SAFETY: SCM_CREDENTIALS has exactly one complete ucred above.
@@ -363,8 +363,11 @@ fn parse_credentials(
             && matches!(header.cmsg_type, libc::SCM_RIGHTS | SCM_PIDFD)
         {
             let sender_pidfd = header.cmsg_type == SCM_PIDFD;
-            let valid_pidfd =
-                sender_pidfd && !pidfd_seen && data_bytes == size_of::<RawFd>() && pass_pidfd;
+            let valid_pidfd = !truncated
+                && sender_pidfd
+                && !pidfd_seen
+                && data_bytes == size_of::<RawFd>()
+                && pass_pidfd;
             pidfd_seen |= sender_pidfd;
             unexpected |= !valid_pidfd;
             for index in 0..data_bytes / size_of::<RawFd>() {
@@ -388,6 +391,11 @@ fn parse_credentials(
             }
         } else {
             unexpected = true;
+        }
+        if truncated {
+            return Err(invalid_data(
+                "identity ancillary record exceeded its buffer",
+            ));
         }
         offset += (record_bytes + alignment - 1) & !(alignment - 1);
     }
@@ -596,3 +604,7 @@ mod tests {
         assert_closed(peer);
     }
 }
+
+#[cfg(test)]
+#[path = "../../tests/identity/ancillary.rs"]
+mod ancillary_tests;

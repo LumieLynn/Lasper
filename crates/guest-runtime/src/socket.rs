@@ -5,6 +5,7 @@ use core::mem::size_of;
 pub(crate) const EINTR: isize = 4;
 pub(crate) const MSG_CTRUNC: u32 = 8;
 pub(crate) const MSG_TRUNC: u32 = 32;
+pub(crate) const MSG_DONTWAIT: usize = 0x40;
 pub(crate) const MSG_NOSIGNAL: usize = 0x4000;
 pub(crate) const MSG_CMSG_CLOEXEC: usize = 0x4000_0000;
 pub(crate) const SCM_RIGHTS: i32 = 1;
@@ -81,6 +82,16 @@ pub(crate) fn close(fd: i32) -> isize {
     unsafe { syscall1(SYS_CLOSE, fd as usize) }
 }
 
+pub(crate) fn duplicate_cloexec(fd: i32) -> Result<i32, i32> {
+    const F_DUPFD_CLOEXEC: usize = 1030;
+    let result = unsafe { syscall3(SYS_FCNTL, fd as usize, F_DUPFD_CLOEXEC, 3) };
+    if result < 0 {
+        Err((-result) as i32)
+    } else {
+        Ok(result as i32)
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 const SYS_CLOSE: usize = 3;
 #[cfg(target_arch = "x86_64")]
@@ -89,6 +100,8 @@ const SYS_SENDMSG: usize = 46;
 const SYS_RECVMSG: usize = 47;
 #[cfg(target_arch = "x86_64")]
 const SYS_SHUTDOWN: usize = 48;
+#[cfg(target_arch = "x86_64")]
+const SYS_FCNTL: usize = 72;
 
 #[cfg(target_arch = "aarch64")]
 const SYS_CLOSE: usize = 57;
@@ -98,3 +111,5 @@ const SYS_SHUTDOWN: usize = 210;
 const SYS_SENDMSG: usize = 211;
 #[cfg(target_arch = "aarch64")]
 const SYS_RECVMSG: usize = 212;
+#[cfg(target_arch = "aarch64")]
+const SYS_FCNTL: usize = 25;

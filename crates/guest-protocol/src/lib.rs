@@ -37,8 +37,11 @@ pub use prepare::{
     MAX_PROJECTION_PATH_BYTES,
 };
 pub use session::{
-    PreparationControl, PreparationControlFrame, PreparationControlKind, SessionFrameError,
-    SessionPayloadError, StartAcceptedFrame, StartFrame, StartRequest,
+    CapturedOutput, CleanupStatus, ControlReplyFrame, ControlReplyStatus, ErrorFrame,
+    ExecutionStatus, ExitFrame, ExitReason, ExitReport, ExitStatus, GuestErrorCode, GuestOperation,
+    OutputStream, PreparationControl, PreparationControlFrame, PreparationControlKind,
+    SessionFrameError, SessionPayloadError, StartAcceptedFrame, StartFrame, StartRequest,
+    MAX_CAPTURED_OUTPUT_BYTES, MIN_HELPER_CONTROL_FRAME_BYTES,
 };
 
 pub const PROTOCOL_MAJOR: u16 = 1;

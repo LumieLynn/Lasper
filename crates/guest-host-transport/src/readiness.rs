@@ -2,6 +2,7 @@ use crate::process::ProcessHandle;
 use lasper_guest_protocol::{
     BrokerId, ControlLimits, EnforcedControlLimits, FeatureSet, HelloNegotiationError,
     HelloRequest, HelloResponse, PrepareReady, PrepareRequest, PrepareRequestFrame,
+    MIN_HELPER_CONTROL_FRAME_BYTES,
 };
 use std::fmt;
 use std::io;
@@ -15,6 +16,7 @@ pub struct WorkerHello {
 
 impl WorkerHello {
     pub fn new(limits: ControlLimits) -> Result<Self, WorkerReadinessError> {
+        require_frame_capacity(limits.max_control_frame_bytes())?;
         // SAFETY: This opens a handle to the calling process, which remains
         // live throughout the local readiness check.
         let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, std::process::id(), 0) };
@@ -45,6 +47,7 @@ impl WorkerHello {
             .request
             .negotiate(protocol_major, response)
             .map_err(WorkerReadinessError::Negotiation)?;
+        require_frame_capacity(limits.get().max_control_frame_bytes())?;
         Ok(WorkerReadiness {
             broker: response.broker_id(),
             limits,
@@ -91,6 +94,7 @@ pub enum WorkerReadinessError {
     HostInspectionUnavailable(io::Error),
     Negotiation(HelloNegotiationError),
     DescriptorLimit { required: u16, available: u16 },
+    FrameLimit { available: u32 },
 }
 
 impl fmt::Display for WorkerReadinessError {
@@ -103,7 +107,16 @@ impl fmt::Display for WorkerReadinessError {
                 formatter.write_str("helper does not support worker pidfd assignment"),
             Self::Negotiation(error) => write!(formatter, "helper Hello negotiation failed: {error:?}"),
             Self::DescriptorLimit { required, available } => write!(formatter, "helper preparation requires {required} descriptors, negotiated limit is {available}"),
+            Self::FrameLimit { available } => write!(formatter, "helper session needs at least {MIN_HELPER_CONTROL_FRAME_BYTES} control-frame bytes; available {available}"),
         }
+    }
+}
+
+fn require_frame_capacity(available: u32) -> Result<(), WorkerReadinessError> {
+    if available < MIN_HELPER_CONTROL_FRAME_BYTES {
+        Err(WorkerReadinessError::FrameLimit { available })
+    } else {
+        Ok(())
     }
 }
 

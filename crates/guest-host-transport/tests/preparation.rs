@@ -1,3 +1,4 @@
+use support::control::{receive_guest_frame, send_guest_frame};
 mod support;
 #[path = "support/target.rs"]
 mod target;
@@ -86,6 +87,38 @@ fn readiness() -> WorkerReadiness {
         .unwrap()
 }
 
+#[test]
+fn helper_hello_rejects_limits_that_cannot_hold_session_results() {
+    let minimum = lasper_guest_protocol::MIN_HELPER_CONTROL_FRAME_BYTES;
+    assert!(matches!(
+        WorkerHello::new(ControlLimits::new(minimum - 1, 3).unwrap()),
+        Err(WorkerReadinessError::FrameLimit { available }) if available == minimum - 1
+    ));
+    let guest = GuestWorkerReadiness::check().unwrap();
+    for (host_limit, guest_limit) in [(minimum - 1, minimum), (minimum, minimum - 1)] {
+        let request = HelloRequest::new(
+            FeatureSet::WORKER_PIDFD,
+            ControlLimits::new(host_limit, 3).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            guest.accept_hello(lasper_guest_protocol::PROTOCOL_MAJOR, request, BrokerId::new([1; 16]), ControlLimits::new(guest_limit, 3).unwrap()),
+            Err(GuestHelloError::FrameLimit { available }) if available == minimum - 1
+        ));
+    }
+    let host = WorkerHello::new(ControlLimits::CURRENT).unwrap();
+    let response = HelloResponse::new(
+        FeatureSet::WORKER_PIDFD,
+        BrokerId::new([1; 16]),
+        ControlLimits::new(minimum - 1, 3).unwrap(),
+    )
+    .unwrap();
+    assert!(matches!(
+        host.negotiate(lasper_guest_protocol::PROTOCOL_MAJOR, response),
+        Err(WorkerReadinessError::FrameLimit { .. })
+    ));
+}
+
 #[tokio::test]
 async fn prepare_ready_transfers_the_assigned_worker_for_both_execution_kinds() {
     for execution in [ExecutionKind::Interactive, ExecutionKind::Bounded] {
@@ -108,7 +141,7 @@ async fn prepare_ready_transfers_the_assigned_worker_for_both_execution_kinds() 
             // the blocking guest transport.
             let mut guest = unsafe { GuestControlStream::from_raw_fd(guest.into_raw_fd()) };
             let mut payload = [0; 256];
-            let frame = guest.receive_frame(&mut payload).unwrap();
+            let frame = receive_guest_frame(&guest, &mut payload).unwrap();
             let hello_request = HelloRequest::decode_payload(frame.payload()).unwrap();
             let major = frame.header().protocol_major();
             let accepted = GuestWorkerReadiness::check()
@@ -122,17 +155,16 @@ async fn prepare_ready_transfers_the_assigned_worker_for_both_execution_kinds() 
                 .unwrap();
             let hello_response = accepted.response();
             let length = hello_response.encode_payload(&mut payload).unwrap();
-            guest
-                .send_frame(
-                    ControlFrameHeader::new(MessageKind::HelloResponse, 1, length as u32, 0)
-                        .unwrap(),
-                    &payload[..length],
-                    &[],
-                )
-                .unwrap();
+            send_guest_frame(
+                &guest,
+                ControlFrameHeader::new(MessageKind::HelloResponse, 1, length as u32, 0).unwrap(),
+                &payload[..length],
+                &[],
+            )
+            .unwrap();
             guest.complete_hello(accepted.limits()).unwrap();
             let mut payload = [0; 4096];
-            let frame = guest.receive_frame(&mut payload).unwrap();
+            let frame = receive_guest_frame(&guest, &mut payload).unwrap();
             assert_eq!(frame.header().kind(), MessageKind::PrepareRequest);
             let mut bytes = [0; 512];
             let length = ready.encode_into(&mut bytes).unwrap();
@@ -141,13 +173,13 @@ async fn prepare_ready_transfers_the_assigned_worker_for_both_execution_kinds() 
                 descriptors.push(terminal.as_raw_fd());
             }
             descriptors.extend([identity.as_raw_fd(), pidfd.as_raw_fd()]);
-            guest
-                .send_frame(
-                    ControlFrameHeader::decode(&bytes[..CONTROL_FRAME_HEADER_BYTES]).unwrap(),
-                    &bytes[CONTROL_FRAME_HEADER_BYTES..length],
-                    &descriptors,
-                )
-                .unwrap();
+            send_guest_frame(
+                &guest,
+                ControlFrameHeader::decode(&bytes[..CONTROL_FRAME_HEADER_BYTES]).unwrap(),
+                &bytes[CONTROL_FRAME_HEADER_BYTES..length],
+                &descriptors,
+            )
+            .unwrap();
         });
         let mut payload = [0; 256];
         let length = hello.request().encode_payload(&mut payload).unwrap();
@@ -266,13 +298,13 @@ async fn invalid_preparation_resources_close_the_received_identity_endpoint() {
                 descriptors.len() as u16,
             )
             .unwrap();
-            guest
-                .send_frame(
-                    header,
-                    &bytes[CONTROL_FRAME_HEADER_BYTES..length],
-                    &descriptors,
-                )
-                .unwrap();
+            send_guest_frame(
+                &guest,
+                header,
+                &bytes[CONTROL_FRAME_HEADER_BYTES..length],
+                &descriptors,
+            )
+            .unwrap();
         });
         establish_host(&mut host).await;
         let response = host.receive_frame().await.unwrap();
@@ -328,13 +360,13 @@ async fn deliver_ready(
             .iter()
             .map(AsRawFd::as_raw_fd)
             .collect::<Vec<_>>();
-        guest
-            .send_frame(
-                ControlFrameHeader::decode(&bytes[..CONTROL_FRAME_HEADER_BYTES]).unwrap(),
-                &bytes[CONTROL_FRAME_HEADER_BYTES..length],
-                &descriptors,
-            )
-            .unwrap();
+        send_guest_frame(
+            &guest,
+            ControlFrameHeader::decode(&bytes[..CONTROL_FRAME_HEADER_BYTES]).unwrap(),
+            &bytes[CONTROL_FRAME_HEADER_BYTES..length],
+            &descriptors,
+        )
+        .unwrap();
     });
     establish_host(&mut host).await;
     let frame = host.receive_frame().await.unwrap();
@@ -453,9 +485,9 @@ async fn guest_rejects_legacy_host_during_hello_without_a_prepare_ready() {
         let (mut host, guest) = raw_stream_pair();
         let guest_task = tokio::task::spawn_blocking(move || {
             // SAFETY: This connected endpoint transfers its ownership.
-            let mut guest = unsafe { GuestControlStream::from_raw_fd(guest.into_raw_fd()) };
+            let guest = unsafe { GuestControlStream::from_raw_fd(guest.into_raw_fd()) };
             let mut payload = [0; 256];
-            let frame = guest.receive_frame(&mut payload).unwrap();
+            let frame = receive_guest_frame(&guest, &mut payload).unwrap();
             let request = HelloRequest::decode_payload(frame.payload()).unwrap();
             let result = GuestWorkerReadiness::check().unwrap().accept_hello(
                 frame.header().protocol_major(),

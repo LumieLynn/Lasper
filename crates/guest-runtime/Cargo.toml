@@ -23,6 +23,10 @@ bench = false
 required-features = ["runtime-bin"]
 
 [[test]]
+name = "transport"
+path = "tests/transport/main.rs"
+
+[[test]]
 name = "session"
 path = "tests/session/main.rs"
 harness = false

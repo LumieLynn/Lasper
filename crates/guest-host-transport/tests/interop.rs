@@ -11,7 +11,11 @@ use std::io::{self, Read, Write};
 use std::mem::{size_of, zeroed};
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::net::UnixStream as StdUnixStream;
-use support::control::{current_limits, establish_guest, establish_host, raw_stream_pair};
+use std::task::Poll;
+use support::control::{
+    current_limits, establish_guest, establish_host, raw_stream_pair, receive_guest_frame,
+    send_guest_frame,
+};
 use tokio::net::UnixStream;
 
 #[repr(C, align(16))]
@@ -26,21 +30,21 @@ fn establish_guest_with_peer(peer: &mut StdUnixStream, guest: &mut GuestControlS
     peer.write_all(&request.encode()).unwrap();
 
     let mut payload = [];
-    let received = guest.receive_frame(&mut payload).unwrap();
+    let received = receive_guest_frame(guest, &mut payload).unwrap();
     assert_eq!(received.header().kind(), MessageKind::HelloRequest);
-    guest
-        .send_frame(
-            ControlFrameHeader::new(
-                MessageKind::HelloResponse,
-                received.header().request_id(),
-                0,
-                0,
-            )
-            .unwrap(),
-            &[],
-            &[],
+    send_guest_frame(
+        guest,
+        ControlFrameHeader::new(
+            MessageKind::HelloResponse,
+            received.header().request_id(),
+            0,
+            0,
         )
-        .unwrap();
+        .unwrap(),
+        &[],
+        &[],
+    )
+    .unwrap();
 
     let mut response = [0; CONTROL_FRAME_HEADER_BYTES];
     peer.read_exact(&mut response).unwrap();
@@ -111,6 +115,8 @@ fn send_with_rights(
 }
 
 fn assert_peer_observes_close(mut peer: StdUnixStream) {
+    peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+        .unwrap();
     let mut byte = [0];
     assert_eq!(peer.read(&mut byte).unwrap(), 0);
 }
@@ -127,16 +133,16 @@ async fn host_and_guest_round_trip_frames_without_descriptors() {
         let mut guest = unsafe { GuestControlStream::from_raw_fd(guest.into_raw_fd()) };
         establish_guest(&mut guest);
         let mut payload = [0; 32];
-        let frame = guest.receive_frame(&mut payload).unwrap();
+        let frame = receive_guest_frame(&guest, &mut payload).unwrap();
         assert_eq!(frame.payload(), request_payload);
         assert!(frame.descriptors().is_empty());
-        guest
-            .send_frame(
-                header(MessageKind::PrepareReady, response_payload, 0),
-                response_payload,
-                &[],
-            )
-            .unwrap();
+        send_guest_frame(
+            &guest,
+            header(MessageKind::PrepareReady, response_payload, 0),
+            response_payload,
+            &[],
+        )
+        .unwrap();
     });
 
     establish_host(&mut host).await;
@@ -166,7 +172,7 @@ async fn host_and_guest_transports_exchange_typed_hello_payloads() {
         // used again in this task.
         let mut guest = unsafe { GuestControlStream::from_raw_fd(guest.into_raw_fd()) };
         let mut payload = [0; 256];
-        let frame = guest.receive_frame(&mut payload).unwrap();
+        let frame = receive_guest_frame(&guest, &mut payload).unwrap();
         assert_eq!(frame.header().kind(), HelloRequest::KIND);
         assert!(frame.descriptors().is_empty());
         let request = HelloRequest::decode_payload(frame.payload()).unwrap();
@@ -182,17 +188,17 @@ async fn host_and_guest_transports_exchange_typed_hello_payloads() {
         let negotiated = request
             .negotiate(lasper_guest_protocol::PROTOCOL_MAJOR, response)
             .unwrap();
-        guest
-            .send_frame(
-                header(HelloResponse::KIND, &response_payload[..response_len], 0),
-                &response_payload[..response_len],
-                &[],
-            )
-            .unwrap();
+        send_guest_frame(
+            &guest,
+            header(HelloResponse::KIND, &response_payload[..response_len], 0),
+            &response_payload[..response_len],
+            &[],
+        )
+        .unwrap();
         guest.complete_hello(negotiated).unwrap();
 
         let mut next_payload = [0; 32];
-        let next = guest.receive_frame(&mut next_payload).unwrap();
+        let next = receive_guest_frame(&guest, &mut next_payload).unwrap();
         assert_eq!(next.header().kind(), MessageKind::PrepareRequest);
         assert_eq!(next.payload(), b"prepare");
         negotiated
@@ -315,7 +321,7 @@ async fn host_and_guest_round_trip_two_ordered_descriptors() {
         let mut guest = unsafe { GuestControlStream::from_raw_fd(guest.into_raw_fd()) };
         establish_guest(&mut guest);
         let mut payload = [0; 32];
-        let frame = guest.receive_frame(&mut payload).unwrap();
+        let frame = receive_guest_frame(&guest, &mut payload).unwrap();
         assert_eq!(frame.payload(), request_payload);
         assert_eq!(frame.descriptors().len(), 2);
         for descriptor in frame.descriptors().as_raw_fds() {
@@ -329,13 +335,13 @@ async fn host_and_guest_round_trip_two_ordered_descriptors() {
         let (_, _, descriptors) = frame.into_parts();
         let (raw, count) = descriptors.into_raw_fds();
         let response_payload = b"returned";
-        guest
-            .send_frame(
-                header(MessageKind::PrepareReady, response_payload, count as u16),
-                response_payload,
-                &raw[..count],
-            )
-            .unwrap();
+        send_guest_frame(
+            &guest,
+            header(MessageKind::PrepareReady, response_payload, count as u16),
+            response_payload,
+            &raw[..count],
+        )
+        .unwrap();
         for descriptor in raw.into_iter().take(count) {
             // `into_raw_fds` transferred ownership of these entries.
             drop(unsafe { OwnedFd::from_raw_fd(descriptor) });
@@ -384,19 +390,19 @@ async fn host_and_guest_round_trip_large_payloads_with_a_descriptor() {
         let mut guest = unsafe { GuestControlStream::from_raw_fd(guest.into_raw_fd()) };
         establish_guest(&mut guest);
         let mut payload = vec![0; expected_request.len()];
-        let frame = guest.receive_frame(&mut payload).unwrap();
+        let frame = receive_guest_frame(&guest, &mut payload).unwrap();
         assert_eq!(frame.payload(), expected_request);
         assert_eq!(frame.descriptors().len(), 1);
 
         let (_, _, descriptors) = frame.into_parts();
         let (raw, count) = descriptors.into_raw_fds();
-        guest
-            .send_frame(
-                header(MessageKind::PrepareReady, &response, count as u16),
-                &response,
-                &raw[..count],
-            )
-            .unwrap();
+        send_guest_frame(
+            &guest,
+            header(MessageKind::PrepareReady, &response, count as u16),
+            &response,
+            &raw[..count],
+        )
+        .unwrap();
         for descriptor in raw.into_iter().take(count) {
             // `into_raw_fds` transferred ownership of these entries.
             drop(unsafe { OwnedFd::from_raw_fd(descriptor) });
@@ -430,14 +436,152 @@ fn guest_shape_errors_leave_the_stream_usable() {
     let mut guest = unsafe { GuestControlStream::from_raw_fd(guest.into_raw_fd()) };
     establish_guest_with_peer(&mut host, &mut guest);
 
-    assert!(guest
-        .send_frame(
-            header(MessageKind::PrepareRequest, b"", 0),
-            b"mismatch",
-            &[],
-        )
-        .is_err());
+    assert!(send_guest_frame(
+        &guest,
+        header(MessageKind::PrepareRequest, b"", 0),
+        b"mismatch",
+        &[],
+    )
+    .is_err());
     assert!(guest.can_continue());
+}
+
+#[test]
+fn abandoning_a_pending_guest_receive_releases_its_received_rights() {
+    for header_only in [true, false] {
+        let (mut sender, guest) = StdUnixStream::pair().unwrap();
+        // SAFETY: This endpoint transfers exclusively into the transport.
+        let mut guest = unsafe { GuestControlStream::from_raw_fd(guest.into_raw_fd()) };
+        establish_guest_with_peer(&mut sender, &mut guest);
+        let (transferred, peer) = StdUnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let encoded = header(MessageKind::PrepareRequest, b"abc", 1).encode();
+        let bytes = if header_only {
+            &encoded[..1]
+        } else {
+            &encoded[..]
+        };
+        assert_eq!(
+            send_with_rights(&sender, bytes, &[transferred.as_raw_fd()]).unwrap(),
+            bytes.len()
+        );
+        drop(transferred);
+        let mut reader = guest.begin_receive().unwrap();
+        if header_only {
+            assert_eq!(reader.advance(), Ok(Poll::Pending));
+            drop(reader);
+        } else {
+            assert!(reader.advance().unwrap().is_ready());
+            let mut payload = reader.into_payload([0; 3]).unwrap();
+            assert_eq!(payload.advance(), Ok(Poll::Pending));
+            drop(payload);
+        }
+        assert!(!guest.can_continue());
+        assert_peer_observes_close(peer);
+    }
+}
+
+#[test]
+fn pending_guest_send_owns_fd_copies_until_cancelled_without_io() {
+    let (mut peer, guest) = StdUnixStream::pair().unwrap();
+    // SAFETY: This endpoint transfers exclusively into the transport.
+    let mut guest = unsafe { GuestControlStream::from_raw_fd(guest.into_raw_fd()) };
+    establish_guest_with_peer(&mut peer, &mut guest);
+    let (transferred, mut observer) = StdUnixStream::pair().unwrap();
+    observer.set_nonblocking(true).unwrap();
+    let writer = guest
+        .begin_send(
+            header(MessageKind::PrepareReady, b"", 1),
+            b"",
+            &[transferred.as_raw_fd()],
+        )
+        .unwrap();
+    drop(transferred);
+    assert_eq!(
+        observer.read(&mut [0]).unwrap_err().kind(),
+        io::ErrorKind::WouldBlock
+    );
+    drop(writer);
+    assert_eq!(observer.read(&mut [0]).unwrap(), 0);
+    assert!(guest.can_continue());
+}
+
+#[test]
+fn cancelling_a_send_blocked_before_its_anchor_releases_rights_without_poisoning() {
+    let (mut peer, guest) = StdUnixStream::pair().unwrap();
+    set_small_send_buffer(&guest);
+    // SAFETY: This endpoint transfers exclusively into the transport.
+    let mut guest = unsafe { GuestControlStream::from_raw_fd(guest.into_raw_fd()) };
+    establish_guest_with_peer(&mut peer, &mut guest);
+    loop {
+        let bytes = [0; 4096];
+        // SAFETY: send borrows the live socket and fixed byte array for this call.
+        let result = unsafe {
+            libc::send(
+                guest.as_raw_fd(),
+                bytes.as_ptr().cast(),
+                bytes.len(),
+                libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+            )
+        };
+        if result < 0 {
+            assert_eq!(io::Error::last_os_error().kind(), io::ErrorKind::WouldBlock);
+            break;
+        }
+        assert!(result > 0);
+    }
+    let (transferred, observer) = StdUnixStream::pair().unwrap();
+    observer
+        .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+        .unwrap();
+    let mut writer = guest
+        .begin_send(
+            header(MessageKind::PrepareReady, b"", 1),
+            b"",
+            &[transferred.as_raw_fd()],
+        )
+        .unwrap();
+    drop(transferred);
+    assert_eq!(writer.advance(), Ok(Poll::Pending));
+    drop(writer);
+    assert!(guest.can_continue());
+    assert_peer_observes_close(observer);
+}
+
+#[tokio::test]
+async fn pending_guest_send_transfers_owned_rights_once_after_short_writes() {
+    let (mut host, guest) = raw_stream_pair();
+    set_small_send_buffer(&guest);
+    let payload = vec![0x9a; 256 * 1024];
+    let expected = payload.clone();
+    let (transferred, peer) = StdUnixStream::pair().unwrap();
+    let task = tokio::task::spawn_blocking(move || {
+        // SAFETY: This endpoint transfers exclusively into the transport.
+        let mut guest = unsafe { GuestControlStream::from_raw_fd(guest.into_raw_fd()) };
+        establish_guest(&mut guest);
+        let mut writer = guest
+            .begin_send(
+                header(MessageKind::PrepareReady, &payload, 1),
+                &payload,
+                &[transferred.as_raw_fd()],
+            )
+            .unwrap();
+        drop(transferred);
+        assert_eq!(writer.advance(), Ok(Poll::Pending));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while writer.advance().unwrap().is_pending() {
+            assert!(std::time::Instant::now() < deadline, "guest send stalled");
+            std::thread::yield_now();
+        }
+    });
+    establish_host(&mut host).await;
+    let received = host.receive_frame().await.unwrap();
+    task.await.unwrap();
+    assert_eq!(received.payload(), expected);
+    assert_eq!(received.descriptors().len(), 1);
+    drop(received);
+    assert_peer_observes_close(peer);
 }
 
 #[test]
@@ -456,7 +600,7 @@ fn guest_rejects_descriptors_attached_after_the_frame_anchor() {
     );
     drop(transferred);
     let mut payload = [0; 8];
-    let error = match guest.receive_frame(&mut payload) {
+    let error = match receive_guest_frame(&guest, &mut payload) {
         Ok(_) => panic!("guest accepted a descriptor after the frame anchor"),
         Err(error) => error,
     };
@@ -470,37 +614,81 @@ fn guest_rejects_descriptors_attached_after_the_frame_anchor() {
 }
 
 #[test]
-fn guest_rejects_truncated_rights_and_closes_every_received_descriptor() {
-    let (mut sender, guest) = StdUnixStream::pair().unwrap();
-    let (transferred, peers): (Vec<_>, Vec<_>) =
-        (0..6).map(|_| StdUnixStream::pair().unwrap()).unzip();
-    let raw = transferred
-        .iter()
-        .map(AsRawFd::as_raw_fd)
-        .collect::<Vec<_>>();
-    // Ownership moves into the guest transport; the original socket is not
-    // used again below.
-    let mut guest = unsafe { GuestControlStream::from_raw_fd(guest.into_raw_fd()) };
-    establish_guest_with_peer(&mut sender, &mut guest);
-    let frame = header(MessageKind::PrepareRequest, b"", 2).encode();
-    assert_eq!(
-        send_with_rights(&sender, &frame, &raw).unwrap(),
-        frame.len()
-    );
-    drop(transferred);
-    let mut payload = [];
-    let error = match guest.receive_frame(&mut payload) {
-        Ok(_) => panic!("guest accepted truncated descriptor rights"),
-        Err(error) => error,
-    };
+fn guest_rejects_excess_rights_without_leaking_received_descriptors() {
+    for count in [4, 5, 16] {
+        for _ in 0..8 {
+            let (mut sender, guest) = StdUnixStream::pair().unwrap();
+            let mut guest = unsafe { GuestControlStream::from_raw_fd(guest.into_raw_fd()) };
+            establish_guest_with_peer(&mut sender, &mut guest);
+            let (transferred, peers): (Vec<_>, Vec<_>) =
+                (0..count).map(|_| StdUnixStream::pair().unwrap()).unzip();
+            let raw = transferred
+                .iter()
+                .map(AsRawFd::as_raw_fd)
+                .collect::<Vec<_>>();
+            let frame = header(MessageKind::PrepareRequest, b"", 2).encode();
+            assert_eq!(
+                send_with_rights(&sender, &frame, &raw).unwrap(),
+                frame.len()
+            );
+            drop(transferred);
+            let mut payload = [];
+            let error = match receive_guest_frame(&guest, &mut payload) {
+                Ok(_) => panic!("guest accepted excess descriptor rights"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error,
+                if count == 4 {
+                    lasper_guest_runtime::transport::TransportError::DescriptorCountMismatch {
+                        declared: 2,
+                        actual: 4,
+                    }
+                } else {
+                    lasper_guest_runtime::transport::TransportError::Truncated
+                }
+            );
+            assert!(!guest.can_continue());
+            for peer in peers {
+                assert_peer_observes_close(peer);
+            }
+        }
+    }
+}
 
-    assert_eq!(
-        error,
-        lasper_guest_runtime::transport::TransportError::Truncated
-    );
-    assert!(!guest.can_continue());
-    for peer in peers {
-        assert_peer_observes_close(peer);
+#[tokio::test]
+async fn host_rejects_excess_rights_without_leaking_received_descriptors() {
+    for count in [4, 5, 16] {
+        for _ in 0..8 {
+            let (mut host, peer) = raw_stream_pair();
+            // This peer sends raw ancillary records after the normal handshake.
+            let raw_peer = peer.try_clone().unwrap();
+            let guest_task = tokio::task::spawn_blocking(move || {
+                let mut guest = unsafe { GuestControlStream::from_raw_fd(peer.into_raw_fd()) };
+                establish_guest(&mut guest);
+                guest
+            });
+            establish_host(&mut host).await;
+            let _guest = guest_task.await.unwrap();
+            let (transferred, peers): (Vec<_>, Vec<_>) =
+                (0..count).map(|_| StdUnixStream::pair().unwrap()).unzip();
+            let raw = transferred
+                .iter()
+                .map(AsRawFd::as_raw_fd)
+                .collect::<Vec<_>>();
+            let frame = header(MessageKind::PrepareReady, b"", 2).encode();
+            assert_eq!(
+                send_with_rights(&raw_peer, &frame, &raw).unwrap(),
+                frame.len()
+            );
+            drop(transferred);
+            let error = host.receive_frame().await.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(!host.can_continue());
+            for peer in peers {
+                assert_peer_observes_close(peer);
+            }
+        }
     }
 }
 
@@ -519,7 +707,7 @@ fn guest_count_mismatch_closes_the_received_descriptor() {
     );
     drop(transferred);
     let mut payload = [];
-    let error = match guest.receive_frame(&mut payload) {
+    let error = match receive_guest_frame(&guest, &mut payload) {
         Ok(_) => panic!("guest accepted a descriptor count mismatch"),
         Err(error) => error,
     };
@@ -551,7 +739,7 @@ fn guest_invalid_header_closes_descriptors_received_with_it() {
     );
     drop(transferred);
     let mut payload = [];
-    let error = match guest.receive_frame(&mut payload) {
+    let error = match receive_guest_frame(&guest, &mut payload) {
         Ok(_) => panic!("guest accepted an invalid control header"),
         Err(error) => error,
     };
@@ -584,7 +772,7 @@ fn guest_payload_buffer_failure_closes_descriptors_received_with_the_header() {
     );
     drop(transferred);
     let mut payload_buffer = [0; 4];
-    let error = match guest.receive_frame(&mut payload_buffer) {
+    let error = match receive_guest_frame(&guest, &mut payload_buffer) {
         Ok(_) => panic!("guest accepted a payload larger than its receive buffer"),
         Err(error) => error,
     };

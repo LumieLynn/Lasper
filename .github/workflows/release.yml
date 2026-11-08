@@ -92,7 +92,7 @@ jobs:
         run: |
           cargo clippy -p lasper-guest-host-transport --all-targets --locked -- -D warnings
           cargo clippy -p lasper-guest-protocol --all-targets --locked -- -D warnings
-          cargo clippy -p lasper-guest-runtime --lib --locked -- -D warnings
+          cargo clippy -p lasper-guest-runtime --all-targets --locked -- -D warnings
 
       - name: Run tests
         run: cargo test --all-targets --locked
@@ -101,7 +101,7 @@ jobs:
         run: |
           cargo test -p lasper-guest-host-transport --all-targets --locked
           cargo test -p lasper-guest-protocol --all-targets --locked
-          cargo test -p lasper-guest-runtime --lib --locked
+          cargo test -p lasper-guest-runtime --all-targets --locked
 
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked --version 0.22.2
@@ -141,8 +141,8 @@ jobs:
 
       - name: Exercise guest transport on runner architecture
         run: |
-          cargo test -p lasper-guest-runtime --lib --locked
-          cargo test -p lasper-guest-host-transport --test interop --test identity --locked
+          cargo test -p lasper-guest-runtime --all-targets --locked
+          cargo test -p lasper-guest-host-transport --test interop --test identity --test preparation --locked
 
       - name: Check guest runtime binary
         run: >-

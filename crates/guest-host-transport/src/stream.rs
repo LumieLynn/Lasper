@@ -10,10 +10,16 @@ use tokio::net::UnixStream;
 
 use crate::SCM_PIDFD;
 
+// Keep one overflow slot so an excessive FD count can be rejected explicitly.
 const MAX_RECEIVED_DESCRIPTORS: usize = MAX_CONTROL_DESCRIPTORS as usize + 1;
+const SEND_CONTROL_BYTES: usize = unsafe {
+    libc::CMSG_SPACE((MAX_CONTROL_DESCRIPTORS as usize * size_of::<RawFd>()) as _) as usize
+};
+const RECEIVE_CONTROL_BYTES: usize =
+    unsafe { libc::CMSG_SPACE((MAX_RECEIVED_DESCRIPTORS * size_of::<RawFd>()) as _) as usize };
 
 #[repr(C, align(16))]
-struct AncillaryBuffer([usize; 16]);
+struct AncillaryBuffer<const BYTES: usize>([u8; BYTES]);
 
 /// Asynchronous host transport for the guest control protocol.
 ///
@@ -320,15 +326,14 @@ fn recvmsg_once(stream: &UnixStream, bytes: &mut [u8]) -> io::Result<(usize, Vec
         iov_base: bytes.as_mut_ptr().cast(),
         iov_len: bytes.len(),
     };
-    let mut control = AncillaryBuffer([0; 16]);
+    let mut control = AncillaryBuffer([0; RECEIVE_CONTROL_BYTES]);
     // A zeroed header represents an empty message; the receive buffers and
     // their lengths are installed below before the syscall.
     let mut message: libc::msghdr = unsafe { zeroed() };
     message.msg_iov = &mut iov;
     message.msg_iovlen = 1;
     message.msg_control = control.0.as_mut_ptr().cast();
-    message.msg_controllen =
-        unsafe { libc::CMSG_SPACE((MAX_RECEIVED_DESCRIPTORS * size_of::<RawFd>()) as _) as _ };
+    message.msg_controllen = control.0.len() as _;
 
     // The byte and control buffers stay live for the call and bound every write.
     let received =
@@ -337,21 +342,16 @@ fn recvmsg_once(stream: &UnixStream, bytes: &mut [u8]) -> io::Result<(usize, Vec
         return Err(io::Error::last_os_error());
     }
 
-    let descriptors = decode_ancillary(&mut message, &control)?;
+    let descriptors = decode_ancillary(&message, &control.0)?;
     Ok((received as usize, descriptors))
 }
 
-fn decode_ancillary(
-    message: &mut libc::msghdr,
-    control: &AncillaryBuffer,
-) -> io::Result<Vec<OwnedFd>> {
+fn decode_ancillary(message: &libc::msghdr, control: &[u8]) -> io::Result<Vec<OwnedFd>> {
     let control_bytes: usize = message.msg_controllen as _;
-    let control_overflow = control_bytes > size_of::<AncillaryBuffer>();
-    if control_overflow {
-        message.msg_controllen = size_of::<AncillaryBuffer>() as _;
-    }
     let (descriptors, unexpected_control) = collect_descriptors(message, control)?;
-    if control_overflow || message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0 {
+    if control_bytes > control.len()
+        || message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0
+    {
         return Err(invalid_data(
             "control frame or ancillary data was truncated",
         ));
@@ -367,57 +367,58 @@ fn decode_ancillary(
     Ok(descriptors)
 }
 
-fn collect_descriptors(
-    message: &libc::msghdr,
-    control: &AncillaryBuffer,
-) -> io::Result<(Vec<OwnedFd>, bool)> {
+fn collect_descriptors(message: &libc::msghdr, control: &[u8]) -> io::Result<(Vec<OwnedFd>, bool)> {
     let mut descriptors = Vec::new();
     let mut unexpected_control = false;
     let mut rights_seen = false;
-    let control_start = control.0.as_ptr() as usize;
     let control_bytes: usize = message.msg_controllen as _;
-    let control_end = control_start.saturating_add(control_bytes);
-    // `msg_control` points at `control`, and its returned length fits the allocation.
-    let mut header = unsafe { libc::CMSG_FIRSTHDR(message) };
+    let control_bytes = control_bytes.min(control.len());
+    let header_bytes = unsafe { libc::CMSG_LEN(0) } as usize;
+    let mut offset = 0;
 
-    while !header.is_null() {
-        // Each libc cursor is checked against the returned control range before
-        // its record is interpreted.
-        let (level, kind, length) = unsafe {
-            (
-                (*header).cmsg_level,
-                (*header).cmsg_type,
-                (*header).cmsg_len as usize,
-            )
+    while control_bytes.saturating_sub(offset) >= header_bytes {
+        // SAFETY: The complete header fits in control; the byte slice need not be aligned.
+        let header = unsafe {
+            control
+                .as_ptr()
+                .add(offset)
+                .cast::<libc::cmsghdr>()
+                .read_unaligned()
         };
-        let header_start = header as usize;
-        let data_start = header_start.saturating_add(unsafe { libc::CMSG_LEN(0) } as usize);
-        let data_length = length
-            .checked_sub(data_start.saturating_sub(header_start))
+        let length: usize = header.cmsg_len as _;
+        let data_bytes = length
+            .checked_sub(header_bytes)
             .ok_or_else(|| invalid_data("malformed ancillary header"))?;
-        let record_end = header_start
-            .checked_add(length)
-            .ok_or_else(|| invalid_data("malformed ancillary length"))?;
-        if header_start < control_start || record_end > control_end {
-            return Err(invalid_data("ancillary record exceeds receive buffer"));
-        }
+        let available_bytes = control_bytes - offset - header_bytes;
+        let truncated = data_bytes > available_bytes;
 
-        if level == libc::SOL_SOCKET && matches!(kind, libc::SCM_RIGHTS | SCM_PIDFD) {
-            if kind == SCM_PIDFD
+        if header.cmsg_level == libc::SOL_SOCKET
+            && matches!(header.cmsg_type, libc::SCM_RIGHTS | SCM_PIDFD)
+        {
+            if header.cmsg_type == SCM_PIDFD
                 || rights_seen
-                || data_length == 0
-                || data_length % size_of::<RawFd>() != 0
+                || data_bytes == 0
+                || !data_bytes.is_multiple_of(size_of::<RawFd>())
             {
                 unexpected_control = true;
             }
             rights_seen = true;
-            // Both FD-bearing record types must be owned before rejecting one.
-            let data = unsafe { libc::CMSG_DATA(header).cast::<RawFd>() };
-            for index in 0..data_length / size_of::<RawFd>() {
-                // This slot lies inside the checked descriptor payload.
-                let raw_fd = unsafe { data.add(index).read_unaligned() };
+            // Own every complete FD slot that was delivered, even when the
+            // record advertises more bytes than the receive buffer contains.
+            let delivered_bytes = data_bytes.min(available_bytes);
+            for index in 0..delivered_bytes / size_of::<RawFd>() {
+                // SAFETY: This complete slot is bounded by the record and the
+                // returned control length. Payload alignment is not assumed.
+                let raw_fd = unsafe {
+                    control
+                        .as_ptr()
+                        .add(offset + header_bytes + index * size_of::<RawFd>())
+                        .cast::<RawFd>()
+                        .read_unaligned()
+                };
                 if raw_fd >= 0 {
-                    // SAFETY: This slot came from a kernel FD-bearing record.
+                    // SAFETY: Each slot in an FD-bearing receive record
+                    // transfers ownership of one installed descriptor.
                     descriptors.push(unsafe { OwnedFd::from_raw_fd(raw_fd) });
                 } else {
                     unexpected_control = true;
@@ -427,8 +428,10 @@ fn collect_descriptors(
             unexpected_control = true;
         }
 
-        // libc computes the next cursor; the next iteration validates its record.
-        header = unsafe { libc::CMSG_NXTHDR(message, header) };
+        if truncated {
+            return Err(invalid_data("ancillary record exceeds receive buffer"));
+        }
+        offset += unsafe { libc::CMSG_SPACE(data_bytes as _) } as usize;
     }
 
     Ok((descriptors, unexpected_control))
@@ -474,9 +477,9 @@ fn sendmsg_raw(
     payload: &[u8],
     descriptors: &[RawFd],
 ) -> io::Result<usize> {
-    if descriptors.len() > (size_of::<AncillaryBuffer>() / size_of::<RawFd>()) {
+    if descriptors.len() > MAX_CONTROL_DESCRIPTORS as usize {
         return Err(invalid_input(
-            "descriptor control record exceeds local buffer",
+            "too many descriptors for guest control frame",
         ));
     }
     let mut iov = [
@@ -489,7 +492,7 @@ fn sendmsg_raw(
             iov_len: payload.len(),
         },
     ];
-    let mut control = AncillaryBuffer([0; 16]);
+    let mut control = AncillaryBuffer([0; SEND_CONTROL_BYTES]);
     // A zeroed header represents an empty message; every field used by
     // `sendmsg` is filled below before the syscall.
     let mut message: libc::msghdr = unsafe { zeroed() };
@@ -499,11 +502,6 @@ fn sendmsg_raw(
     if !descriptors.is_empty() {
         let data_bytes = std::mem::size_of_val(descriptors);
         let control_bytes = unsafe { libc::CMSG_SPACE(data_bytes as _) } as usize;
-        if control_bytes > size_of::<AncillaryBuffer>() {
-            return Err(invalid_input(
-                "descriptor control record exceeds local buffer",
-            ));
-        }
         message.msg_control = control.0.as_mut_ptr().cast();
         message.msg_controllen = control_bytes as _;
         // The control buffer is aligned and large enough for the requested record.
@@ -582,7 +580,7 @@ mod tests {
     };
     use std::fs::File;
     use std::io::Read;
-    use std::os::fd::{AsFd, IntoRawFd};
+    use std::os::fd::AsFd;
     use std::os::unix::net::UnixStream as StdUnixStream;
     use tokio::time::{timeout, Duration};
 
@@ -687,86 +685,9 @@ mod tests {
         assert!(!host.can_continue());
     }
 
-    fn rights_message(control: &mut AncillaryBuffer, descriptors: &[RawFd]) -> libc::msghdr {
-        // The test fills the only control fields read by the parser below.
-        let mut message: libc::msghdr = unsafe { zeroed() };
-        let data_bytes = std::mem::size_of_val(descriptors);
-        message.msg_control = control.0.as_mut_ptr().cast();
-        message.msg_controllen = unsafe { libc::CMSG_SPACE(data_bytes as _) } as _;
-        // The test buffer is aligned and sized for the supplied descriptors.
-        let header = unsafe { libc::CMSG_FIRSTHDR(&message) };
-        assert!(!header.is_null());
-        // `header` points into the checked test control allocation.
-        unsafe {
-            (*header).cmsg_level = libc::SOL_SOCKET;
-            (*header).cmsg_type = libc::SCM_RIGHTS;
-            (*header).cmsg_len = libc::CMSG_LEN(data_bytes as _) as _;
-            std::ptr::copy_nonoverlapping(
-                descriptors.as_ptr().cast::<u8>(),
-                libc::CMSG_DATA(header),
-                data_bytes,
-            );
-        }
-        message
-    }
-
     fn assert_peer_observes_close(mut peer: StdUnixStream) {
         let mut byte = [0];
         assert_eq!(peer.read(&mut byte).unwrap(), 0);
-    }
-
-    #[test]
-    fn empty_rights_record_is_rejected() {
-        let mut control = AncillaryBuffer([0; 16]);
-        let mut message = rights_message(&mut control, &[]);
-
-        let error = decode_ancillary(&mut message, &control).unwrap_err();
-
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-    }
-
-    #[test]
-    fn unexpected_pidfd_is_closed_even_on_truncation() {
-        for flags in [0, libc::MSG_CTRUNC] {
-            let (received, peer) = StdUnixStream::pair().unwrap();
-            let mut control = AncillaryBuffer([0; 16]);
-            let mut message = rights_message(&mut control, &[received.into_raw_fd()]);
-            // SAFETY: rights_message installed this complete record in control.
-            unsafe {
-                (*message.msg_control.cast::<libc::cmsghdr>()).cmsg_type = SCM_PIDFD;
-            }
-            message.msg_flags = flags;
-            assert!(decode_ancillary(&mut message, &control).is_err());
-            assert_peer_observes_close(peer);
-        }
-    }
-
-    #[test]
-    fn truncated_control_closes_descriptors_before_returning() {
-        let (received, peer) = StdUnixStream::pair().unwrap();
-        let fd = received.into_raw_fd();
-        let mut control = AncillaryBuffer([0; 16]);
-        let mut message = rights_message(&mut control, &[fd]);
-        message.msg_flags = libc::MSG_CTRUNC;
-
-        let error = decode_ancillary(&mut message, &control).unwrap_err();
-
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert_peer_observes_close(peer);
-    }
-
-    #[test]
-    fn oversized_control_length_closes_descriptors_before_returning() {
-        let (received, peer) = StdUnixStream::pair().unwrap();
-        let fd = received.into_raw_fd();
-        let mut control = AncillaryBuffer([0; 16]);
-        let mut message = rights_message(&mut control, &[fd]);
-        message.msg_controllen = (size_of::<AncillaryBuffer>() + 1) as _;
-
-        let error = decode_ancillary(&mut message, &control).unwrap_err();
-
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert_peer_observes_close(peer);
     }
 
     #[tokio::test]
@@ -957,30 +878,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn truncated_rights_are_rejected() {
-        let (sender, receiver) = UnixStream::pair().unwrap();
-        let mut receiver = established_stream(receiver);
-        let (transferred, peers): (Vec<_>, Vec<_>) =
-            (0..5).map(|_| StdUnixStream::pair().unwrap()).unzip();
-        let raw_fds = transferred
-            .iter()
-            .map(AsRawFd::as_raw_fd)
-            .collect::<Vec<_>>();
-        let header = test_header(0, 2).encode();
-
-        let written = sendmsg_raw(&sender, &header, &[], &raw_fds).unwrap();
-        assert_eq!(written, header.len());
-        drop(transferred);
-        let error = receiver.receive_frame().await.unwrap_err();
-
-        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
-        assert!(!receiver.can_continue());
-        for peer in peers {
-            assert_peer_observes_close(peer);
-        }
-    }
-
-    #[tokio::test]
     async fn cancelling_a_partial_frame_receive_invalidates_the_stream() {
         let (sender, receiver) = UnixStream::pair().unwrap();
         let mut receiver = UnixControlStream::new(receiver);
@@ -1021,3 +918,7 @@ mod tests {
         assert!(sender.can_continue());
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/transport/ancillary.rs"]
+mod ancillary_tests;

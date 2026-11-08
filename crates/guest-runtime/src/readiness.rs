@@ -3,7 +3,7 @@ use crate::syscall::{syscall1, syscall2};
 use core::fmt;
 use lasper_guest_protocol::{
     BrokerId, ControlLimits, EnforcedControlLimits, FeatureSet, HelloNegotiationError,
-    HelloRequest, HelloResponse,
+    HelloRequest, HelloResponse, MIN_HELPER_CONTROL_FRAME_BYTES,
 };
 
 /// Checked in the broker's execution context before advertising worker pidfds.
@@ -57,6 +57,10 @@ impl GuestWorkerReadiness {
         {
             return Err(GuestHelloError::WorkerPidfdNotRequested);
         }
+        let available = limits.get().max_control_frame_bytes();
+        if available < MIN_HELPER_CONTROL_FRAME_BYTES {
+            return Err(GuestHelloError::FrameLimit { available });
+        }
         Ok(GuestWorkerHello { response, limits })
     }
 }
@@ -80,6 +84,7 @@ impl GuestWorkerHello {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GuestHelloError {
     WorkerPidfdNotRequested,
+    FrameLimit { available: u32 },
     Negotiation(HelloNegotiationError),
 }
 
@@ -90,6 +95,7 @@ impl fmt::Display for GuestHelloError {
                 "host did not request worker pidfd assignment; helper cannot use the legacy PrepareReady FD layout",
             ),
             Self::Negotiation(error) => write!(formatter, "helper Hello negotiation failed: {error:?}"),
+            Self::FrameLimit { available } => write!(formatter, "helper session needs at least {MIN_HELPER_CONTROL_FRAME_BYTES} control-frame bytes; negotiated {available}"),
         }
     }
 }
