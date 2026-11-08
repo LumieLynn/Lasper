@@ -1,5 +1,6 @@
-use super::linux::{Descriptor, EAGAIN};
+use super::linux::Descriptor;
 use super::GuardianError;
+use crate::linux::uapi::errno::EAGAIN;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[repr(u32)]

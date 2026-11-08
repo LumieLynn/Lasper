@@ -2,12 +2,16 @@ use core::mem::{size_of, zeroed};
 use core::ptr;
 use lasper_guest_protocol::MAX_CONTROL_DESCRIPTORS;
 
+use crate::linux::uapi::socket::{
+    MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_DONTWAIT, MSG_NOSIGNAL, MSG_TRUNC, SCM_PIDFD, SCM_RIGHTS,
+    SOL_SOCKET,
+};
+
 use super::descriptors::{RawDescriptors, MAX_RECEIVED_DESCRIPTORS};
 use super::TransportError;
 use crate::socket::{
     cmsg_align, cmsg_data, cmsg_len, cmsg_space, recvmsg, sendmsg, ControlMessageHeader, Iovec,
-    MessageHeader, MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_DONTWAIT, MSG_NOSIGNAL, MSG_TRUNC, SCM_PIDFD,
-    SCM_RIGHTS, SOL_SOCKET,
+    MessageHeader,
 };
 
 #[repr(C, align(16))]

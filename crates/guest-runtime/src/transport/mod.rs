@@ -9,6 +9,7 @@ use lasper_guest_protocol::{
     ControlSessionState, EnforcedControlLimits,
 };
 
+use crate::linux::uapi::errno::{EAGAIN, EINTR};
 use crate::socket::{close, shutdown};
 
 pub use descriptors::ReceivedDescriptors;
@@ -213,6 +214,3 @@ impl IoBudget {
         self.bytes -= bytes;
     }
 }
-
-const EAGAIN: i32 = 11;
-const EINTR: i32 = 4;

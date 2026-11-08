@@ -1,3 +1,4 @@
+use crate::linux::uapi::errno::{E2BIG, EINVAL};
 use core::ffi::CStr;
 use lasper_guest_protocol::{
     CommandArgv, GuestProcess, PrepareRequest, StartRequest, MAX_COMMAND_ARGUMENTS,
@@ -8,8 +9,6 @@ use super::linux;
 use super::{WorkerFailure, WorkerStage};
 
 const MAX_ENVIRONMENT_ENTRIES: usize = 10;
-const E2BIG: i32 = 7;
-const EINVAL: i32 = 22;
 const GUEST_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 pub(super) fn execute(

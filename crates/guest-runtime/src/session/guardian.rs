@@ -25,17 +25,7 @@ pub struct SessionGuardian<'a> {
 }
 
 impl<'a> SessionGuardian<'a> {
-    /// Starts worker setup with a five-second deadline. The preparation lease
-    /// begins only after that same worker reports readiness.
-    ///
-    /// # Safety
-    ///
-    /// The caller must be a dedicated single-threaded guardian, with exclusive
-    /// ownership of child creation/reaping. Entry is trusted helper code and
-    /// must use fork-safe operations before exec/exit, without unwinding.
-    /// Its call chain must leave WORKER_STACK_BUDGET_BYTES available; spawning
-    /// from a deep recursive call or a smaller thread stack is unsupported.
-    pub unsafe fn spawn(
+    pub(super) unsafe fn spawn(
         request: PrepareRequestFrame<'a>,
         preparation: PreparationId,
         now_ms: u64,

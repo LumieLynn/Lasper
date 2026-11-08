@@ -2,6 +2,12 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+// The ELF entry uses only write/exit from the library's shared kernel table.
+#[allow(dead_code)]
+#[path = "linux/uapi.rs"]
+mod uapi;
+use uapi::{errno::EINTR, nr};
+
 use core::arch::{asm, global_asm};
 use core::panic::PanicInfo;
 
@@ -86,7 +92,7 @@ unsafe fn c_string_equals(value: *const u8, expected: &[u8]) -> bool {
 fn write_all(fd: usize, mut bytes: &[u8]) -> bool {
     while !bytes.is_empty() {
         let written = write(fd, bytes);
-        if written == -EINTR {
+        if written == -(EINTR as isize) {
             continue;
         }
         if written <= 0 {
@@ -103,7 +109,7 @@ fn write(fd: usize, bytes: &[u8]) -> isize {
     unsafe {
         asm!(
             "syscall",
-            inlateout("rax") SYS_WRITE => result,
+            inlateout("rax") nr::WRITE => result,
             in("rdi") fd,
             in("rsi") bytes.as_ptr(),
             in("rdx") bytes.len(),
@@ -123,7 +129,7 @@ fn write(fd: usize, bytes: &[u8]) -> isize {
             inlateout("x0") fd as isize => result,
             in("x1") bytes.as_ptr(),
             in("x2") bytes.len(),
-            in("x8") SYS_WRITE,
+            in("x8") nr::WRITE,
         );
     }
     result
@@ -134,7 +140,7 @@ fn exit_group(code: i32) -> ! {
     unsafe {
         asm!(
             "syscall",
-            in("rax") SYS_EXIT_GROUP,
+            in("rax") nr::EXIT_GROUP,
             in("rdi") code as usize,
             options(noreturn),
         );
@@ -147,20 +153,8 @@ fn exit_group(code: i32) -> ! {
         asm!(
             "svc 0",
             in("x0") code as usize,
-            in("x8") SYS_EXIT_GROUP,
+            in("x8") nr::EXIT_GROUP,
             options(noreturn),
         );
     }
 }
-
-const EINTR: isize = 4;
-
-#[cfg(target_arch = "x86_64")]
-const SYS_WRITE: usize = 1;
-#[cfg(target_arch = "x86_64")]
-const SYS_EXIT_GROUP: usize = 231;
-
-#[cfg(target_arch = "aarch64")]
-const SYS_WRITE: usize = 64;
-#[cfg(target_arch = "aarch64")]
-const SYS_EXIT_GROUP: usize = 94;

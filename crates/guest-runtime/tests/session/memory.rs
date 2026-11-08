@@ -4,7 +4,7 @@ use lasper_guest_protocol::{
     MAX_COMMAND_TOTAL_BYTES,
 };
 use lasper_guest_runtime::session::{
-    SessionGuardian, SessionPhase, WorkerBootstrap, WorkerExit, WorkerFailure, WorkerStage,
+    GuardianContext, SessionPhase, WorkerBootstrap, WorkerExit, WorkerFailure, WorkerStage,
     WORKER_STACK_BUDGET_BYTES,
 };
 use std::time::{Duration, Instant};
@@ -71,10 +71,11 @@ fn request<'a>(argv: &[&'a str]) -> PrepareRequestFrame<'a> {
     )
 }
 
-fn allocation_failure() {
+fn allocation_failure(context: &mut GuardianContext) {
     let request = request(&["/bin/true"]);
-    let mut worker =
-        unsafe { SessionGuardian::spawn(request, PREPARATION, 0, deny_allocation) }.unwrap();
+    let mut worker = context
+        .spawn(request, PREPARATION, 0, deny_allocation)
+        .unwrap();
     let clock = Instant::now();
     loop {
         let state = worker.poll(clock.elapsed().as_millis() as u64).unwrap();
@@ -95,7 +96,7 @@ fn allocation_failure() {
     }
 }
 
-fn maximum_argv() {
+fn maximum_argv(context: &mut GuardianContext) {
     let mut arguments: Vec<String> = [
         "/bin/account-shell",
         "-c",
@@ -113,8 +114,9 @@ fn maximum_argv() {
     }
     let argv: Vec<_> = arguments.iter().map(String::as_str).collect();
     let request = request(&argv);
-    let mut worker =
-        unsafe { SessionGuardian::spawn(request.clone(), PREPARATION, 0, fixture::entry) }.unwrap();
+    let mut worker = context
+        .spawn(request.clone(), PREPARATION, 0, fixture::entry)
+        .unwrap();
     let clock = Instant::now();
     let mut started = false;
     let mut output = Vec::new();
@@ -149,7 +151,7 @@ fn maximum_argv() {
     }
 }
 
-pub(super) const SCENARIOS: &[(&str, fn())] = &[
+pub(super) const SCENARIOS: &[(&str, super::ScenarioFn)] = &[
     (
         "workspace allocation failure is reported before Prepared",
         allocation_failure,

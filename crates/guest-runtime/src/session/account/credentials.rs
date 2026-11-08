@@ -1,10 +1,9 @@
+use crate::linux::uapi::{errno::EPERM, nr};
 use crate::session::linux::result_or_errno;
 use crate::session::{WorkerFailure, WorkerStage};
 use crate::syscall::{syscall2, syscall3};
 
 use super::{Account, MAX_GROUPS};
-
-const EPERM: i32 = 1;
 
 pub(super) fn switch(account: &Account) -> Result<(), WorkerFailure> {
     let failure = |stage, errno| WorkerFailure::new(stage, errno);
@@ -83,28 +82,4 @@ fn verify_ids(number: usize, expected: u32) -> Result<(), i32> {
     } else {
         Err(EPERM)
     }
-}
-
-#[cfg(target_arch = "x86_64")]
-mod nr {
-    pub(super) const FCHMOD: usize = 91;
-    pub(super) const FCHOWN: usize = 93;
-    pub(super) const GETGROUPS: usize = 115;
-    pub(super) const SETGROUPS: usize = 116;
-    pub(super) const SETRESUID: usize = 117;
-    pub(super) const GETRESUID: usize = 118;
-    pub(super) const SETRESGID: usize = 119;
-    pub(super) const GETRESGID: usize = 120;
-}
-
-#[cfg(target_arch = "aarch64")]
-mod nr {
-    pub(super) const FCHMOD: usize = 52;
-    pub(super) const FCHOWN: usize = 55;
-    pub(super) const SETRESUID: usize = 147;
-    pub(super) const GETRESUID: usize = 148;
-    pub(super) const SETRESGID: usize = 149;
-    pub(super) const GETRESGID: usize = 150;
-    pub(super) const GETGROUPS: usize = 158;
-    pub(super) const SETGROUPS: usize = 159;
 }

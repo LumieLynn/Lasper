@@ -4,10 +4,14 @@ use lasper_guest_protocol::{
     MAX_IDENTITY_MESSAGE_BYTES,
 };
 
+use crate::linux::uapi::{
+    errno::EINTR,
+    socket::{
+        MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_NOSIGNAL, MSG_TRUNC, SCM_PIDFD, SCM_RIGHTS, SOL_SOCKET,
+    },
+};
 use crate::socket::{
     close, cmsg_align, recvmsg, sendmsg, shutdown, ControlMessageHeader, Iovec, MessageHeader,
-    EINTR, MSG_CMSG_CLOEXEC, MSG_CTRUNC, MSG_NOSIGNAL, MSG_TRUNC, SCM_PIDFD, SCM_RIGHTS,
-    SOL_SOCKET,
 };
 
 #[repr(C, align(16))]
@@ -152,7 +156,7 @@ fn send_packet(fd: i32, packet: &[u8]) -> Result<(), IdentityTransportError> {
 
     loop {
         let result = sendmsg(fd, &message, MSG_NOSIGNAL);
-        if result == -EINTR {
+        if result == -(EINTR as isize) {
             continue;
         }
         if result < 0 {
@@ -182,7 +186,7 @@ fn receive_packet(fd: i32, packet: &mut [u8]) -> Result<usize, IdentityTransport
         message.control_length = size_of::<AncillaryBuffer>();
         message.flags = 0;
         let result = recvmsg(fd, &mut message, MSG_CMSG_CLOEXEC);
-        if result == -EINTR {
+        if result == -(EINTR as isize) {
             continue;
         }
         if result < 0 {

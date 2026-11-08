@@ -1,3 +1,4 @@
+use crate::linux::uapi::errno::EIO;
 use core::marker::PhantomData;
 use lasper_guest_protocol::{
     ExecutionKind, PreparationId, PrepareReady, PrepareRequestFrame, SessionPayloadError,
@@ -5,8 +6,9 @@ use lasper_guest_protocol::{
 };
 
 use super::children::{visit_direct_children, Children, CleanupProgress};
+use super::error::SystemResultExt;
 use super::lifecycle::ExecOutcome;
-use super::linux::{self, Descriptor, Pipe, Terminal, EIO};
+use super::linux::{self, Descriptor, Pipe, Terminal};
 use super::ready::ReadyResources;
 use super::status::{WorkerFailure, WorkerStage, WorkerStatus};
 use super::worker::{encode_start, WorkerBootstrap, WorkerChannels, START_BYTES};
@@ -85,8 +87,6 @@ impl<'a> GuardianWorker<'a> {
         if existing {
             return Err(GuardianError::ExistingChildren);
         }
-        linux::guardian_signals().context("set guardian signal dispositions")?;
-        linux::set_subreaper().context("set guardian subreaper")?;
         let start = Pipe::new().context("create worker Start pipe")?;
         start
             .writer
@@ -426,15 +426,5 @@ impl Drop for GuardianWorker<'_> {
             self.start = StartDelivery::Cancelled;
         }
         self.children.finish_on_drop();
-    }
-}
-
-trait SystemResultExt<T> {
-    fn context(self, operation: &'static str) -> Result<T, GuardianError>;
-}
-
-impl<T> SystemResultExt<T> for Result<T, i32> {
-    fn context(self, operation: &'static str) -> Result<T, GuardianError> {
-        self.map_err(|errno| GuardianError::System { operation, errno })
     }
 }

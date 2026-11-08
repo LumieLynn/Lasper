@@ -51,10 +51,12 @@ fn request(process: GuestProcess<'_>, interactive: bool) -> PrepareRequestFrame<
     )
 }
 
-fn spawn<'a>(request: &PrepareRequestFrame<'a>) -> SessionGuardian<'a> {
-    // SAFETY: Each scenario is a fresh single-threaded process. The entry only
-    // chroots into the fixture and runs allocation-free worker setup.
-    unsafe { SessionGuardian::spawn(request.clone(), PREPARATION, now_ms(), fixture::entry) }
+fn spawn<'a>(
+    context: &mut GuardianContext,
+    request: &PrepareRequestFrame<'a>,
+) -> SessionGuardian<'a> {
+    context
+        .spawn(request.clone(), PREPARATION, now_ms(), fixture::entry)
         .unwrap()
 }
 
@@ -200,14 +202,14 @@ fn completed(
     }
 }
 
-fn login_snapshot() {
+fn login_snapshot(context: &mut GuardianContext) {
     let fixture = fixture::get();
     fixture.shell_script("printf 'argv0=%s\\nhome=%s\\nuser=%s\\nlogname=%s\\nshell=%s\\nterm=%s\\ncolor=%s\\nno_color=<%s>\\ncwd=' \"$0\" \"$HOME\" \"$USER\" \"$LOGNAME\" \"$SHELL\" \"$TERM\" \"$COLORTERM\" \"$NO_COLOR\"; pwd; printf 'sudo=%s\\nrun0=%s\\nld=%s\\n' \"${SUDO_USER-unset}\" \"${SYSTEMD_EXEC_PID-unset}\" \"${LD_PRELOAD-unset}\"; exit 0\n");
     std::env::set_var("SUDO_USER", "must-not-leak");
     std::env::set_var("SYSTEMD_EXEC_PID", "123");
     std::env::set_var("LD_PRELOAD", "/must-not-leak.so");
     let request = request(GuestProcess::LoginShell, true);
-    let mut worker = spawn(&request);
+    let mut worker = spawn(context, &request);
     prepared(&mut worker);
     assert_credentials(&worker, &fixture.groups);
     assert_terminal_owner(&worker);
@@ -242,7 +244,7 @@ fn login_snapshot() {
     drop(worker);
 }
 
-fn command_arguments() {
+fn command_arguments(context: &mut GuardianContext) {
     let fixture = fixture::get();
     fixture.write_account("/home/alice", "/usr/sbin/nologin", fixture.uid, fixture.gid);
     let command = CommandArgv::new(&[
@@ -256,7 +258,7 @@ fn command_arguments() {
     ])
     .unwrap();
     let request = request(GuestProcess::Command(command), false);
-    let mut worker = spawn(&request);
+    let mut worker = spawn(context, &request);
     prepared(&mut worker);
     assert_credentials(&worker, &fixture.groups);
     let _ready = fixture::receive_ready(&mut worker, now_ms());
@@ -271,7 +273,7 @@ fn command_arguments() {
     drop(worker);
 }
 
-fn failure(stage: WorkerStage, errno: i32) {
+fn failure(context: &mut GuardianContext, stage: WorkerStage, errno: i32) {
     let interactive = !matches!(
         stage,
         WorkerStage::UserIdentity | WorkerStage::GroupIdentity | WorkerStage::SupplementaryGroups
@@ -282,7 +284,7 @@ fn failure(stage: WorkerStage, errno: i32) {
         GuestProcess::Command(CommandArgv::new(&["/bin/account-shell", "-c", "exit 0"]).unwrap())
     };
     let request = request(process, interactive);
-    let mut worker = spawn(&request);
+    let mut worker = spawn(context, &request);
     let deadline = Instant::now() + Duration::from_secs(4);
     loop {
         let observation = worker.poll(now_ms()).unwrap();
@@ -304,33 +306,33 @@ fn failure(stage: WorkerStage, errno: i32) {
     drop(worker);
 }
 
-fn denied_groups() {
+fn denied_groups(context: &mut GuardianContext) {
     std::fs::write(fixture::get().path("etc/group"), "extra:x:1:alice\n").unwrap();
-    failure(WorkerStage::SupplementaryGroups, 1);
+    failure(context, WorkerStage::SupplementaryGroups, 1);
 }
 
-fn denied_home() {
+fn denied_home(context: &mut GuardianContext) {
     std::fs::set_permissions(
         fixture::get().path("home/alice"),
         std::fs::Permissions::from_mode(0o0),
     )
     .unwrap();
-    failure(WorkerStage::HomeDirectory, 13);
+    failure(context, WorkerStage::HomeDirectory, 13);
 }
 
-fn unmapped_uid() {
+fn unmapped_uid(context: &mut GuardianContext) {
     let fixture = fixture::get();
     fixture.write_account("/home/alice", "/bin/account-shell", 1, fixture.gid);
-    failure(WorkerStage::UserIdentity, 22);
+    failure(context, WorkerStage::UserIdentity, 22);
 }
 
-fn unmapped_gid() {
+fn unmapped_gid(context: &mut GuardianContext) {
     let fixture = fixture::get();
     fixture.write_account("/home/alice", "/bin/account-shell", fixture.uid, 1);
-    failure(WorkerStage::SupplementaryGroups, 1);
+    failure(context, WorkerStage::SupplementaryGroups, 1);
 }
 
-fn missing_home() {
+fn missing_home(context: &mut GuardianContext) {
     let fixture = fixture::get();
     fixture.write_account(
         "/does-not-exist",
@@ -338,36 +340,36 @@ fn missing_home() {
         fixture.uid,
         fixture.gid,
     );
-    failure(WorkerStage::HomeDirectory, 2);
+    failure(context, WorkerStage::HomeDirectory, 2);
 }
 
-fn missing_shell() {
+fn missing_shell(context: &mut GuardianContext) {
     let fixture = fixture::get();
     fixture.write_account("/home/alice", "/missing-shell", fixture.uid, fixture.gid);
-    failure(WorkerStage::LoginShell, 2);
+    failure(context, WorkerStage::LoginShell, 2);
 }
 
-fn nologin() {
+fn nologin(context: &mut GuardianContext) {
     let fixture = fixture::get();
     fixture.write_account("/home/alice", "/usr/sbin/nologin", fixture.uid, fixture.gid);
-    failure(WorkerStage::LoginDisabled, 13);
+    failure(context, WorkerStage::LoginDisabled, 13);
 }
 
-fn non_executable_shell() {
+fn non_executable_shell(context: &mut GuardianContext) {
     std::fs::set_permissions(
         fixture::get().path("bin/account-shell"),
         std::fs::Permissions::from_mode(0o644),
     )
     .unwrap();
-    failure(WorkerStage::LoginShell, 13);
+    failure(context, WorkerStage::LoginShell, 13);
 }
 
-fn malformed_groups() {
+fn malformed_groups(context: &mut GuardianContext) {
     std::fs::write(fixture::get().path("etc/group"), "broken\n").unwrap();
-    failure(WorkerStage::GroupDatabase, 22);
+    failure(context, WorkerStage::GroupDatabase, 22);
 }
 
-fn missing_groups() {
+fn missing_groups(context: &mut GuardianContext) {
     let fixture = fixture::get();
     assert_eq!(
         unsafe { setgroups(fixture.groups.len(), fixture.groups.as_ptr()) },
@@ -380,7 +382,7 @@ fn missing_groups() {
         ),
         false,
     );
-    let mut worker = spawn(&request);
+    let mut worker = spawn(context, &request);
     prepared(&mut worker);
     assert_credentials(&worker, &[fixture.gid]);
     let ready = fixture::receive_ready(&mut worker, now_ms());
@@ -392,27 +394,27 @@ fn missing_groups() {
     assert_eq!(output, "minimal");
 }
 
-fn invalid_group_file_type() {
+fn invalid_group_file_type(context: &mut GuardianContext) {
     let path = fixture::get().path("etc/group");
     std::fs::remove_file(&path).unwrap();
     std::fs::create_dir(path).unwrap();
-    failure(WorkerStage::GroupDatabase, 13);
+    failure(context, WorkerStage::GroupDatabase, 13);
 }
 
-fn oversized_passwd() {
+fn oversized_passwd(context: &mut GuardianContext) {
     std::fs::write(fixture::get().path("etc/passwd"), vec![b'#'; 65537]).unwrap();
-    failure(WorkerStage::Account, 27);
+    failure(context, WorkerStage::Account, 27);
 }
 
-fn fifo_database() {
+fn fifo_database(context: &mut GuardianContext) {
     let path = fixture::get().path("etc/passwd");
     std::fs::remove_file(&path).unwrap();
     let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
     assert_eq!(unsafe { mkfifo(path.as_ptr(), 0o600) }, 0);
-    failure(WorkerStage::Account, 13);
+    failure(context, WorkerStage::Account, 13);
 }
 
-pub(super) const SCENARIOS: &[(&str, fn(), Mode)] = &[
+pub(super) const SCENARIOS: &[(&str, super::ScenarioFn, Mode)] = &[
     (
         "login shell uses prepared account snapshot and clean environment",
         login_snapshot,

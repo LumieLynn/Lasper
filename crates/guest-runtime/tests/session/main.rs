@@ -1,11 +1,15 @@
 mod accounts;
 mod fixture;
+#[path = "../support/guardian.rs"]
+pub mod guardian_fixture;
 mod lifecycle;
 mod memory;
 
+use lasper_guest_runtime::session::GuardianContext;
 use std::os::unix::process::CommandExt;
 use std::process::Command;
-use std::time::{Duration, Instant};
+
+type ScenarioFn = fn(&mut GuardianContext);
 
 unsafe extern "C" {
     fn getuid() -> u32;
@@ -31,13 +35,7 @@ fn main() {
         );
     }
     if arguments.first().map(String::as_str) == Some("--scenario") {
-        let name = &arguments[1];
-        let (_, run, _) = scenarios()
-            .find(|(candidate, _, _)| candidate == name)
-            .unwrap();
-        let _fixture = fixture::initialize(privileged);
-        run();
-        return;
+        guardian_fixture::enter(run_scenario);
     }
     if !privileged && !arguments.iter().any(|argument| argument == "--ignored") {
         println!("guest session: namespace tests ignored; run --test session -- --ignored");
@@ -60,26 +58,28 @@ fn main() {
         unsafe {
             command.pre_exec(memory::limit_stack);
         }
-        let mut child = command.spawn().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                assert!(status.success(), "session scenario {name}: {status}");
-                passed += 1;
-                break;
-            }
-            if Instant::now() >= deadline {
-                child.kill().unwrap();
-                let _ = child.wait();
-                panic!("session scenario {name} exceeded its deadline");
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
+        let mut guardian = guardian_fixture::GuardianProcess::spawn(command).unwrap();
+        guardian.release();
+        guardian.hello();
+        let status = guardian.wait();
+        assert!(status.success(), "session scenario {name}: {status}");
+        passed += 1;
     }
     println!("guest session: {passed} scenarios passed");
 }
 
-fn scenarios() -> impl Iterator<Item = (&'static str, fn(), Mode)> {
+fn run_scenario(mut context: GuardianContext) -> i32 {
+    let arguments: Vec<_> = std::env::args().skip(1).collect();
+    let name = &arguments[1];
+    let (_, run, _) = scenarios()
+        .find(|(candidate, _, _)| candidate == name)
+        .unwrap();
+    let _fixture = fixture::initialize(arguments.iter().any(|argument| argument == "--privileged"));
+    run(&mut context);
+    0
+}
+
+fn scenarios() -> impl Iterator<Item = (&'static str, ScenarioFn, Mode)> {
     accounts::SCENARIOS.iter().copied().chain(
         lifecycle::SCENARIOS
             .iter()

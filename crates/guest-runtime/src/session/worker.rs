@@ -4,10 +4,11 @@ use lasper_guest_protocol::{
 };
 
 use crate::identity::GuestIdentityChannel;
+use crate::linux::uapi::errno::{EINTR, EINVAL, EIO};
 
 use super::account::Account;
 use super::execution;
-use super::linux::{self, Descriptor, PollFd, EINVAL, EIO};
+use super::linux::{self, Descriptor, PollFd};
 use super::memory::WorkerMemory;
 use super::status::{StatusMessage, WorkerFailure, WorkerStage};
 
@@ -140,7 +141,7 @@ impl<'a> WorkerBootstrap<'a> {
         loop {
             let mut fds = [PollFd::new(self.start.raw()), PollFd::new(identity_fd)];
             if let Err(errno) = linux::poll(&mut fds, None) {
-                if errno == linux::EINTR {
+                if errno == EINTR {
                     continue;
                 }
                 fail(&self.status, WorkerFailure::new(WorkerStage::Start, errno));

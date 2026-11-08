@@ -1,47 +1,28 @@
 use core::ffi::CStr;
-use core::mem::size_of;
+use core::mem::{align_of, offset_of, size_of};
 
-use crate::socket::{close, SOL_SOCKET};
+use crate::linux::uapi::{
+    errno::{EINTR, EIO},
+    file::{
+        AT_FDCWD, FD_CLOEXEC, F_DUPFD_CLOEXEC, F_GETFD, F_GETFL, F_SETFD, F_SETFL, O_CLOEXEC,
+        O_DIRECTORY, O_NOCTTY, O_NONBLOCK, O_RDWR,
+    },
+    nr,
+    poll::POLLIN,
+    process::{CLD_EXITED, PR_SET_CHILD_SUBREAPER, P_PID, WEXITED, WNOHANG, WNOWAIT},
+    signal::{
+        SIGCHLD, SIGCONT, SIGHUP, SIGINT, SIGPIPE, SIGQUIT, SIGTERM, SIGTSTP, SIGTTIN, SIGTTOU,
+        SIG_BLOCK, SIG_SETMASK,
+    },
+    socket::{AF_UNIX, SOCK_SEQPACKET, SOL_SOCKET, SO_PASSCRED},
+    terminal::{TIOCGPTPEER, TIOCSCTTY, TIOCSPGRP, TIOCSPTLCK, TIOCSWINSZ},
+    time::CLOCK_MONOTONIC,
+};
+use crate::socket::close;
 use crate::syscall::{syscall1, syscall2, syscall3, syscall4, syscall5};
 use lasper_guest_protocol::TerminalSize;
 
 use super::WorkerExit;
-
-pub(super) const EINTR: i32 = 4;
-pub(super) const EIO: i32 = 5;
-pub(super) const ECHILD: i32 = 10;
-pub(super) const EAGAIN: i32 = 11;
-pub(super) const EINVAL: i32 = 22;
-pub(super) const ESRCH: i32 = 3;
-pub(super) const SIGKILL: i32 = 9;
-pub(super) const SIGHUP: i32 = 1;
-pub(super) const SIGTERM: i32 = 15;
-const SIGCHLD: usize = 17;
-const SIGPIPE: usize = 13;
-const O_RDWR: usize = 2;
-const O_NONBLOCK: usize = 0o4000;
-const O_CLOEXEC: usize = 0o2000000;
-const O_NOCTTY: usize = 0o400;
-const O_DIRECTORY: usize = 0o200000;
-const AT_FDCWD: usize = -100isize as usize;
-const WNOHANG: usize = 1;
-const WEXITED: usize = 4;
-const WNOWAIT: usize = 0x0100_0000;
-const F_GETFL: usize = 3;
-const F_SETFL: usize = 4;
-const F_DUPFD_CLOEXEC: usize = 1030;
-const AF_UNIX: usize = 1;
-const SOCK_SEQPACKET: usize = 5;
-const SO_PASSCRED: usize = 16;
-const TIOCSWINSZ: usize = 0x5414;
-const TIOCSCTTY: usize = 0x540e;
-const TIOCSPGRP: usize = 0x5410;
-const TIOCSPTLCK: usize = 0x4004_5431;
-const TIOCGPTPEER: usize = 0x5441;
-const PR_SET_CHILD_SUBREAPER: usize = 36;
-const SIG_SETMASK: usize = 2;
-const P_PID: usize = 1;
-const CLD_EXITED: i32 = 1;
 
 pub(super) struct Descriptor(i32);
 
@@ -75,6 +56,14 @@ impl Descriptor {
         Ok(())
     }
 
+    pub(super) fn cloexec(&self) -> Result<(), i32> {
+        let flags = result_or_errno(unsafe { syscall3(nr::FCNTL, self.0 as usize, F_GETFD, 0) })?;
+        result_or_errno(unsafe {
+            syscall3(nr::FCNTL, self.0 as usize, F_SETFD, flags | FD_CLOEXEC)
+        })?;
+        Ok(())
+    }
+
     pub(super) fn duplicate_to(&self, target: i32) -> Result<(), i32> {
         result_or_errno(unsafe { syscall3(nr::DUP3, self.0 as usize, target as usize, 0) })?;
         Ok(())
@@ -98,20 +87,7 @@ impl Descriptor {
     }
 
     pub(super) fn write(&self, bytes: &[u8]) -> Result<usize, i32> {
-        loop {
-            // SAFETY: The input slice remains readable for the syscall.
-            let result = unsafe {
-                syscall3(
-                    nr::WRITE,
-                    self.0 as usize,
-                    bytes.as_ptr() as usize,
-                    bytes.len(),
-                )
-            };
-            if result != -(EINTR as isize) {
-                return result_or_errno(result);
-            }
-        }
+        write(self.0, bytes)
     }
 
     pub(super) fn write_all(&self, mut bytes: &[u8]) -> Result<(), i32> {
@@ -123,6 +99,17 @@ impl Descriptor {
             bytes = &bytes[count..];
         }
         Ok(())
+    }
+}
+
+pub(super) fn write(fd: i32, bytes: &[u8]) -> Result<usize, i32> {
+    loop {
+        // SAFETY: The input slice remains readable for the syscall.
+        let result =
+            unsafe { syscall3(nr::WRITE, fd as usize, bytes.as_ptr() as usize, bytes.len()) };
+        if result != -(EINTR as isize) {
+            return result_or_errno(result);
+        }
     }
 }
 
@@ -290,7 +277,16 @@ struct SignalAction {
     mask: u64,
 }
 
-fn signal_disposition(signal: usize, ignore: bool) -> Result<(), i32> {
+const _: () = {
+    assert!(size_of::<SignalAction>() == 32);
+    assert!(align_of::<SignalAction>() == 8);
+    assert!(offset_of!(SignalAction, handler) == 0);
+    assert!(offset_of!(SignalAction, flags) == 8);
+    assert!(offset_of!(SignalAction, restorer) == 16);
+    assert!(offset_of!(SignalAction, mask) == 24);
+};
+
+fn signal_disposition(signal: i32, ignore: bool) -> Result<(), i32> {
     let action = SignalAction {
         handler: usize::from(ignore),
         flags: 0,
@@ -299,19 +295,64 @@ fn signal_disposition(signal: usize, ignore: bool) -> Result<(), i32> {
     };
     // SAFETY: This is the kernel sigaction layout, with an eight-byte sigset.
     result_or_errno(unsafe {
-        syscall4(nr::RT_SIGACTION, signal, &action as *const _ as usize, 0, 8)
+        syscall4(
+            nr::RT_SIGACTION,
+            signal as usize,
+            &action as *const _ as usize,
+            0,
+            8,
+        )
     })?;
     Ok(())
 }
 
 pub(super) fn guardian_signals() -> Result<(), i32> {
     // Children must remain waitable, including when the broker ignored SIGCHLD.
-    signal_disposition(SIGCHLD, false)?;
+    for signal in [SIGCHLD, SIGINT, SIGQUIT, SIGTERM] {
+        signal_disposition(signal, false)?;
+    }
+    Ok(())
+}
+
+pub(super) fn ignore_sigpipe() -> Result<(), i32> {
     signal_disposition(SIGPIPE, true)
 }
 
+pub(super) fn block_signals(mask: u64) -> Result<(), i32> {
+    // SAFETY: mask is a live kernel-sized signal set, borrowed for this syscall.
+    result_or_errno(unsafe {
+        syscall4(
+            nr::RT_SIGPROCMASK,
+            SIG_BLOCK,
+            &mask as *const _ as usize,
+            0,
+            8,
+        )
+    })?;
+    Ok(())
+}
+
+pub(super) fn signal_fd(mask: u64) -> Result<Descriptor, i32> {
+    Descriptor::adopt(unsafe {
+        syscall4(
+            nr::SIGNALFD4,
+            usize::MAX,
+            &mask as *const _ as usize,
+            8,
+            O_NONBLOCK | O_CLOEXEC,
+        )
+    })
+}
+
+pub(super) fn validate_descriptor(fd: i32) -> Result<(), i32> {
+    result_or_errno(unsafe { syscall3(nr::FCNTL, fd as usize, F_GETFD, 0) })?;
+    Ok(())
+}
+
 pub(super) fn worker_signals() -> Result<(), i32> {
-    for signal in [1, 2, 3, 13, 15, 17, 18, 20, 21, 22] {
+    for signal in [
+        SIGHUP, SIGINT, SIGQUIT, SIGPIPE, SIGTERM, SIGCHLD, SIGCONT, SIGTSTP, SIGTTIN, SIGTTOU,
+    ] {
         signal_disposition(signal, false)?;
     }
     let empty = 0u64;
@@ -331,12 +372,13 @@ pub(super) fn worker_signals() -> Result<(), i32> {
 pub(super) unsafe fn fork() -> Result<i32, i32> {
     // A null child stack gives fork semantics. No VM, files, or signal handlers
     // are shared; the last two clone arguments are null on both architectures.
-    result_or_errno(unsafe { syscall5(nr::CLONE, SIGCHLD, 0, 0, 0, 0) }).map(|pid| pid as i32)
+    result_or_errno(unsafe { syscall5(nr::CLONE, SIGCHLD as usize, 0, 0, 0, 0) })
+        .map(|pid| pid as i32)
 }
 
 pub(super) fn pidfd(pid: i32) -> Result<Descriptor, i32> {
     loop {
-        let result = unsafe { syscall2(434, pid as usize, 0) };
+        let result = unsafe { syscall2(nr::PIDFD_OPEN, pid as usize, 0) };
         if result != -(EINTR as isize) {
             return Descriptor::adopt(result);
         }
@@ -359,6 +401,18 @@ struct WaitInfo {
     status: i32,
     rest: [u8; 100],
 }
+
+const _: () = {
+    assert!(size_of::<WaitInfo>() == 128);
+    assert!(align_of::<WaitInfo>() == 8);
+    assert!(offset_of!(WaitInfo, signal) == 0);
+    assert!(offset_of!(WaitInfo, errno) == 4);
+    assert!(offset_of!(WaitInfo, code) == 8);
+    assert!(offset_of!(WaitInfo, pid) == 16);
+    assert!(offset_of!(WaitInfo, uid) == 20);
+    assert!(offset_of!(WaitInfo, status) == 24);
+    assert!(offset_of!(WaitInfo, rest) == 28);
+};
 
 pub(super) fn observe_exit(pid: i32) -> Result<Option<WorkerExit>, i32> {
     let mut info = WaitInfo {
@@ -435,11 +489,19 @@ pub(super) struct PollFd {
     pub(super) returned: i16,
 }
 
+const _: () = {
+    assert!(size_of::<PollFd>() == 8);
+    assert!(align_of::<PollFd>() == 4);
+    assert!(offset_of!(PollFd, fd) == 0);
+    assert!(offset_of!(PollFd, events) == 4);
+    assert!(offset_of!(PollFd, returned) == 6);
+};
+
 impl PollFd {
     pub(super) const fn new(fd: i32) -> Self {
         Self {
             fd,
-            events: 1,
+            events: POLLIN,
             returned: 0,
         }
     }
@@ -453,6 +515,29 @@ impl PollFd {
 struct Timespec {
     seconds: i64,
     nanoseconds: i64,
+}
+
+const _: () = {
+    assert!(size_of::<Timespec>() == 16);
+    assert!(align_of::<Timespec>() == 8);
+    assert!(offset_of!(Timespec, seconds) == 0);
+    assert!(offset_of!(Timespec, nanoseconds) == 8);
+};
+
+pub(super) fn monotonic_ms() -> Result<u64, i32> {
+    let mut time = Timespec {
+        seconds: 0,
+        nanoseconds: 0,
+    };
+    // SAFETY: The kernel initializes the complete timespec on success.
+    result_or_errno(unsafe {
+        syscall2(
+            nr::CLOCK_GETTIME,
+            CLOCK_MONOTONIC,
+            &mut time as *mut _ as usize,
+        )
+    })?;
+    Ok((time.seconds as u64).saturating_mul(1000) + time.nanoseconds as u64 / 1_000_000)
 }
 
 pub(super) fn poll(fds: &mut [PollFd], timeout_ms: Option<u64>) -> Result<(), i32> {
@@ -578,56 +663,6 @@ pub(super) fn result_or_errno(result: isize) -> Result<usize, i32> {
     }
 }
 
-#[cfg(target_arch = "x86_64")]
-mod nr {
-    pub(super) const READ: usize = 0;
-    pub(super) const WRITE: usize = 1;
-    pub(super) const RT_SIGACTION: usize = 13;
-    pub(super) const RT_SIGPROCMASK: usize = 14;
-    pub(super) const IOCTL: usize = 16;
-    pub(super) const GETPID: usize = 39;
-    pub(super) const SOCKETPAIR: usize = 53;
-    pub(super) const SETSOCKOPT: usize = 54;
-    pub(super) const CLONE: usize = 56;
-    pub(super) const EXECVE: usize = 59;
-    pub(super) const WAIT4: usize = 61;
-    pub(super) const KILL: usize = 62;
-    pub(super) const FCNTL: usize = 72;
-    pub(super) const SETSID: usize = 112;
-    pub(super) const PRCTL: usize = 157;
-    pub(super) const GETTID: usize = 186;
-    pub(super) const GETDENTS64: usize = 217;
-    pub(super) const EXIT_GROUP: usize = 231;
-    pub(super) const WAITID: usize = 247;
-    pub(super) const OPENAT: usize = 257;
-    pub(super) const PPOLL: usize = 271;
-    pub(super) const DUP3: usize = 292;
-    pub(super) const PIPE2: usize = 293;
-}
-
-#[cfg(target_arch = "aarch64")]
-mod nr {
-    pub(super) const DUP3: usize = 24;
-    pub(super) const FCNTL: usize = 25;
-    pub(super) const IOCTL: usize = 29;
-    pub(super) const OPENAT: usize = 56;
-    pub(super) const PIPE2: usize = 59;
-    pub(super) const GETDENTS64: usize = 61;
-    pub(super) const READ: usize = 63;
-    pub(super) const WRITE: usize = 64;
-    pub(super) const PPOLL: usize = 73;
-    pub(super) const EXIT_GROUP: usize = 94;
-    pub(super) const WAITID: usize = 95;
-    pub(super) const KILL: usize = 129;
-    pub(super) const RT_SIGACTION: usize = 134;
-    pub(super) const RT_SIGPROCMASK: usize = 135;
-    pub(super) const SETSID: usize = 157;
-    pub(super) const PRCTL: usize = 167;
-    pub(super) const GETPID: usize = 172;
-    pub(super) const GETTID: usize = 178;
-    pub(super) const SOCKETPAIR: usize = 199;
-    pub(super) const SETSOCKOPT: usize = 208;
-    pub(super) const CLONE: usize = 220;
-    pub(super) const EXECVE: usize = 221;
-    pub(super) const WAIT4: usize = 260;
-}
+#[cfg(test)]
+#[path = "../../tests/session/filesystem.rs"]
+mod tests;

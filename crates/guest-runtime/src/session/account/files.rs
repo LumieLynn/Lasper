@@ -1,22 +1,18 @@
 use core::ffi::CStr;
+use core::mem::{align_of, offset_of, size_of};
 
-use crate::session::linux::{result_or_errno, Descriptor, EIO};
+use crate::linux::uapi::{
+    errno::{EACCES, EFBIG, EINVAL, EIO},
+    file::{
+        AT_EMPTY_PATH, AT_FDCWD, O_CLOEXEC, O_NOCTTY, O_NONBLOCK, O_PATH, STATX_TYPE, S_IFMT,
+        S_IFREG, X_OK,
+    },
+    nr,
+};
+use crate::session::linux::{result_or_errno, Descriptor};
 use crate::syscall::{syscall1, syscall3, syscall5};
 
 use super::MAX_ACCOUNT_FILE_BYTES;
-
-const AT_FDCWD: usize = -100isize as usize;
-const O_CLOEXEC: usize = 0o2000000;
-const O_NONBLOCK: usize = 0o4000;
-const O_NOCTTY: usize = 0o400;
-const O_PATH: usize = 0o10000000;
-const AT_EMPTY_PATH: usize = 0x1000;
-const STATX_TYPE: usize = 1;
-const S_IFMT: u16 = 0o170000;
-const S_IFREG: u16 = 0o100000;
-const EFBIG: i32 = 27;
-const EINVAL: i32 = 22;
-const EACCES: i32 = 13;
 
 pub(super) fn read(path: &CStr, buffer: &mut [u8]) -> Result<usize, i32> {
     if buffer.len() <= MAX_ACCOUNT_FILE_BYTES {
@@ -43,7 +39,7 @@ pub(super) fn check_executable(path: &CStr) -> Result<(), i32> {
     let _file = open_regular(path, O_PATH)?;
     // access uses real IDs, which have already been made equal to effective
     // and saved IDs. O_PATH above does not require read permission on a shell.
-    result_or_errno(unsafe { syscall3(nr::FACCESSAT, AT_FDCWD, path.as_ptr() as usize, 1) })?;
+    result_or_errno(unsafe { syscall3(nr::FACCESSAT, AT_FDCWD, path.as_ptr() as usize, X_OK) })?;
     Ok(())
 }
 
@@ -93,20 +89,10 @@ struct Statx {
     remainder: [u64; 28],
 }
 
-const _: () = assert!(core::mem::size_of::<Statx>() == 256);
-
-#[cfg(target_arch = "x86_64")]
-mod nr {
-    pub(super) const OPENAT: usize = 257;
-    pub(super) const FACCESSAT: usize = 269;
-    pub(super) const CHDIR: usize = 80;
-    pub(super) const STATX: usize = 332;
-}
-
-#[cfg(target_arch = "aarch64")]
-mod nr {
-    pub(super) const OPENAT: usize = 56;
-    pub(super) const FACCESSAT: usize = 48;
-    pub(super) const CHDIR: usize = 49;
-    pub(super) const STATX: usize = 291;
-}
+const _: () = {
+    assert!(size_of::<Statx>() == 256);
+    assert!(align_of::<Statx>() == 8);
+    assert!(offset_of!(Statx, mask) == 0);
+    assert!(offset_of!(Statx, mode) == 28);
+    assert!(offset_of!(Statx, remainder) == 32);
+};

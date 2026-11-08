@@ -30,3 +30,8 @@ path = "tests/transport/main.rs"
 name = "session"
 path = "tests/session/main.rs"
 harness = false
+
+[[test]]
+name = "guardian"
+path = "tests/guardian/main.rs"
+harness = false

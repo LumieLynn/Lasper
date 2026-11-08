@@ -1,3 +1,4 @@
+use crate::linux::uapi::errno::{E2BIG, EEXIST, EINVAL, ENOENT};
 mod credentials;
 mod files;
 
@@ -11,10 +12,6 @@ use crate::session::{WorkerFailure, WorkerStage};
 pub(super) const MAX_ACCOUNT_FILE_BYTES: usize = 64 * 1024;
 const MAX_GROUPS: usize = 256;
 const MAX_PATH_BYTES: usize = 4096;
-const EINVAL: i32 = 22;
-const ENOENT: i32 = 2;
-const EEXIST: i32 = 17;
-const E2BIG: i32 = 7;
 
 /// This snapshot stays with the worker across Prepared and Start. Neither the
 /// identity reply nor exec resolves the account a second time.

@@ -1,4 +1,5 @@
-use crate::socket::{close, EINTR};
+use crate::linux::uapi::{errno::EINTR, nr};
+use crate::socket::close;
 use crate::syscall::{syscall1, syscall2};
 use core::fmt;
 use lasper_guest_protocol::{
@@ -15,11 +16,11 @@ pub struct GuestWorkerReadiness {
 impl GuestWorkerReadiness {
     pub fn check() -> Result<Self, GuestReadinessError> {
         // SAFETY: getpid does not dereference memory or consume descriptors.
-        let pid = unsafe { syscall1(SYS_GETPID, 0) };
+        let pid = unsafe { syscall1(nr::GETPID, 0) };
         loop {
             // SAFETY: pid identifies this live broker; flags is zero.
-            let descriptor = unsafe { syscall2(SYS_PIDFD_OPEN, pid as usize, 0) };
-            if descriptor == -EINTR {
+            let descriptor = unsafe { syscall2(nr::PIDFD_OPEN, pid as usize, 0) };
+            if descriptor == -(EINTR as isize) {
                 continue;
             }
             if descriptor < 0 {
@@ -115,12 +116,6 @@ impl fmt::Display for GuestReadinessError {
         }
     }
 }
-
-#[cfg(target_arch = "x86_64")]
-const SYS_GETPID: usize = 39;
-#[cfg(target_arch = "aarch64")]
-const SYS_GETPID: usize = 172;
-const SYS_PIDFD_OPEN: usize = 434;
 
 #[cfg(test)]
 mod tests {

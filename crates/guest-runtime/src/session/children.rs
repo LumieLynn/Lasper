@@ -1,8 +1,12 @@
 use core::ffi::CStr;
 use core::fmt::{self, Write};
 
-use super::linux::{self, Descriptor, ECHILD, EIO, ESRCH, SIGHUP, SIGKILL, SIGTERM};
+use super::linux::{self, Descriptor};
 use super::WorkerExit;
+use crate::linux::uapi::{
+    errno::{ECHILD, EIO, ESRCH},
+    signal::{SIGHUP, SIGKILL, SIGTERM},
+};
 
 const GRACE_MS: u64 = 1_000;
 const REAP_BUDGET: usize = 256;
