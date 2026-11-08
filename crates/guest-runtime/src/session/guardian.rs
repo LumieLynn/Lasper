@@ -1,13 +1,12 @@
 use lasper_guest_protocol::{
-    PreparationControl, PreparationControlFrame, PreparationId, PrepareReadyFrame,
-    PrepareRequestFrame, StartAcceptedFrame, StartFrame, MAX_PREPARED_LEASE_MS,
+    PreparationControl, PreparationControlFrame, PreparationId, PrepareRequestFrame,
+    StartAcceptedFrame, StartFrame, MAX_PREPARED_LEASE_MS,
 };
 
 use super::process::GuardianWorker;
 use super::{
-    CleanupProgress, CleanupReason, ExecOutcome, GuardianError, PreparedSession, SessionAction,
-    SessionConnection, SessionLifecycle, SessionPhase, WorkerBootstrap, WorkerDescriptors,
-    WorkerObservation,
+    CleanupProgress, CleanupReason, ExecOutcome, GuardianError, SessionAction, SessionConnection,
+    SessionLifecycle, SessionPhase, StartDecision, WorkerBootstrap, WorkerObservation, WorkerReady,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -21,7 +20,7 @@ pub struct GuardianObservation {
 /// events are applied by one guardian loop; callers do not synchronize a second
 /// process registry with the preparation state.
 pub struct SessionGuardian<'a> {
-    session: PreparedSession,
+    session: SessionLifecycle,
     worker: GuardianWorker<'a>,
 }
 
@@ -34,11 +33,13 @@ impl<'a> SessionGuardian<'a> {
     /// The caller must be a dedicated single-threaded guardian, with exclusive
     /// ownership of child creation/reaping. Entry is trusted helper code and
     /// must use fork-safe operations before exec/exit, without unwinding.
+    /// Its call chain must leave WORKER_STACK_BUDGET_BYTES available; spawning
+    /// from a deep recursive call or a smaller thread stack is unsupported.
     pub unsafe fn spawn(
         request: PrepareRequestFrame<'a>,
         preparation: PreparationId,
         now_ms: u64,
-        entry: fn(WorkerBootstrap<'a>) -> !,
+        entry: fn(WorkerBootstrap<'_>) -> !,
     ) -> Result<Self, GuardianError> {
         let lifecycle = SessionLifecycle::preparing(
             request.broker_id(),
@@ -50,7 +51,7 @@ impl<'a> SessionGuardian<'a> {
         // SAFETY: The caller guarantees exclusive child ownership and a fork-safe entry.
         let worker = unsafe { GuardianWorker::spawn(request, preparation, entry) }?;
         Ok(Self {
-            session: PreparedSession::new(lifecycle),
+            session: lifecycle,
             worker,
         })
     }
@@ -67,7 +68,10 @@ impl<'a> SessionGuardian<'a> {
     /// Running sessions have no preparation timer; cleanup has its own retries.
     pub const fn next_deadline_ms(&self) -> Option<u64> {
         match self.phase() {
-            SessionPhase::Preparing | SessionPhase::Prepared => Some(self.session.deadline_ms()),
+            SessionPhase::Preparing
+            | SessionPhase::Prepared
+            | SessionPhase::DeliveringReady
+            | SessionPhase::AwaitingStart => Some(self.session.deadline_ms()),
             SessionPhase::Closing | SessionPhase::CleanupPending => {
                 self.worker.cleanup_deadline_ms()
             }
@@ -80,6 +84,11 @@ impl<'a> SessionGuardian<'a> {
     pub fn poll(&mut self, now_ms: u64) -> Result<GuardianObservation, GuardianError> {
         if let Some(action) = self.session.tick(now_ms) {
             self.perform(action, now_ms);
+        }
+        // Ready can be dropped outside poll. Apply its cleanup decision before
+        // observing worker exit, retaining the original reason in the lifecycle.
+        if self.session.cleanup_reason().is_some() && self.phase() != SessionPhase::Closed {
+            self.worker.begin_cleanup(now_ms);
         }
         let worker = self.worker.poll(now_ms);
         if self.phase() == SessionPhase::Preparing && worker.prepared {
@@ -126,8 +135,14 @@ impl<'a> SessionGuardian<'a> {
         })
     }
 
-    pub fn ready_frame(&mut self, now_ms: u64) -> Result<PrepareReadyFrame, GuardianError> {
+    /// Polls worker setup and expiry before taking the one Ready delivery.
+    /// Call `deliver` on the returned owner to send it. Start is disabled until
+    /// that delivery succeeds; dropping it requests cleanup on the next poll.
+    pub fn take_ready(&mut self, now_ms: u64) -> Result<WorkerReady<'_>, GuardianError> {
         self.poll(now_ms)?;
+        if self.phase() == SessionPhase::AwaitingStart {
+            return Err(GuardianError::ReadyAlreadyTaken);
+        }
         if self.phase() != SessionPhase::Prepared {
             return Err(GuardianError::NotPrepared);
         }
@@ -136,18 +151,12 @@ impl<'a> SessionGuardian<'a> {
             .deadline_ms()
             .saturating_sub(now_ms)
             .min(u32::MAX as u64) as u32;
-        self.worker.ready_frame(remaining)
-    }
-
-    pub fn descriptors(&self) -> Result<WorkerDescriptors<'_>, GuardianError> {
-        if self.phase() != SessionPhase::Prepared {
-            return Err(GuardianError::NotPrepared);
-        }
-        self.worker.descriptors()
-    }
-
-    pub fn release_exported_descriptors(&mut self) {
-        self.worker.release_exported_descriptors();
+        let transition = self
+            .session
+            .begin_ready_delivery()
+            .map_err(GuardianError::Lifecycle)?;
+        let resources = self.worker.take_ready(remaining)?;
+        Ok(WorkerReady::new(resources, transition))
     }
 
     /// Handles control EOF or the broker-liveness pipe closing. The event loop
@@ -171,18 +180,17 @@ impl<'a> SessionGuardian<'a> {
             frame.request().broker_id(),
             frame.request().preparation_id(),
         );
-        let action = self
+        let decision = self
             .session
             .accept_start(now_ms, frame)
             .map_err(GuardianError::Lifecycle)?;
-        if action != SessionAction::StartAccepted {
-            self.perform(action, now_ms);
-            return Err(GuardianError::NotPrepared);
-        }
-        let start = self
-            .session
-            .take_start()
-            .expect("accepted Start retains its request");
+        let start = match decision {
+            StartDecision::Accepted(start) => start,
+            StartDecision::BeginCleanup(reason) => {
+                self.perform(SessionAction::BeginCleanup(reason), now_ms);
+                return Err(GuardianError::NotPrepared);
+            }
+        };
         if let Err(error) = self.worker.start(&start) {
             let action = self
                 .session

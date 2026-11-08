@@ -1,12 +1,14 @@
-use core::ffi::CStr;
 use lasper_guest_protocol::{
-    GuestIdentityReply, GuestProcess, IdentityChallenge, PreparationId, PrepareRequestFrame,
-    StartRequest, TerminalSize, MAX_COMMAND_ARGUMENTS,
+    ExecutionKind, GuestIdentityReply, GuestProcess, PreparationId, PrepareRequestFrame,
+    ProjectionObservations, ProjectionRequests, StartRequest, TerminalSize,
 };
 
 use crate::identity::GuestIdentityChannel;
 
+use super::account::Account;
+use super::execution;
 use super::linux::{self, Descriptor, PollFd, EINVAL, EIO};
+use super::memory::WorkerMemory;
 use super::status::{StatusMessage, WorkerFailure, WorkerStage};
 
 pub(super) struct WorkerChannels {
@@ -21,7 +23,7 @@ pub(super) struct WorkerChannels {
 impl WorkerChannels {
     pub(super) fn bootstrap<'a>(
         self,
-        request: PrepareRequestFrame<'a>,
+        request: &'a PrepareRequestFrame<'a>,
         preparation: PreparationId,
     ) -> WorkerBootstrap<'a> {
         let retained = [
@@ -71,10 +73,10 @@ impl WorkerChannels {
     }
 }
 
-/// The trusted worker entry resolves and switches account before calling
-/// `await_start`. It must not run a guest executable during preparation.
+/// The trusted worker entry calls `run` to prepare the account and wait for
+/// Start. It can report a setup failure, but cannot release an unchecked exec.
 pub struct WorkerBootstrap<'a> {
-    request: PrepareRequestFrame<'a>,
+    request: &'a PrepareRequestFrame<'a>,
     preparation: PreparationId,
     start: Descriptor,
     status: Descriptor,
@@ -83,22 +85,53 @@ pub struct WorkerBootstrap<'a> {
 
 impl<'a> WorkerBootstrap<'a> {
     pub const fn request(&self) -> &PrepareRequestFrame<'a> {
-        &self.request
+        self.request
     }
 
     pub fn fail(self, failure: WorkerFailure) -> ! {
         fail(&self.status, failure)
     }
 
-    /// Publishes readiness after account setup, then answers identity challenges
-    /// in this same process until its guardian releases Start or cancels it.
-    pub fn await_start(
+    /// Resolves local passwd/group, switches identity and enters home before
+    /// publishing Prepared. The observer runs under that selected identity.
+    ///
+    /// The worker owns one WORKER_MEMORY_BYTES mapping for its account and
+    /// buffers. exec/exit releases it; entries do not allocate a second workspace.
+    pub fn run(
+        self,
+        mut observe: impl FnMut(&ProjectionRequests) -> Result<ProjectionObservations, WorkerFailure>,
+    ) -> ! {
+        let mut memory = match WorkerMemory::new() {
+            Ok(memory) => memory,
+            Err(errno) => self.fail(WorkerFailure::new(WorkerStage::Memory, errno)),
+        };
+        let storage = memory.storage();
+        let account = Account::initialize(&mut storage.account);
+        if let Err(failure) = account.load(self.request.request().user(), &mut storage.scratch) {
+            self.fail(failure);
+        }
+        if let Err(failure) = account.enter(
+            self.request.request().execution() == ExecutionKind::Interactive,
+            matches!(self.request.request().process(), GuestProcess::LoginShell),
+        ) {
+            self.fail(failure);
+        }
+        let started = self.await_start(account, &mut storage.packet, &mut observe);
+        let failure = execution::execute(
+            account,
+            started.request.request(),
+            &started.start,
+            &mut storage.scratch,
+            &mut storage.packet,
+        );
+        fail(&started.status, failure)
+    }
+
+    fn await_start(
         mut self,
+        account: &Account,
         packet: &mut [u8],
-        mut observe: impl FnMut(
-            IdentityChallenge,
-            &PrepareRequestFrame<'a>,
-        ) -> Result<GuestIdentityReply, WorkerFailure>,
+        observe: &mut impl FnMut(&ProjectionRequests) -> Result<ProjectionObservations, WorkerFailure>,
     ) -> StartedWorker<'a> {
         if let Err(errno) = StatusMessage::Prepared.send(&self.status) {
             fail(&self.status, WorkerFailure::new(WorkerStage::Start, errno));
@@ -124,7 +157,7 @@ impl<'a> WorkerBootstrap<'a> {
                         }
                     }
                 }
-                let start = match decode_start(&self.request, self.preparation, command) {
+                let start = match decode_start(self.request, self.preparation, command) {
                     Ok(start) => start,
                     Err(failure) => fail(&self.status, failure),
                 };
@@ -149,9 +182,23 @@ impl<'a> WorkerBootstrap<'a> {
                         WorkerFailure::new(WorkerStage::Projection, EIO),
                     ),
                 };
-                let reply = match observe(challenge, &self.request) {
-                    Ok(reply) => reply,
+                let projections = match observe(self.request.request().projections()) {
+                    Ok(projections) => projections,
                     Err(failure) => fail(&self.status, failure),
+                };
+                let reply = match GuestIdentityReply::new(
+                    challenge,
+                    self.request.request(),
+                    account.username.as_str(),
+                    account.uid,
+                    account.gid,
+                    projections,
+                ) {
+                    Ok(reply) => reply,
+                    Err(_) => fail(
+                        &self.status,
+                        WorkerFailure::new(WorkerStage::Projection, EINVAL),
+                    ),
                 };
                 if self.identity.send_reply(&reply, packet).is_err() {
                     fail(
@@ -168,58 +215,12 @@ impl<'a> WorkerBootstrap<'a> {
     }
 }
 
-/// Only `await_start` can produce this owner. Its status pipe survives until
-/// exec, so a failed exec is distinguishable from a successfully closed pipe.
-pub struct StartedWorker<'a> {
-    request: PrepareRequestFrame<'a>,
+// The status pipe survives Start. exec closes it; setup or exec failure sends
+// an error before the worker exits.
+struct StartedWorker<'a> {
+    request: &'a PrepareRequestFrame<'a>,
     start: StartRequest,
     status: Descriptor,
-}
-
-impl<'a> StartedWorker<'a> {
-    pub const fn request(&self) -> &PrepareRequestFrame<'a> {
-        &self.request
-    }
-
-    pub const fn start(&self) -> &StartRequest {
-        &self.start
-    }
-
-    /// Builds argv from the original Prepare. The caller supplies storage,
-    /// not a second executable or replacement argument list.
-    pub fn exec_command(self, storage: &mut [u8], environment: &[&CStr]) -> ! {
-        let GuestProcess::Command(command) = self.request.request().process() else {
-            fail(&self.status, WorkerFailure::new(WorkerStage::Exec, EINVAL));
-        };
-        let length = match command.write_nul_terminated_into(storage) {
-            Ok(length) => length,
-            Err(_) => fail(&self.status, WorkerFailure::new(WorkerStage::Exec, EINVAL)),
-        };
-        if environment.len() > 32 {
-            fail(&self.status, WorkerFailure::new(WorkerStage::Exec, EINVAL));
-        }
-        let mut arguments = [core::ptr::null(); MAX_COMMAND_ARGUMENTS + 2];
-        for (target, value) in arguments
-            .iter_mut()
-            .zip(storage[..length].split_inclusive(|byte| *byte == 0))
-        {
-            *target = value.as_ptr();
-        }
-        let program_end = storage[..length]
-            .iter()
-            .position(|byte| *byte == 0)
-            .expect("validated argv has an executable");
-        let program = CStr::from_bytes_with_nul(&storage[..=program_end])
-            .expect("validated executable has one trailing NUL");
-        let mut variables = [core::ptr::null(); 33];
-        for (target, source) in variables.iter_mut().zip(environment) {
-            *target = source.as_ptr().cast::<u8>();
-        }
-        // SAFETY: The CStr references outlive execve; both arrays have a spare
-        // null slot and no inherited host environment is passed implicitly.
-        let errno = unsafe { linux::execve(program, &arguments, &variables) };
-        fail(&self.status, WorkerFailure::new(WorkerStage::Exec, errno))
-    }
 }
 
 pub(super) const START_BYTES: usize = 8;

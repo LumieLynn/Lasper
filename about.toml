@@ -21,6 +21,10 @@ targets = [
 ignore-dev-dependencies = true
 ignore-build-dependencies = false
 
+# Unpublished workspace crates are Lasper source, covered by the project license.
+[private]
+ignore = true
+
 # These Rio crates omit their workspace license from the published package.
 # Pin the upstream text and preserve the additional source-level notices.
 [rio-vt.clarify]

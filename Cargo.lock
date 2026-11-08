@@ -1125,6 +1125,7 @@ dependencies = [
  "fs2",
  "futures-util",
  "hex",
+ "lasper-local-accounts",
  "libc",
  "linux-raw-sys",
  "log",
@@ -1183,7 +1184,12 @@ name = "lasper-guest-runtime"
 version = "0.1.0"
 dependencies = [
  "lasper-guest-protocol",
+ "lasper-local-accounts",
 ]
+
+[[package]]
+name = "lasper-local-accounts"
+version = "0.1.0"
 
 [[package]]
 name = "lazy_static"

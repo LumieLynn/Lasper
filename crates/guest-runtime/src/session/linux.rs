@@ -46,7 +46,7 @@ const CLD_EXITED: i32 = 1;
 pub(super) struct Descriptor(i32);
 
 impl Descriptor {
-    fn adopt(result: isize) -> Result<Self, i32> {
+    pub(super) fn adopt(result: isize) -> Result<Self, i32> {
         let fd = result_or_errno(result)? as i32;
         if fd >= 3 {
             return Ok(Self(fd));

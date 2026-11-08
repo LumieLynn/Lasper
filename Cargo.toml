@@ -10,6 +10,7 @@ members = [
     "crates/guest-host-transport",
     "crates/guest-protocol",
     "crates/guest-runtime",
+    "crates/local-accounts",
 ]
 default-members = ["."]
 resolver = "2"
@@ -19,6 +20,7 @@ name = "lasper"
 path = "src/main.rs"
 
 [dependencies]
+lasper-local-accounts = { path = "crates/local-accounts" }
 ratatui = { version = "0.30", default-features = false, features = [
     "all-widgets",
     "crossterm",

@@ -1,38 +1,27 @@
 use core::marker::PhantomData;
 use lasper_guest_protocol::{
-    ExecutionKind, PreparationId, PrepareReady, PrepareReadyFrame, PrepareRequestFrame,
-    SessionPayloadError, StartRequest,
+    ExecutionKind, PreparationId, PrepareReady, PrepareRequestFrame, SessionPayloadError,
+    StartRequest,
 };
 
 use super::children::{visit_direct_children, Children, CleanupProgress};
 use super::lifecycle::ExecOutcome;
 use super::linux::{self, Descriptor, Pipe, Terminal, EIO};
+use super::ready::ReadyResources;
 use super::status::{WorkerFailure, WorkerStage, WorkerStatus};
 use super::worker::{encode_start, WorkerBootstrap, WorkerChannels, START_BYTES};
 use super::{GuardianError, WorkerExit};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WorkerObservation {
+    /// Worker account/session setup is complete. Ready delivery and Start
+    /// eligibility belong to the guardian's protocol phase.
     pub prepared: bool,
     pub exec: Option<ExecOutcome>,
     pub exit: Option<WorkerExit>,
     pub failure: Option<WorkerFailure>,
     pub error: Option<GuardianError>,
     pub cleanup: CleanupProgress,
-}
-
-/// Borrowed descriptors in PrepareReady order. Sending SCM_RIGHTS duplicates
-/// them; the guardian still owns them until `release_exported_descriptors`.
-pub struct WorkerDescriptors<'a> {
-    fds: [i32; 3],
-    length: usize,
-    owner: PhantomData<&'a GuardianWorker<'a>>,
-}
-
-impl WorkerDescriptors<'_> {
-    pub fn as_raw_fds(&self) -> &[i32] {
-        &self.fds[..self.length]
-    }
 }
 
 /// Kernel resources for one guardian's worker. SessionLifecycle decides which
@@ -85,38 +74,38 @@ impl<'a> GuardianWorker<'a> {
     pub unsafe fn spawn(
         request: PrepareRequestFrame<'a>,
         preparation: PreparationId,
-        entry: fn(WorkerBootstrap<'a>) -> !,
+        entry: fn(WorkerBootstrap<'_>) -> !,
     ) -> Result<Self, GuardianError> {
         let mut existing = false;
         visit_direct_children(linux::pid(), linux::tid(), |_| {
             existing = true;
             Ok(())
         })
-        .map_err(system("inspect guardian children"))?;
+        .context("inspect guardian children")?;
         if existing {
             return Err(GuardianError::ExistingChildren);
         }
-        linux::guardian_signals().map_err(system("set guardian signal dispositions"))?;
-        linux::set_subreaper().map_err(system("set guardian subreaper"))?;
-        let start = Pipe::new().map_err(system("create worker Start pipe"))?;
+        linux::guardian_signals().context("set guardian signal dispositions")?;
+        linux::set_subreaper().context("set guardian subreaper")?;
+        let start = Pipe::new().context("create worker Start pipe")?;
         start
             .writer
             .nonblocking()
-            .map_err(system("configure worker Start pipe"))?;
-        let status = Pipe::new().map_err(system("create worker status pipe"))?;
+            .context("configure worker Start pipe")?;
+        let status = Pipe::new().context("create worker status pipe")?;
         status
             .reader
             .nonblocking()
-            .map_err(system("configure worker status pipe"))?;
+            .context("configure worker status pipe")?;
         let (identity, child_identity) =
-            linux::identity_pair().map_err(system("create worker identity channel"))?;
+            linux::identity_pair().context("create worker identity channel")?;
         let (terminal, stdout, stderr, input, output, error) = match request.request().execution() {
             ExecutionKind::Interactive => {
                 let size = request
                     .request()
                     .initial_size()
                     .ok_or(GuardianError::NotPrepared)?;
-                let terminal = Terminal::new(size).map_err(system("create worker terminal"))?;
+                let terminal = Terminal::new(size).context("create worker terminal")?;
                 (
                     Some(terminal.master),
                     None,
@@ -127,21 +116,21 @@ impl<'a> GuardianWorker<'a> {
                 )
             }
             ExecutionKind::Bounded => {
-                let stdout = Pipe::new().map_err(system("create worker stdout"))?;
-                let stderr = Pipe::new().map_err(system("create worker stderr"))?;
+                let stdout = Pipe::new().context("create worker stdout")?;
+                let stderr = Pipe::new().context("create worker stderr")?;
                 stdout
                     .reader
                     .nonblocking()
-                    .map_err(system("configure worker stdout"))?;
+                    .context("configure worker stdout")?;
                 stderr
                     .reader
                     .nonblocking()
-                    .map_err(system("configure worker stderr"))?;
+                    .context("configure worker stderr")?;
                 (
                     None,
                     Some(stdout.reader),
                     Some(stderr.reader),
-                    linux::null_device().map_err(system("open worker stdin"))?,
+                    linux::null_device().context("open worker stdin")?,
                     Some(stdout.writer),
                     Some(stderr.writer),
                 )
@@ -157,9 +146,11 @@ impl<'a> GuardianWorker<'a> {
         };
         // SAFETY: The caller promises the dedicated guardian context. The
         // child prunes inherited FDs and never returns into this stack frame.
-        let pid = unsafe { linux::fork() }.map_err(system("fork worker"))?;
+        let pid = unsafe { linux::fork() }.context("fork worker")?;
         if pid == 0 {
-            entry(child.bootstrap(request, preparation));
+            // Entry never returns, so this child's inherited request frame
+            // stays alive through exec without copying its inline paths/argv.
+            entry(child.bootstrap(&request, preparation));
         }
         drop(child);
         // This guardian alone owns wait. Even an early-exit child keeps its
@@ -279,7 +270,7 @@ impl<'a> GuardianWorker<'a> {
 
     pub fn observation(&self) -> WorkerObservation {
         WorkerObservation {
-            prepared: self.prepared(),
+            prepared: self.setup_ready(),
             exec: self.exec,
             exit: self.exit,
             failure: self.status.failure(),
@@ -288,45 +279,24 @@ impl<'a> GuardianWorker<'a> {
         }
     }
 
-    pub fn ready_frame(&self, lease_ms: u32) -> Result<PrepareReadyFrame, GuardianError> {
-        if !self.prepared() {
+    pub fn take_ready(&mut self, lease_ms: u32) -> Result<ReadyResources<'_>, GuardianError> {
+        if !self.setup_ready() {
             return Err(GuardianError::NotPrepared);
         }
         let ready = PrepareReady::new(self.preparation, self.request.broker_id(), lease_ms)
             .map_err(|_| GuardianError::NotPrepared)?;
-        self.request
+        let frame = self
+            .request
             .ready_frame(ready)
-            .map_err(|_| GuardianError::NotPrepared)
-    }
-
-    pub fn descriptors(&self) -> Result<WorkerDescriptors<'_>, GuardianError> {
-        if !self.prepared() {
-            return Err(GuardianError::NotPrepared);
-        }
-        let mut fds = [-1; 3];
-        let mut length = 0;
-        if let Some(terminal) = &self.terminal {
-            fds[length] = terminal.raw();
-            length += 1;
-        }
-        fds[length] = self
-            .identity
-            .as_ref()
-            .ok_or(GuardianError::NotPrepared)?
-            .raw();
-        fds[length + 1] = self.pidfd.as_ref().ok_or(GuardianError::NotPrepared)?.raw();
-        Ok(WorkerDescriptors {
-            fds,
-            length: length + 2,
-            owner: PhantomData,
-        })
-    }
-
-    /// Call only after successful SCM_RIGHTS delivery. The guardian keeps the
-    /// pidfd and its private worker pipes, not an extra host-facing PTY/identity FD.
-    pub fn release_exported_descriptors(&mut self) {
-        self.terminal = None;
-        self.identity = None;
+            .map_err(|_| GuardianError::NotPrepared)?;
+        let pidfd = self.pidfd.as_ref().ok_or(GuardianError::NotPrepared)?;
+        let identity = self.identity.take().ok_or(GuardianError::NotPrepared)?;
+        Ok(ReadyResources::new(
+            frame,
+            self.terminal.take(),
+            identity,
+            pidfd,
+        ))
     }
 
     pub fn validate_start(&self, start: &StartRequest) -> Result<(), GuardianError> {
@@ -357,7 +327,7 @@ impl<'a> GuardianWorker<'a> {
         if self.start.requested() {
             return Err(GuardianError::AlreadyStarted);
         }
-        if !self.prepared() {
+        if !self.setup_ready() {
             return Err(GuardianError::NotPrepared);
         }
         let StartDelivery::Waiting(pipe) =
@@ -392,7 +362,7 @@ impl<'a> GuardianWorker<'a> {
     pub fn read_stdout(&mut self, buffer: &mut [u8]) -> Result<usize, GuardianError> {
         match &self.stdout {
             Some(fd) => {
-                let count = fd.read(buffer).map_err(system("read worker stdout"))?;
+                let count = fd.read(buffer).context("read worker stdout")?;
                 if count == 0 && !buffer.is_empty() {
                     self.stdout = None;
                 }
@@ -405,7 +375,7 @@ impl<'a> GuardianWorker<'a> {
     pub fn read_stderr(&mut self, buffer: &mut [u8]) -> Result<usize, GuardianError> {
         match &self.stderr {
             Some(fd) => {
-                let count = fd.read(buffer).map_err(system("read worker stderr"))?;
+                let count = fd.read(buffer).context("read worker stderr")?;
                 if count == 0 && !buffer.is_empty() {
                     self.stderr = None;
                 }
@@ -430,7 +400,7 @@ impl<'a> GuardianWorker<'a> {
         ]
     }
 
-    fn prepared(&self) -> bool {
+    fn setup_ready(&self) -> bool {
         self.status.prepared()
             && !self.status.closed()
             && self.pidfd.is_some()
@@ -459,6 +429,12 @@ impl Drop for GuardianWorker<'_> {
     }
 }
 
-fn system(operation: &'static str) -> impl FnOnce(i32) -> GuardianError {
-    move |errno| GuardianError::System { operation, errno }
+trait SystemResultExt<T> {
+    fn context(self, operation: &'static str) -> Result<T, GuardianError>;
+}
+
+impl<T> SystemResultExt<T> for Result<T, i32> {
+    fn context(self, operation: &'static str) -> Result<T, GuardianError> {
+        self.map_err(|errno| GuardianError::System { operation, errno })
+    }
 }

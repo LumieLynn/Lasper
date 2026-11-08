@@ -1,18 +1,18 @@
 use lasper_guest_protocol::{
     BrokerId, CommandArgv, ExecutionKind, GuestIdentityReply, GuestProcess, PreparationId,
-    PrepareRequest, PrepareRequestFrame, ProjectionObservations, ProjectionRequests, StartFrame,
-    StartRequest, TerminalEnvironment, TerminalSize, MAX_COMMAND_TOTAL_BYTES,
-    MAX_IDENTITY_MESSAGE_BYTES,
+    PrepareRequest, PrepareRequestFrame, ProjectionRequests, StartFrame, StartRequest,
+    TerminalEnvironment, TerminalSize, MAX_IDENTITY_MESSAGE_BYTES,
 };
 use lasper_guest_runtime::session::*;
 use std::io::Read;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
 use std::os::unix::net::UnixDatagram;
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use std::vec::Vec;
+
+use super::fixture::{self, entry};
 
 const PREPARATION: PreparationId = PreparationId::new([2; 16]);
 
@@ -24,15 +24,13 @@ struct PollFd {
 }
 
 unsafe extern "C" {
-    fn getuid() -> u32;
-    fn getgid() -> u32;
     fn kill(pid: i32, signal: i32) -> i32;
     fn getpgid(pid: i32) -> i32;
     fn pause() -> i32;
     fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
-    fn _exit(code: i32) -> !;
     fn ioctl(fd: i32, operation: usize, ...) -> i32;
     fn poll(fds: *mut PollFd, count: usize, timeout_ms: i32) -> i32;
+    fn fcntl(fd: i32, operation: i32, ...) -> i32;
 }
 
 const EAGAIN: i32 = 11;
@@ -101,41 +99,7 @@ fn control(
     )
 }
 
-fn entry(bootstrap: WorkerBootstrap<'_>) -> ! {
-    let started = await_worker_start(bootstrap);
-    let mut command = [0; MAX_COMMAND_TOTAL_BYTES + 1];
-    started.exec_command(&mut command, &[c"PATH=/usr/bin:/bin"])
-}
-
-fn await_worker_start(bootstrap: WorkerBootstrap<'_>) -> StartedWorker<'_> {
-    let mut packet = [0; MAX_IDENTITY_MESSAGE_BYTES];
-    bootstrap.await_start(&mut packet, |challenge, request| {
-        GuestIdentityReply::new(
-            challenge,
-            request.request(),
-            request.request().user(),
-            unsafe { getuid() },
-            unsafe { getgid() },
-            ProjectionObservations::default(),
-        )
-        .map_err(|_| WorkerFailure::new(WorkerStage::Projection, 22))
-    })
-}
-
-fn failing_entry(bootstrap: WorkerBootstrap<'_>) -> ! {
-    bootstrap.fail(WorkerFailure::new(WorkerStage::Account, 2))
-}
-
 fn blocked_entry(_: WorkerBootstrap<'_>) -> ! {
-    loop {
-        unsafe {
-            pause();
-        }
-    }
-}
-
-fn blocked_after_start_entry(bootstrap: WorkerBootstrap<'_>) -> ! {
-    let _started = await_worker_start(bootstrap);
     loop {
         unsafe {
             pause();
@@ -215,6 +179,8 @@ fn finish(
         worker.phase(),
         SessionPhase::Preparing
             | SessionPhase::Prepared
+            | SessionPhase::DeliveringReady
+            | SessionPhase::AwaitingStart
             | SessionPhase::Starting
             | SessionPhase::Running
     ) {
@@ -268,26 +234,27 @@ fn bounded_start_scenario() {
         worker.read_stdout(&mut [0; 8]),
         Err(GuardianError::System { errno: EAGAIN, .. })
     ));
-    assert_eq!(worker.ready_frame(now_ms()).unwrap().descriptor_count(), 2);
-    let identity: UnixDatagram = duplicate(worker.descriptors().unwrap().as_raw_fds()[0]).into();
+    let ready = fixture::receive_ready(&mut worker, now_ms());
+    assert_eq!(ready.frame.descriptor_count(), 2);
+    let identity: UnixDatagram = ready.descriptors[0].try_clone().unwrap().into();
     identity
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
-    let mut packet = [0; MAX_IDENTITY_MESSAGE_BYTES];
+    let mut packet = vec![0; MAX_IDENTITY_MESSAGE_BYTES];
     for nonce in [1, 2] {
-        let challenge = worker
-            .ready_frame(now_ms())
-            .unwrap()
-            .identity_challenge([nonce; 32]);
+        let challenge = ready.frame.identity_challenge([nonce; 32]);
         let length = challenge.encode_packet(&mut packet).unwrap();
         identity.send(&packet[..length]).unwrap();
         let length = identity.recv(&mut packet).unwrap();
         let reply = GuestIdentityReply::decode_for(&packet[..length], challenge, request.request())
             .unwrap();
         assert_eq!(reply.guest_user(), "alice");
+        assert_eq!(
+            (reply.guest_uid(), reply.guest_gid()),
+            (fixture::get().uid, fixture::get().gid)
+        );
         assert!(worker.poll(now_ms()).unwrap().worker.prepared);
     }
-    worker.release_exported_descriptors();
     worker.start(now_ms(), start(&request)).unwrap();
     assert!(matches!(
         worker.start(now_ms(), start(&request)),
@@ -296,8 +263,15 @@ fn bounded_start_scenario() {
         ))
     ));
     let output = bounded_stdout(&mut worker);
-    assert_eq!(output, std::format!("{}", worker.pid()).as_bytes());
     let observation = wait_for(&mut worker, |observation| observation.exit.is_some());
+    let mut error = [0; 1024];
+    let error_length = worker.read_stderr(&mut error).unwrap();
+    assert_eq!(
+        output,
+        std::format!("{}", worker.pid()).as_bytes(),
+        "{observation:?}; {}",
+        String::from_utf8_lossy(&error[..error_length])
+    );
     assert_eq!(observation.exit, Some(WorkerExit::Exited(0)));
     assert!(matches!(
         observation.exec,
@@ -311,10 +285,9 @@ fn terminal_scenario() {
     let mut worker =
         unsafe { SessionGuardian::spawn(request.clone(), PREPARATION, now_ms(), entry) }.unwrap();
     wait_for(&mut worker, |observation| observation.prepared);
-    let descriptors = worker.descriptors().unwrap();
-    assert_eq!(descriptors.as_raw_fds().len(), 3);
-    let master = duplicate(descriptors.as_raw_fds()[0]);
-    let _identity = duplicate(descriptors.as_raw_fds()[1]);
+    let ready = fixture::receive_ready(&mut worker, now_ms());
+    assert_eq!(ready.descriptors.len(), 3);
+    let master = ready.descriptors[0].try_clone().unwrap();
     for operation in [0x5429, 0x540f] {
         // TIOCGSID, TIOCGPGRP
         let mut terminal_pid = 0i32;
@@ -324,7 +297,6 @@ fn terminal_scenario() {
         );
         assert_eq!(terminal_pid, worker.pid());
     }
-    worker.release_exported_descriptors();
     let start = StartRequest::new(
         &request,
         PREPARATION,
@@ -345,11 +317,122 @@ fn terminal_scenario() {
     finish(&mut worker, &request);
 }
 
+fn ready_delivery_scenario() {
+    for execution in [ExecutionKind::Interactive, ExecutionKind::Bounded] {
+        let request = request(execution, &["/bin/true"]);
+        let mut worker =
+            unsafe { SessionGuardian::spawn(request.clone(), PREPARATION, now_ms(), entry) }
+                .unwrap();
+        wait_for(&mut worker, |observation| observation.prepared);
+        assert_eq!(worker.phase(), SessionPhase::Prepared);
+        assert!(matches!(
+            worker.start(now_ms(), start(&request)),
+            Err(GuardianError::Lifecycle(
+                SessionLifecycleError::InvalidTransition {
+                    phase: SessionPhase::Prepared
+                }
+            ))
+        ));
+        assert_eq!(worker.phase(), SessionPhase::Prepared);
+        let pidfd = worker.poll_descriptors()[1];
+        let ready = worker.take_ready(now_ms()).unwrap();
+        let descriptors = ready.descriptors();
+        let originals = descriptors.as_raw_fds().to_vec();
+        assert_eq!(originals.len(), ready.frame().descriptor_count() as usize);
+        assert_eq!(originals.last(), Some(&pidfd));
+        let received = ready
+            .deliver(|frame, descriptors| {
+                assert_eq!(
+                    frame.descriptor_count() as usize,
+                    descriptors.as_raw_fds().len()
+                );
+                Ok::<Vec<_>, ()>(
+                    descriptors
+                        .as_raw_fds()
+                        .iter()
+                        .map(|&fd| duplicate(fd))
+                        .collect(),
+                )
+            })
+            .unwrap();
+        assert_eq!(worker.phase(), SessionPhase::AwaitingStart);
+
+        for &fd in &originals[..originals.len() - 1] {
+            assert_eq!(unsafe { fcntl(fd, 1) }, -1);
+            assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(9));
+        }
+        assert!(unsafe { fcntl(pidfd, 1) } >= 0);
+        for fd in &received {
+            assert!(unsafe { fcntl(fd.as_raw_fd(), 1) } >= 0);
+        }
+        assert_eq!(
+            worker.take_ready(now_ms()).err(),
+            Some(GuardianError::ReadyAlreadyTaken)
+        );
+        worker.start(now_ms(), start(&request)).unwrap();
+        finish(&mut worker, &request);
+        drop(worker);
+        assert_eq!(unsafe { fcntl(pidfd, 1) }, -1);
+        assert!(unsafe { fcntl(received.last().unwrap().as_raw_fd(), 1) } >= 0);
+    }
+}
+
+fn abandoned_ready_scenario() {
+    let request = request(
+        ExecutionKind::Bounded,
+        &["/bin/sh", "-c", "printf must-not-run"],
+    );
+    for fail_delivery in [false, true] {
+        let mut worker =
+            unsafe { SessionGuardian::spawn(request.clone(), PREPARATION, now_ms(), entry) }
+                .unwrap();
+        wait_for(&mut worker, |observation| observation.prepared);
+        let ready = worker.take_ready(now_ms()).unwrap();
+        let identity = ready.descriptors().as_raw_fds()[0];
+        // Retain a receiver copy so EOF cannot hide a missing lifecycle guard.
+        let _received_identity = duplicate(identity);
+        if fail_delivery {
+            let result = ready.deliver(|_, descriptors| {
+                let _partial_delivery = duplicate(descriptors.as_raw_fds()[1]);
+                Err::<(), _>("partial send")
+            });
+            assert_eq!(result, Err("partial send"));
+        } else {
+            drop(ready);
+        }
+        assert_eq!(worker.phase(), SessionPhase::Closing);
+        assert_eq!(unsafe { fcntl(identity, 1) }, -1);
+        assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(9));
+        assert!(worker.start(now_ms(), start(&request)).is_err());
+        assert_eq!(
+            worker.poll(now_ms()).unwrap().cleanup_reason,
+            Some(CleanupReason::ReadyDeliveryFailed)
+        );
+        finish(&mut worker, &request);
+        assert!(bounded_stdout(&mut worker).is_empty());
+    }
+
+    let mut worker =
+        unsafe { SessionGuardian::spawn(request.clone(), PREPARATION, now_ms(), entry) }.unwrap();
+    wait_for(&mut worker, |observation| observation.prepared);
+    let deadline = worker.next_deadline_ms().unwrap();
+    assert_eq!(
+        worker.take_ready(advance_to(deadline)).err(),
+        Some(GuardianError::NotPrepared)
+    );
+    assert_eq!(worker.phase(), SessionPhase::Closing);
+    assert_eq!(
+        finish(&mut worker, &request).cleanup,
+        CleanupProgress::Complete
+    );
+}
+
 fn failure_scenario() {
     let request = request(ExecutionKind::Bounded, &["/not/a/real/guest/program"]);
     let mut worker =
         unsafe { SessionGuardian::spawn(request.clone(), PREPARATION, now_ms(), entry) }.unwrap();
     wait_for(&mut worker, |observation| observation.prepared);
+    let _ready = fixture::receive_ready(&mut worker, now_ms());
     worker.start(now_ms(), start(&request)).unwrap();
     let observation = wait_for(&mut worker, |observation| observation.failure.is_some());
     assert_eq!(
@@ -359,16 +442,19 @@ fn failure_scenario() {
     assert_eq!(observation.exec, Some(ExecOutcome::Failed { errno: 2 }));
     finish(&mut worker, &request);
 
+    std::fs::remove_file(fixture::get().path("etc/passwd")).unwrap();
     let mut worker =
-        unsafe { SessionGuardian::spawn(request.clone(), PREPARATION, now_ms(), failing_entry) }
-            .unwrap();
+        unsafe { SessionGuardian::spawn(request.clone(), PREPARATION, now_ms(), entry) }.unwrap();
     let observation = wait_for(&mut worker, |observation| observation.failure.is_some());
     assert_eq!(
         observation.failure,
         Some(WorkerFailure::new(WorkerStage::Account, 2))
     );
     assert!(!observation.prepared);
-    assert_eq!(worker.descriptors().err(), Some(GuardianError::NotPrepared));
+    assert_eq!(
+        worker.take_ready(now_ms()).err(),
+        Some(GuardianError::NotPrepared)
+    );
     finish(&mut worker, &request);
 }
 
@@ -387,10 +473,8 @@ fn completed_before_poll_scenario() {
             unsafe { SessionGuardian::spawn(request.clone(), PREPARATION, now_ms(), entry) }
                 .unwrap();
         wait_for(&mut worker, |observation| observation.prepared);
-        let descriptors = worker.descriptors().unwrap();
-        let _identity = duplicate(descriptors.as_raw_fds()[0]);
-        let pidfd = duplicate(*descriptors.as_raw_fds().last().unwrap());
-        worker.release_exported_descriptors();
+        let ready = fixture::receive_ready(&mut worker, now_ms());
+        let pidfd = ready.descriptors.last().unwrap().try_clone().unwrap();
         worker.start(now_ms(), start(&request)).unwrap();
         wait_for_pidfd(&pidfd);
         assert_eq!(worker.phase(), SessionPhase::Starting);
@@ -414,7 +498,8 @@ fn exec_failure_before_poll_scenario() {
     let mut worker =
         unsafe { SessionGuardian::spawn(request.clone(), PREPARATION, now_ms(), entry) }.unwrap();
     wait_for(&mut worker, |observation| observation.prepared);
-    let pidfd = duplicate(*worker.descriptors().unwrap().as_raw_fds().last().unwrap());
+    let ready = fixture::receive_ready(&mut worker, now_ms());
+    let pidfd = ready.descriptors.last().unwrap().try_clone().unwrap();
     worker.start(now_ms(), start(&request)).unwrap();
     wait_for_pidfd(&pidfd);
 
@@ -438,17 +523,27 @@ fn exec_failure_before_poll_scenario() {
 
 fn killed_before_exec_scenario() {
     let request = request(ExecutionKind::Bounded, &["/bin/true"]);
-    let mut worker = unsafe {
-        SessionGuardian::spawn(
-            request.clone(),
-            PREPARATION,
-            now_ms(),
-            blocked_after_start_entry,
-        )
-    }
-    .unwrap();
+    let mut worker =
+        unsafe { SessionGuardian::spawn(request.clone(), PREPARATION, now_ms(), entry) }.unwrap();
     wait_for(&mut worker, |observation| observation.prepared);
-    let pidfd = duplicate(*worker.descriptors().unwrap().as_raw_fds().last().unwrap());
+    let ready = fixture::receive_ready(&mut worker, now_ms());
+    let pidfd = ready.descriptors.last().unwrap().try_clone().unwrap();
+    assert_eq!(unsafe { kill(worker.pid(), 19) }, 0);
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let mut status = 0;
+        // Observe SIGSTOP without reaping the worker. Start can now be accepted
+        // by the guardian, but the worker cannot consume it before SIGKILL.
+        let result = unsafe { waitpid(worker.pid(), &mut status, 1 | 2) };
+        assert!(result >= 0);
+        if result == worker.pid() {
+            assert_eq!(status & 0xff, 0x7f);
+            assert_eq!((status >> 8) & 0xff, 19);
+            break;
+        }
+        assert!(Instant::now() < deadline, "worker did not stop");
+        std::thread::sleep(Duration::from_millis(2));
+    }
     worker.start(now_ms(), start(&request)).unwrap();
     assert_eq!(unsafe { kill(worker.pid(), 9) }, 0);
     wait_for_pidfd(&pidfd);
@@ -490,12 +585,20 @@ fn cancel_scenario() {
 
 fn descendants_scenario() {
     let request = request(ExecutionKind::Bounded, &["/bin/sh", "-c",
-        "setsid /bin/sh -c 'trap \"\" HUP TERM; printf \"%s\" \"$$\"; exec >/dev/null 2>&1; while :; do sleep 1; done' & exit 23"]);
+        "setsid --fork /bin/sh -c 'trap \"\" HUP TERM; printf \"%s\" \"$$\"; exec >/home/alice/detached.out 2>&1; while :; do sleep 1; done'; exit 23"]);
     let mut worker =
         unsafe { SessionGuardian::spawn(request.clone(), PREPARATION, now_ms(), entry) }.unwrap();
     wait_for(&mut worker, |observation| observation.prepared);
+    let _ready = fixture::receive_ready(&mut worker, now_ms());
     worker.start(now_ms(), start(&request)).unwrap();
     let output = bounded_stdout(&mut worker);
+    let mut error = [0; 1024];
+    let error_length = worker.read_stderr(&mut error).unwrap();
+    assert!(
+        !output.is_empty(),
+        "descendant did not report its PID: {}",
+        String::from_utf8_lossy(&error[..error_length])
+    );
     let descendant = std::str::from_utf8(&output)
         .unwrap()
         .parse::<i32>()
@@ -518,7 +621,7 @@ fn preparation_timeout_scenario() {
         unsafe { SessionGuardian::spawn(request.clone(), PREPARATION, 0, blocked_entry) }.unwrap();
     assert_eq!(worker.phase(), SessionPhase::Preparing);
     assert_eq!(
-        worker.ready_frame(advance_to(4_999)).err(),
+        worker.take_ready(advance_to(4_999)).err(),
         Some(GuardianError::NotPrepared)
     );
     assert_eq!(
@@ -526,7 +629,7 @@ fn preparation_timeout_scenario() {
         SessionPhase::Closing
     );
     assert_eq!(
-        worker.ready_frame(now_ms()).err(),
+        worker.take_ready(now_ms()).err(),
         Some(GuardianError::NotPrepared)
     );
     let result = worker.poll(advance_to(6_001)).unwrap();
@@ -553,14 +656,8 @@ fn lease_and_disconnect_scenario() {
                 .unwrap();
         wait_for(&mut worker, |observation| observation.prepared);
         let deadline = worker.next_deadline_ms().unwrap();
-        assert_eq!(
-            worker
-                .ready_frame(advance_to(deadline - 1))
-                .unwrap()
-                .response()
-                .remaining_lease_ms(),
-            1
-        );
+        let ready = fixture::receive_ready(&mut worker, advance_to(deadline - 1));
+        assert_eq!(ready.frame.response().remaining_lease_ms(), 1);
         worker
             .control(
                 now_ms(),
@@ -594,6 +691,7 @@ fn wrong_start_scenario() {
     let mut worker =
         unsafe { SessionGuardian::spawn(request.clone(), PREPARATION, now_ms(), entry) }.unwrap();
     wait_for(&mut worker, |observation| observation.prepared);
+    let _ready = fixture::receive_ready(&mut worker, now_ms());
     let wrong = StartRequest::new(&request, PreparationId::new([3; 16]), None, None, None).unwrap();
     assert!(matches!(
         worker.start(now_ms(), StartFrame::new(11, wrong)),
@@ -601,7 +699,7 @@ fn wrong_start_scenario() {
             lasper_guest_protocol::SessionPayloadError::PreparationMismatch
         ))
     ));
-    assert_eq!(worker.phase(), SessionPhase::Prepared);
+    assert_eq!(worker.phase(), SessionPhase::AwaitingStart);
     worker.start(now_ms(), start(&request)).unwrap();
     finish(&mut worker, &request);
 }
@@ -624,47 +722,15 @@ fn worker_exit_before_start_scenario() {
     assert!(bounded_stdout(&mut worker).is_empty());
 }
 
-fn isolated(scenario: &str) {
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .args(["--scenario", scenario])
-        .spawn()
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(8);
-    loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            assert!(
-                status.success(),
-                "guardian scenario {scenario} failed: {status}"
-            );
-            return;
-        }
-        if Instant::now() >= deadline {
-            child.kill().unwrap();
-            let _ = child.wait();
-            panic!("guardian scenario {scenario} exceeded its deadline");
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-}
-
-fn main() {
-    let mut arguments = std::env::args().skip(1);
-    if arguments.next().as_deref() != Some("--scenario") {
-        for (scenario, _) in SCENARIOS {
-            std::println!("guest session: {scenario}");
-            isolated(scenario);
-        }
-        return;
-    }
-    let scenario = arguments.next().expect("scenario name");
-    let (_, run) = SCENARIOS
-        .iter()
-        .find(|(name, _)| *name == scenario)
-        .expect("known scenario");
-    run();
-}
-
-const SCENARIOS: &[(&str, fn())] = &[
+pub(super) const SCENARIOS: &[(&str, fn())] = &[
+    (
+        "Ready delivery owns exported endpoints and is one-shot",
+        ready_delivery_scenario,
+    ),
+    (
+        "abandoned or expired Ready enters cleanup",
+        abandoned_ready_scenario,
+    ),
     (
         "assigned worker identity and one-shot Start",
         bounded_start_scenario,

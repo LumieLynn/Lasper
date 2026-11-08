@@ -3,6 +3,7 @@
 use crate::adapters::storage::rootfs::access::RootfsAccess;
 use crate::adapters::storage::rootfs::RootfsTarget;
 use crate::domain::machine::accounts::{LocalAccount, LocalAccountObservation};
+use lasper_local_accounts::passwd_entries;
 use std::io::{self, Read};
 use std::path::Path;
 
@@ -49,14 +50,16 @@ fn read(root: &Path) -> io::Result<LocalAccountObservation> {
 fn parse(content: &[u8]) -> LocalAccountObservation {
     let mut accounts = Vec::new();
     let mut rejected_lines = Vec::new();
-    for (index, line) in content.split(|byte| *byte == b'\n').enumerate() {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if line.is_empty() || line.starts_with(b"#") {
-            continue;
-        }
-        match std::str::from_utf8(line).ok().and_then(parse_entry) {
-            Some(account) => accounts.push(account),
-            None => rejected_lines.push(index + 1),
+    for entry in passwd_entries(content) {
+        match entry {
+            Ok(account) => accounts.push(LocalAccount {
+                username: account.username.into(),
+                uid: account.uid,
+                gid: account.gid,
+                home: account.home.into(),
+                shell: account.shell.into(),
+            }),
+            Err(error) => rejected_lines.push(error.line),
         }
         if accounts.len() + rejected_lines.len() > MAX_ACCOUNT_ENTRIES {
             return LocalAccountObservation::Invalid(format!(
@@ -68,41 +71,6 @@ fn parse(content: &[u8]) -> LocalAccountObservation {
         accounts,
         rejected_lines,
     }
-}
-
-fn parse_entry(line: &str) -> Option<LocalAccount> {
-    let mut fields = line.split(':');
-    let username = fields.next()?;
-    let _password = fields.next()?;
-    let uid = fields.next()?;
-    let gid = fields.next()?;
-    let _gecos = fields.next()?;
-    let home = fields.next()?;
-    let shell = fields.next()?;
-    if fields.next().is_some() {
-        return None;
-    }
-    // Observation must not impose the stricter rules Lasper uses to create users.
-    if username.is_empty()
-        || [username, home, shell]
-            .iter()
-            .any(|value| value.chars().any(char::is_control))
-    {
-        return None;
-    }
-    if ![uid, gid]
-        .iter()
-        .all(|value| !value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
-    {
-        return None;
-    }
-    Some(LocalAccount {
-        username: username.into(),
-        uid: uid.parse().ok()?,
-        gid: gid.parse().ok()?,
-        home: home.into(),
-        shell: shell.into(),
-    })
 }
 
 #[cfg(test)]

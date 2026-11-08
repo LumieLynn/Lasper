@@ -12,6 +12,16 @@ pub enum WorkerStage {
     Exec = 6,
     Signals = 7,
     Projection = 8,
+    GroupDatabase = 9,
+    SupplementaryGroups = 10,
+    GroupIdentity = 11,
+    UserIdentity = 12,
+    HomeDirectory = 13,
+    LoginShell = 14,
+    LoginDisabled = 15,
+    TerminalOwnership = 16,
+    Environment = 17,
+    Memory = 18,
 }
 
 impl WorkerStage {
@@ -25,6 +35,16 @@ impl WorkerStage {
             6 => Some(Self::Exec),
             7 => Some(Self::Signals),
             8 => Some(Self::Projection),
+            9 => Some(Self::GroupDatabase),
+            10 => Some(Self::SupplementaryGroups),
+            11 => Some(Self::GroupIdentity),
+            12 => Some(Self::UserIdentity),
+            13 => Some(Self::HomeDirectory),
+            14 => Some(Self::LoginShell),
+            15 => Some(Self::LoginDisabled),
+            16 => Some(Self::TerminalOwnership),
+            17 => Some(Self::Environment),
+            18 => Some(Self::Memory),
             _ => None,
         }
     }

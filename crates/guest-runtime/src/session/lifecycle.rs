@@ -9,6 +9,8 @@ const WORKER_SETUP_TIMEOUT_MS: u64 = 5_000;
 pub enum SessionPhase {
     Preparing,
     Prepared,
+    DeliveringReady,
+    AwaitingStart,
     Starting,
     Running,
     Closing,
@@ -21,6 +23,7 @@ pub enum CleanupReason {
     PreparationExpired,
     WorkerPreparationFailed,
     WorkerObservationFailed,
+    ReadyDeliveryFailed,
     Cancelled,
     LeaseExpired,
     ClientClosed,
@@ -51,7 +54,6 @@ pub enum SessionAction {
     Prepared { deadline_ms: u64 },
     LeaseRenewed { deadline_ms: u64 },
     Recheck,
-    StartAccepted,
     BeginCleanup(CleanupReason),
     Running,
     CleanupPending(CleanupReason),
@@ -68,10 +70,21 @@ pub enum SessionLifecycleError {
     InvalidTransition { phase: SessionPhase },
 }
 
+/// Start carries an inline path buffer, so its request stays out of the small
+/// results used by lease, control, and cleanup events.
+#[derive(Debug, Eq, PartialEq)]
+#[allow(clippy::large_enum_variant)]
+pub enum StartDecision {
+    Accepted(StartRequest),
+    BeginCleanup(CleanupReason),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum State {
     Preparing,
     Prepared,
+    DeliveringReady,
+    AwaitingStart,
     Starting,
     Running,
     Closing(CleanupReason),
@@ -88,6 +101,25 @@ pub struct SessionLifecycle {
     deadline_ms: u64,
     lease_ms: u32,
     state: State,
+}
+
+pub(super) struct ReadyTransition<'a> {
+    lifecycle: &'a mut SessionLifecycle,
+}
+
+impl ReadyTransition<'_> {
+    pub(super) fn complete(self) {
+        self.lifecycle.state = State::AwaitingStart;
+    }
+}
+
+impl Drop for ReadyTransition<'_> {
+    fn drop(&mut self) {
+        if self.lifecycle.state == State::DeliveringReady {
+            self.lifecycle
+                .begin_cleanup(CleanupReason::ReadyDeliveryFailed);
+        }
+    }
 }
 
 impl SessionLifecycle {
@@ -116,6 +148,8 @@ impl SessionLifecycle {
         match self.state {
             State::Preparing => SessionPhase::Preparing,
             State::Prepared => SessionPhase::Prepared,
+            State::DeliveringReady => SessionPhase::DeliveringReady,
+            State::AwaitingStart => SessionPhase::AwaitingStart,
             State::Starting => SessionPhase::Starting,
             State::Running => SessionPhase::Running,
             State::Closing(_) => SessionPhase::Closing,
@@ -168,44 +202,62 @@ impl SessionLifecycle {
         self.deadline_ms
     }
 
+    pub(super) fn begin_ready_delivery(
+        &mut self,
+    ) -> Result<ReadyTransition<'_>, SessionLifecycleError> {
+        if self.state != State::Prepared {
+            return Err(SessionLifecycleError::InvalidTransition {
+                phase: self.phase(),
+            });
+        }
+        self.state = State::DeliveringReady;
+        Ok(ReadyTransition { lifecycle: self })
+    }
+
     /// Expires only an unstarted preparation. Once Start wins, the lease no
     /// longer controls the lifetime of the running guest process.
     pub fn tick(&mut self, now_ms: u64) -> Option<SessionAction> {
+        self.expiration(now_ms)
+            .map(|reason| self.begin_cleanup(reason))
+    }
+
+    fn expiration(&self, now_ms: u64) -> Option<CleanupReason> {
         match self.state {
             State::Preparing if now_ms >= self.deadline_ms => {
-                Some(self.begin_cleanup(CleanupReason::PreparationExpired))
+                Some(CleanupReason::PreparationExpired)
             }
-            State::Prepared if now_ms >= self.deadline_ms => {
-                Some(self.begin_cleanup(CleanupReason::LeaseExpired))
+            State::Prepared | State::DeliveringReady | State::AwaitingStart
+                if now_ms >= self.deadline_ms =>
+            {
+                Some(CleanupReason::LeaseExpired)
             }
             _ => None,
         }
     }
 
-    /// Commits the one-way Prepared -> Starting transition.
-    ///
-    /// The frame is borrowed deliberately: the owner keeps the validated
-    /// request and passes it to the worker only after this decision wins.
+    /// Returns the accepted request for delivery to the assigned worker.
+    /// An expired preparation enters cleanup without releasing the request.
     pub fn accept_start(
         &mut self,
         now_ms: u64,
-        frame: &StartFrame,
-    ) -> Result<SessionAction, SessionLifecycleError> {
+        frame: StartFrame,
+    ) -> Result<StartDecision, SessionLifecycleError> {
         self.validate_token(
             frame.request().broker_id(),
             frame.request().preparation_id(),
         )?;
-        if let Some(action) = self.tick(now_ms) {
-            return Ok(action);
+        if let Some(reason) = self.expiration(now_ms) {
+            self.begin_cleanup(reason);
+            return Ok(StartDecision::BeginCleanup(reason));
         }
-        if self.state != State::Prepared {
+        if self.state != State::AwaitingStart {
             return Err(SessionLifecycleError::InvalidTransition {
                 phase: self.phase(),
             });
         }
 
         self.state = State::Starting;
-        Ok(SessionAction::StartAccepted)
+        Ok(StartDecision::Accepted(frame.into_request()))
     }
 
     /// Applies one control frame in the guardian's serialized event loop.
@@ -221,19 +273,25 @@ impl SessionLifecycle {
         }
 
         match (self.state, frame.kind()) {
-            (State::Prepared, PreparationControlKind::KeepPrepared) => {
+            (State::AwaitingStart, PreparationControlKind::KeepPrepared) => {
                 let deadline_ms = now_ms
                     .checked_add(u64::from(MAX_PREPARED_LEASE_MS))
                     .ok_or(SessionLifecycleError::ClockOverflow)?;
                 self.deadline_ms = deadline_ms;
                 Ok(SessionAction::LeaseRenewed { deadline_ms })
             }
-            (State::Prepared, PreparationControlKind::Recheck) => Ok(SessionAction::Recheck),
-            (State::Preparing | State::Prepared, PreparationControlKind::Cancel) => {
-                Ok(self.begin_cleanup(CleanupReason::Cancelled))
-            }
+            (State::AwaitingStart, PreparationControlKind::Recheck) => Ok(SessionAction::Recheck),
             (
-                State::Preparing | State::Prepared | State::Starting | State::Running,
+                State::Preparing | State::Prepared | State::DeliveringReady | State::AwaitingStart,
+                PreparationControlKind::Cancel,
+            ) => Ok(self.begin_cleanup(CleanupReason::Cancelled)),
+            (
+                State::Preparing
+                | State::Prepared
+                | State::DeliveringReady
+                | State::AwaitingStart
+                | State::Starting
+                | State::Running,
                 PreparationControlKind::Close,
             ) => Ok(self.begin_cleanup(CleanupReason::ClientClosed)),
             (
@@ -274,7 +332,7 @@ impl SessionLifecycle {
 
     pub fn worker_exited(&mut self) -> SessionAction {
         match self.state {
-            State::Preparing | State::Prepared => {
+            State::Preparing | State::Prepared | State::DeliveringReady | State::AwaitingStart => {
                 self.begin_cleanup(CleanupReason::WorkerExitedBeforeStart)
             }
             State::Starting | State::Running => self.begin_cleanup(CleanupReason::WorkerExited),
@@ -284,7 +342,7 @@ impl SessionLifecycle {
 
     pub fn worker_failed(&mut self) -> SessionAction {
         match self.state {
-            State::Preparing | State::Prepared => {
+            State::Preparing | State::Prepared | State::DeliveringReady | State::AwaitingStart => {
                 self.begin_cleanup(CleanupReason::WorkerPreparationFailed)
             }
             State::Starting => self.begin_cleanup(CleanupReason::StartOutcomeUnknown),
@@ -295,11 +353,15 @@ impl SessionLifecycle {
 
     pub fn connection_closed(&mut self, connection: SessionConnection) -> SessionAction {
         match self.state {
-            State::Preparing | State::Prepared | State::Starting | State::Running => self
-                .begin_cleanup(match connection {
-                    SessionConnection::Broker => CleanupReason::BrokerExited,
-                    SessionConnection::Client => CleanupReason::ClientClosed,
-                }),
+            State::Preparing
+            | State::Prepared
+            | State::DeliveringReady
+            | State::AwaitingStart
+            | State::Starting
+            | State::Running => self.begin_cleanup(match connection {
+                SessionConnection::Broker => CleanupReason::BrokerExited,
+                SessionConnection::Client => CleanupReason::ClientClosed,
+            }),
             State::Closing(_) | State::CleanupPending(_) | State::Closed(_) => SessionAction::Noop,
         }
     }
@@ -355,99 +417,6 @@ impl SessionLifecycle {
     }
 }
 
-/// Owns the lifecycle decision and the one Start request accepted by it.
-/// A guardian keeps this object beside the worker resources it must clean up.
-#[derive(Debug, Eq, PartialEq)]
-pub struct PreparedSession {
-    lifecycle: SessionLifecycle,
-    start: Option<StartFrame>,
-}
-
-impl PreparedSession {
-    pub const fn new(lifecycle: SessionLifecycle) -> Self {
-        Self {
-            lifecycle,
-            start: None,
-        }
-    }
-
-    pub const fn phase(&self) -> SessionPhase {
-        self.lifecycle.phase()
-    }
-
-    pub const fn cleanup_reason(&self) -> Option<CleanupReason> {
-        self.lifecycle.cleanup_reason()
-    }
-
-    pub const fn deadline_ms(&self) -> u64 {
-        self.lifecycle.deadline_ms()
-    }
-
-    pub fn tick(&mut self, now_ms: u64) -> Option<SessionAction> {
-        self.lifecycle.tick(now_ms)
-    }
-
-    pub fn accept_start(
-        &mut self,
-        now_ms: u64,
-        frame: StartFrame,
-    ) -> Result<SessionAction, SessionLifecycleError> {
-        let action = self.lifecycle.accept_start(now_ms, &frame)?;
-        if action == SessionAction::StartAccepted {
-            self.start = Some(frame);
-        }
-        Ok(action)
-    }
-
-    /// Returns the exact request accepted by Start. It can be consumed once;
-    /// the caller must not construct a replacement request after acceptance.
-    pub fn take_start(&mut self) -> Option<StartRequest> {
-        self.start.take().map(StartFrame::into_request)
-    }
-
-    pub fn control(
-        &mut self,
-        now_ms: u64,
-        frame: PreparationControlFrame,
-    ) -> Result<SessionAction, SessionLifecycleError> {
-        self.lifecycle.control(now_ms, frame)
-    }
-
-    pub fn exec_outcome(
-        &mut self,
-        outcome: ExecOutcome,
-    ) -> Result<SessionAction, SessionLifecycleError> {
-        self.lifecycle.exec_outcome(outcome)
-    }
-
-    pub fn worker_exited(&mut self) -> SessionAction {
-        self.lifecycle.worker_exited()
-    }
-
-    pub fn worker_prepared(&mut self, now_ms: u64) -> Result<SessionAction, SessionLifecycleError> {
-        self.lifecycle.worker_prepared(now_ms)
-    }
-
-    pub fn worker_failed(&mut self) -> SessionAction {
-        self.lifecycle.worker_failed()
-    }
-
-    pub fn connection_closed(&mut self, connection: SessionConnection) -> SessionAction {
-        self.lifecycle.connection_closed(connection)
-    }
-
-    pub fn cleanup_result(
-        &mut self,
-        complete: bool,
-    ) -> Result<SessionAction, SessionLifecycleError> {
-        self.lifecycle.cleanup_result(complete)
-    }
-
-    pub fn retry_cleanup(&mut self) -> Result<SessionAction, SessionLifecycleError> {
-        self.lifecycle.retry_cleanup()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,8 +444,10 @@ mod tests {
         )
     }
 
-    fn lifecycle() -> SessionLifecycle {
-        SessionLifecycle::new(BROKER, PREPARATION, 100, 10_000).unwrap()
+    fn awaiting_start() -> SessionLifecycle {
+        let mut lifecycle = SessionLifecycle::new(BROKER, PREPARATION, 100, 10_000).unwrap();
+        lifecycle.begin_ready_delivery().unwrap().complete();
+        lifecycle
     }
 
     #[test]
@@ -522,8 +493,8 @@ mod tests {
                 SessionAction::BeginCleanup(reason)
             );
             assert_eq!(preparing.connection_closed(connection), SessionAction::Noop);
-            let mut running = lifecycle();
-            running.accept_start(101, &start_frame()).unwrap();
+            let mut running = awaiting_start();
+            running.accept_start(101, start_frame()).unwrap();
             running.exec_outcome(ExecOutcome::Started).unwrap();
             assert_eq!(
                 running.connection_closed(connection),
@@ -555,16 +526,17 @@ mod tests {
 
     #[test]
     fn start_is_one_shot_and_ends_the_preparation_lease() {
-        let mut session = lifecycle();
-        assert_eq!(session.phase(), SessionPhase::Prepared);
+        let mut session = awaiting_start();
+        assert_eq!(session.phase(), SessionPhase::AwaitingStart);
 
         let frame = start_frame();
-        let action = session.accept_start(101, &frame).unwrap();
-        assert_eq!(action, SessionAction::StartAccepted);
+        let expected = frame.request().clone();
+        let decision = session.accept_start(101, frame.clone()).unwrap();
+        assert_eq!(decision, StartDecision::Accepted(expected));
         assert_eq!(session.phase(), SessionPhase::Starting);
         assert_eq!(session.tick(u64::MAX), None);
         assert_eq!(
-            session.accept_start(102, &frame),
+            session.accept_start(102, frame),
             Err(SessionLifecycleError::InvalidTransition {
                 phase: SessionPhase::Starting,
             }),
@@ -572,21 +544,47 @@ mod tests {
     }
 
     #[test]
+    fn start_requires_completed_ready_delivery() {
+        let mut session = SessionLifecycle::new(BROKER, PREPARATION, 100, 10_000).unwrap();
+        assert_eq!(
+            session.accept_start(101, start_frame()),
+            Err(SessionLifecycleError::InvalidTransition {
+                phase: SessionPhase::Prepared
+            }),
+        );
+        assert_eq!(session.phase(), SessionPhase::Prepared);
+        assert_eq!(
+            session.control(101, control(PreparationControlKind::KeepPrepared)),
+            Err(SessionLifecycleError::InvalidTransition {
+                phase: SessionPhase::Prepared
+            }),
+        );
+        let delivery = session.begin_ready_delivery().unwrap();
+        assert_eq!(delivery.lifecycle.phase(), SessionPhase::DeliveringReady);
+        delivery.complete();
+        assert_eq!(session.phase(), SessionPhase::AwaitingStart);
+        assert!(matches!(
+            session.accept_start(102, start_frame()),
+            Ok(StartDecision::Accepted(_))
+        ));
+    }
+
+    #[test]
     fn expiry_wins_at_the_deadline_before_a_queued_start() {
-        let mut session = lifecycle();
+        let mut session = awaiting_start();
         assert_eq!(session.deadline_ms(), 10_100);
         assert_eq!(
-            session.accept_start(10_100, &start_frame()),
-            Ok(SessionAction::BeginCleanup(CleanupReason::LeaseExpired)),
+            session.accept_start(10_100, start_frame()),
+            Ok(StartDecision::BeginCleanup(CleanupReason::LeaseExpired)),
         );
         assert_eq!(session.phase(), SessionPhase::Closing);
     }
 
     #[test]
     fn serialized_start_and_cancel_have_one_winner() {
-        let mut start_wins = lifecycle();
+        let mut start_wins = awaiting_start();
         let frame = start_frame();
-        start_wins.accept_start(101, &frame).unwrap();
+        start_wins.accept_start(101, frame).unwrap();
         assert_eq!(
             start_wins.control(102, control(PreparationControlKind::Cancel)),
             Err(SessionLifecycleError::InvalidTransition {
@@ -594,13 +592,13 @@ mod tests {
             }),
         );
 
-        let mut cancel_wins = lifecycle();
+        let mut cancel_wins = awaiting_start();
         assert_eq!(
             cancel_wins.control(101, control(PreparationControlKind::Cancel)),
             Ok(SessionAction::BeginCleanup(CleanupReason::Cancelled)),
         );
         assert_eq!(
-            cancel_wins.accept_start(102, &start_frame()),
+            cancel_wins.accept_start(102, start_frame()),
             Err(SessionLifecycleError::InvalidTransition {
                 phase: SessionPhase::Closing,
             }),
@@ -609,7 +607,7 @@ mod tests {
 
     #[test]
     fn keep_prepared_renews_only_a_live_preparation() {
-        let mut session = lifecycle();
+        let mut session = awaiting_start();
         assert_eq!(
             session.control(1_000, control(PreparationControlKind::KeepPrepared)),
             Ok(SessionAction::LeaseRenewed {
@@ -625,9 +623,9 @@ mod tests {
 
     #[test]
     fn start_result_preserves_failed_and_unknown_outcomes() {
-        let mut failed = lifecycle();
+        let mut failed = awaiting_start();
         let frame = start_frame();
-        failed.accept_start(101, &frame).unwrap();
+        failed.accept_start(101, frame).unwrap();
         assert_eq!(
             failed.exec_outcome(ExecOutcome::Failed { errno: 2 }),
             Ok(SessionAction::BeginCleanup(CleanupReason::ExecFailed {
@@ -635,9 +633,9 @@ mod tests {
             })),
         );
 
-        let mut unknown = lifecycle();
+        let mut unknown = awaiting_start();
         let frame = start_frame();
-        unknown.accept_start(101, &frame).unwrap();
+        unknown.accept_start(101, frame).unwrap();
         assert_eq!(
             unknown.exec_outcome(ExecOutcome::Unknown),
             Ok(SessionAction::BeginCleanup(
@@ -648,8 +646,8 @@ mod tests {
 
     #[test]
     fn worker_exit_does_not_require_a_running_observation() {
-        let mut session = lifecycle();
-        session.accept_start(101, &start_frame()).unwrap();
+        let mut session = awaiting_start();
+        session.accept_start(101, start_frame()).unwrap();
         assert_eq!(
             session.worker_exited(),
             SessionAction::BeginCleanup(CleanupReason::WorkerExited)
@@ -666,9 +664,9 @@ mod tests {
 
     #[test]
     fn close_and_cleanup_pending_keep_one_cleanup_owner() {
-        let mut session = lifecycle();
+        let mut session = awaiting_start();
         let frame = start_frame();
-        session.accept_start(101, &frame).unwrap();
+        session.accept_start(101, frame).unwrap();
         session.exec_outcome(ExecOutcome::Started).unwrap();
         assert_eq!(
             session.control(102, control(PreparationControlKind::Close)),
@@ -696,7 +694,7 @@ mod tests {
 
     #[test]
     fn close_cancels_an_unstarted_preparation() {
-        let mut session = lifecycle();
+        let mut session = awaiting_start();
         assert_eq!(
             session.control(101, control(PreparationControlKind::Close)),
             Ok(SessionAction::BeginCleanup(CleanupReason::ClientClosed)),
@@ -706,7 +704,7 @@ mod tests {
 
     #[test]
     fn commands_must_match_the_preparation_owner() {
-        let mut session = lifecycle();
+        let mut session = awaiting_start();
         let wrong = PreparationControlFrame::new(
             12,
             PreparationControlKind::Cancel,
@@ -716,7 +714,7 @@ mod tests {
             session.control(101, wrong),
             Err(SessionLifecycleError::PreparationMismatch),
         );
-        assert_eq!(session.phase(), SessionPhase::Prepared);
+        assert_eq!(session.phase(), SessionPhase::AwaitingStart);
     }
 
     #[test]
@@ -729,21 +727,5 @@ mod tests {
             SessionLifecycle::new(BROKER, PREPARATION, 0, MAX_PREPARED_LEASE_MS + 1),
             Err(SessionLifecycleError::InvalidLease),
         );
-    }
-
-    #[test]
-    fn prepared_session_keeps_the_accepted_start_request_once() {
-        let mut session = PreparedSession::new(lifecycle());
-        let frame = start_frame();
-        assert_eq!(
-            session.accept_start(101, frame),
-            Ok(SessionAction::StartAccepted),
-        );
-        let request = session.take_start().expect("accepted Start is retained");
-        assert_eq!(
-            request.terminal_size(),
-            Some(TerminalSize::new(80, 24).unwrap())
-        );
-        assert!(session.take_start().is_none());
     }
 }
