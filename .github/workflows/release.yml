@@ -139,10 +139,32 @@ jobs:
         with:
           key: release-guest-runtime-${{ matrix.target }}
 
-      - name: Exercise guest transport on runner architecture
+      - name: Run guest tests on runner architecture
+        run: >-
+          cargo test
+          -p lasper-guest-protocol
+          -p lasper-guest-host-transport
+          -p lasper-guest-runtime
+          -p lasper-local-accounts
+          --all-targets --locked
+
+      - name: Verify worker identity across user namespaces
+        shell: bash
         run: |
-          cargo test -p lasper-guest-runtime --all-targets --locked
-          cargo test -p lasper-guest-host-transport --test interop --test identity --test preparation --locked
+          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+          cargo test -p lasper-guest-host-transport --lib child_user_namespace_maps_packet_and_proc_credentials --locked -- --ignored
+
+      - name: Verify guest sessions and account switching
+        run: |
+          cargo test -p lasper-guest-runtime --test session --locked -- --ignored
+          cargo test -p lasper-guest-runtime --test session --locked -- --sudo
+
+      - name: Verify guest control loop and cleanup
+        run: |
+          cargo test -p lasper-guest-runtime --test control --locked -- --ignored
+          cargo test -p lasper-guest-runtime --test control --locked -- --sudo
 
       - name: Check guest runtime binary
         run: >-
