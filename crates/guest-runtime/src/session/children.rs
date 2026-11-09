@@ -27,9 +27,14 @@ pub(super) struct Children {
     group_established: bool,
     worker_reaped: bool,
     worker_exit: Option<WorkerExit>,
-    deadline_ms: Option<u64>,
+    termination: Option<Termination>,
     next_poll_ms: Option<u64>,
     progress: CleanupProgress,
+}
+
+enum Termination {
+    Grace { until_ms: u64 },
+    Force,
 }
 
 impl Children {
@@ -41,7 +46,7 @@ impl Children {
             group_established: false,
             worker_reaped: false,
             worker_exit: None,
-            deadline_ms: None,
+            termination: None,
             next_poll_ms: None,
             progress: CleanupProgress::NotStarted,
         }
@@ -68,21 +73,34 @@ impl Children {
     }
 
     pub(super) fn begin(&mut self, now_ms: u64) {
-        if self.deadline_ms.is_none() {
-            self.deadline_ms = Some(now_ms.saturating_add(GRACE_MS));
+        if self.termination.is_none() {
+            self.termination = Some(Termination::Grace {
+                until_ms: now_ms.saturating_add(GRACE_MS),
+            });
             self.next_poll_ms = Some(now_ms);
             self.progress = CleanupProgress::Terminating;
         }
     }
 
+    pub(super) fn force(&mut self) {
+        if self.progress != CleanupProgress::Complete {
+            self.termination = Some(Termination::Force);
+            self.next_poll_ms = None;
+            self.progress = CleanupProgress::Terminating;
+        }
+    }
+
     pub(super) fn advance(&mut self, now_ms: u64) -> CleanupProgress {
-        let Some(deadline) = self.deadline_ms else {
+        let Some(termination) = &self.termination else {
             return self.progress;
         };
         if self.progress == CleanupProgress::Complete {
             return self.progress;
         }
-        let force = now_ms >= deadline;
+        let (force, deadline) = match termination {
+            Termination::Grace { until_ms } => (now_ms >= *until_ms, *until_ms),
+            Termination::Force => (true, now_ms),
+        };
         let signal = if force { SIGKILL } else { SIGTERM };
         let mut error = None;
         if !self.worker_reaped {
@@ -151,9 +169,9 @@ impl Children {
         if self.progress == CleanupProgress::Complete {
             return;
         }
-        self.begin(0);
+        self.force();
         loop {
-            if self.advance(u64::MAX) == CleanupProgress::Complete {
+            if self.advance(0) == CleanupProgress::Complete {
                 return;
             }
             // Revisit adopted children after each reap. Blocking in wait here

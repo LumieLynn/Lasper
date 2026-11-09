@@ -41,6 +41,7 @@ pub enum ExitReason {
     PreparationExpired,
     WorkerPreparationFailed,
     WorkerObservationFailed,
+    ClockFailed,
     ReadyDeliveryFailed,
     Cancelled,
     LeaseExpired,

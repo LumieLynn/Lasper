@@ -1,4 +1,7 @@
-use crate::{MAX_CONTROL_FRAME_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR};
+use crate::{
+    ProtocolVersion, ProtocolVersionMismatch, MAX_CONTROL_FRAME_BYTES, PROTOCOL_MAJOR,
+    PROTOCOL_MINOR,
+};
 use serde::{Deserialize, Serialize};
 
 const IDENTITY_MAGIC: [u8; 8] = *b"LSPRGRT1";
@@ -58,6 +61,13 @@ pub struct RuntimeIdentity {
 }
 
 impl RuntimeIdentity {
+    pub const fn protocol_version(self) -> ProtocolVersion {
+        ProtocolVersion {
+            major: self.protocol_major,
+            minor: self.protocol_minor,
+        }
+    }
+
     pub const fn current(architecture: Architecture) -> Self {
         Self {
             architecture,
@@ -137,12 +147,10 @@ pub struct RuntimeRequirements {
 
 impl RuntimeRequirements {
     pub fn check(self, identity: RuntimeIdentity) -> Result<(), RuntimeCompatibilityError> {
-        if identity.protocol_major != PROTOCOL_MAJOR {
-            return Err(RuntimeCompatibilityError::ProtocolMajor {
-                expected: PROTOCOL_MAJOR,
-                actual: identity.protocol_major,
-            });
-        }
+        identity
+            .protocol_version()
+            .check()
+            .map_err(RuntimeCompatibilityError::ProtocolVersion)?;
         if identity.architecture != self.architecture {
             return Err(RuntimeCompatibilityError::Architecture {
                 expected: self.architecture,
@@ -167,10 +175,7 @@ impl RuntimeRequirements {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RuntimeCompatibilityError {
-    ProtocolMajor {
-        expected: u16,
-        actual: u16,
-    },
+    ProtocolVersion(ProtocolVersionMismatch),
     Architecture {
         expected: Architecture,
         actual: Architecture,
@@ -280,7 +285,7 @@ mod tests {
                 protocol_major: PROTOCOL_MAJOR + 1,
                 ..compatible
             }),
-            Err(RuntimeCompatibilityError::ProtocolMajor { .. })
+            Err(RuntimeCompatibilityError::ProtocolVersion(_))
         ));
         assert!(matches!(
             requirements.check(RuntimeIdentity {

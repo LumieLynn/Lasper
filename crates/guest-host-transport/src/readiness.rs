@@ -2,7 +2,7 @@ use crate::process::ProcessHandle;
 use lasper_guest_protocol::{
     BrokerId, ControlLimits, EnforcedControlLimits, FeatureSet, HelloNegotiationError,
     HelloRequest, HelloResponse, PrepareReady, PrepareRequest, PrepareRequestFrame,
-    MIN_HELPER_CONTROL_FRAME_BYTES,
+    ProtocolVersion, MIN_HELPER_CONTROL_FRAME_BYTES,
 };
 use std::fmt;
 use std::io;
@@ -40,12 +40,12 @@ impl WorkerHello {
 
     pub fn negotiate(
         self,
-        protocol_major: u16,
+        protocol_version: ProtocolVersion,
         response: HelloResponse,
     ) -> Result<WorkerReadiness, WorkerReadinessError> {
         let limits = self
             .request
-            .negotiate(protocol_major, response)
+            .negotiate(protocol_version, response)
             .map_err(WorkerReadinessError::Negotiation)?;
         require_frame_capacity(limits.get().max_control_frame_bytes())?;
         Ok(WorkerReadiness {

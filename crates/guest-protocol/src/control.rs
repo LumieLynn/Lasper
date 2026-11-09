@@ -1,4 +1,4 @@
-use crate::{MAX_CONTROL_FRAME_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR};
+use crate::{ProtocolVersion, MAX_CONTROL_FRAME_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR};
 
 const CONTROL_FRAME_MAGIC: [u8; 8] = *b"LSPGCTL1";
 const CONTROL_FRAME_FORMAT: u16 = 1;
@@ -94,6 +94,13 @@ impl ControlFrameHeader {
 
     pub const fn protocol_minor(self) -> u16 {
         self.protocol_minor
+    }
+
+    pub const fn protocol_version(self) -> ProtocolVersion {
+        ProtocolVersion {
+            major: self.protocol_major,
+            minor: self.protocol_minor,
+        }
     }
 
     pub const fn request_id(self) -> u64 {

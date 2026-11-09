@@ -1,8 +1,8 @@
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 use crate::{
-    MessageKind, CONTROL_FRAME_HEADER_BYTES, MAX_CONTROL_DESCRIPTORS, MAX_CONTROL_FRAME_BYTES,
-    PROTOCOL_MAJOR,
+    MessageKind, ProtocolVersion, ProtocolVersionMismatch, CONTROL_FRAME_HEADER_BYTES,
+    MAX_CONTROL_DESCRIPTORS, MAX_CONTROL_FRAME_BYTES,
 };
 
 const BROKER_ID_BYTES: usize = 16;
@@ -253,15 +253,12 @@ impl HelloRequest {
     /// completing the transport handshake.
     pub fn negotiate(
         self,
-        peer_protocol_major: u16,
+        peer_protocol_version: ProtocolVersion,
         response: HelloResponse,
     ) -> Result<EnforcedControlLimits, HelloNegotiationError> {
-        if peer_protocol_major != PROTOCOL_MAJOR {
-            return Err(HelloNegotiationError::ProtocolMajor {
-                expected: PROTOCOL_MAJOR,
-                actual: peer_protocol_major,
-            });
-        }
+        peer_protocol_version
+            .check()
+            .map_err(HelloNegotiationError::ProtocolVersion)?;
         self.validate()
             .map_err(HelloNegotiationError::InvalidLimits)?;
         response
@@ -282,10 +279,7 @@ impl HelloRequest {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HelloNegotiationError {
-    ProtocolMajor {
-        expected: u16,
-        actual: u16,
-    },
+    ProtocolVersion(ProtocolVersionMismatch),
     InvalidLimits(PayloadCodecError),
     UnsupportedFeatures {
         required: crate::FeatureSet,
@@ -301,6 +295,7 @@ pub enum ControlLimitError {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ControlSessionError {
+    ProtocolVersion(ProtocolVersionMismatch),
     Limit(ControlLimitError),
     ExpectedOutbound(MessageKind),
     ExpectedInbound(MessageKind),
@@ -452,6 +447,10 @@ fn validate_hello_kind(
             actual: header.kind(),
         });
     }
+    header
+        .protocol_version()
+        .check()
+        .map_err(ControlSessionError::ProtocolVersion)?;
     match HELLO_CONTROL_LIMITS.validate_header(header) {
         Ok(()) => Ok(()),
         Err(error) => Err(ControlSessionError::Limit(error)),
@@ -482,6 +481,10 @@ fn validate_established_header(
     ) {
         return Err(ControlSessionError::UnexpectedHello);
     }
+    header
+        .protocol_version()
+        .check()
+        .map_err(ControlSessionError::ProtocolVersion)?;
     match limits.validate_header(header) {
         Ok(()) => Ok(()),
         Err(error) => Err(ControlSessionError::Limit(error)),
@@ -662,7 +665,7 @@ mod tests {
 
         assert_eq!(
             request
-                .negotiate(crate::PROTOCOL_MAJOR, response)
+                .negotiate(ProtocolVersion::CURRENT, response)
                 .unwrap()
                 .get(),
             ControlLimits::new(32768, 1).unwrap()
@@ -671,7 +674,7 @@ mod tests {
         let unsupported =
             HelloRequest::new(FeatureSet::from_bits(0b1000), ControlLimits::CURRENT).unwrap();
         assert_eq!(
-            unsupported.negotiate(crate::PROTOCOL_MAJOR, response),
+            unsupported.negotiate(ProtocolVersion::CURRENT, response),
             Err(HelloNegotiationError::UnsupportedFeatures {
                 required: FeatureSet::from_bits(0b1000),
                 available: FeatureSet::from_bits(0b111),
@@ -679,11 +682,22 @@ mod tests {
         );
 
         assert_eq!(
-            request.negotiate(crate::PROTOCOL_MAJOR + 1, response),
-            Err(HelloNegotiationError::ProtocolMajor {
-                expected: crate::PROTOCOL_MAJOR,
-                actual: crate::PROTOCOL_MAJOR + 1,
-            })
+            request.negotiate(
+                ProtocolVersion {
+                    major: crate::PROTOCOL_MAJOR + 1,
+                    ..ProtocolVersion::CURRENT
+                },
+                response
+            ),
+            Err(HelloNegotiationError::ProtocolVersion(
+                ProtocolVersionMismatch {
+                    expected: ProtocolVersion::CURRENT,
+                    actual: ProtocolVersion {
+                        major: crate::PROTOCOL_MAJOR + 1,
+                        ..ProtocolVersion::CURRENT
+                    },
+                }
+            ))
         );
     }
 
@@ -824,7 +838,9 @@ mod tests {
             ControlLimits::CURRENT,
         )
         .unwrap();
-        let established = request.negotiate(crate::PROTOCOL_MAJOR, response).unwrap();
+        let established = request
+            .negotiate(ProtocolVersion::CURRENT, response)
+            .unwrap();
         host.complete_hello(established).unwrap();
         guest.complete_hello(established).unwrap();
 

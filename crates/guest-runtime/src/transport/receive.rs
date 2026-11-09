@@ -36,10 +36,21 @@ impl<'a> FrameReceiver<'a> {
         self.operation.stream.fd
     }
 
+    pub fn has_started(&self) -> bool {
+        self.operation.started
+    }
+
     /// Advance with a bounded I/O budget. Pending retains progress; call again
     /// from a level-triggered poll loop alongside the guardian's other events.
     pub fn advance(&mut self) -> Result<Poll<ControlFrameHeader>, TransportError> {
-        match self.read_header() {
+        self.advance_with_budget(&mut IoBudget::new())
+    }
+
+    pub fn advance_with_budget(
+        &mut self,
+        budget: &mut IoBudget,
+    ) -> Result<Poll<ControlFrameHeader>, TransportError> {
+        match self.read_header(budget) {
             Ok(result) => Ok(result),
             Err(error) => {
                 self.descriptors.take();
@@ -48,18 +59,21 @@ impl<'a> FrameReceiver<'a> {
         }
     }
 
-    fn read_header(&mut self) -> Result<Poll<ControlFrameHeader>, TransportError> {
+    fn read_header(
+        &mut self,
+        budget: &mut IoBudget,
+    ) -> Result<Poll<ControlFrameHeader>, TransportError> {
         self.operation.stream.ensure_usable()?;
         if let Some(header) = self.header {
             return Ok(Poll::Ready(header));
         }
-        let mut budget = IoBudget::new();
         while self.offset < self.bytes.len() && budget.available() {
             let end = if self.offset == 0 {
                 CONTROL_FRAME_DESCRIPTOR_ANCHOR_BYTES
             } else {
                 self.bytes.len()
             };
+            let end = self.offset + budget.length(end - self.offset);
             budget.attempted();
             let (read, descriptors) =
                 match receive_chunk(self.as_raw_fd(), &mut self.bytes[self.offset..end]) {
@@ -143,8 +157,19 @@ impl<B: AsMut<[u8]>> PayloadReceiver<'_, B> {
         self.operation.stream.fd
     }
 
+    pub fn has_started(&self) -> bool {
+        self.operation.started
+    }
+
     pub fn advance(&mut self) -> Result<Poll<()>, TransportError> {
-        match self.read_payload() {
+        self.advance_with_budget(&mut IoBudget::new())
+    }
+
+    pub fn advance_with_budget(
+        &mut self,
+        budget: &mut IoBudget,
+    ) -> Result<Poll<()>, TransportError> {
+        match self.read_payload(budget) {
             Ok(result) => Ok(result),
             Err(error) => {
                 self.descriptors.take();
@@ -153,7 +178,7 @@ impl<B: AsMut<[u8]>> PayloadReceiver<'_, B> {
         }
     }
 
-    fn read_payload(&mut self) -> Result<Poll<()>, TransportError> {
+    fn read_payload(&mut self, budget: &mut IoBudget) -> Result<Poll<()>, TransportError> {
         self.operation.stream.ensure_usable()?;
         if self.operation.finished {
             return Ok(Poll::Ready(()));
@@ -165,7 +190,6 @@ impl<B: AsMut<[u8]>> PayloadReceiver<'_, B> {
                 available: self.buffer.as_mut().len(),
             });
         }
-        let mut budget = IoBudget::new();
         while self.offset < required && budget.available() {
             let end = self.offset + budget.length(required - self.offset);
             budget.attempted();

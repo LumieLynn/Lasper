@@ -113,7 +113,7 @@ impl GuestControlStream {
         }
     }
 
-    fn poison(&self) {
+    pub(crate) fn poison(&self) {
         self.poisoned.set(true);
         let _ = shutdown(self.fd);
     }
@@ -189,28 +189,43 @@ enum Direction {
 
 // Limit syscall attempts as well as bytes so repeated EINTR cannot keep the
 // guardian from checking its deadlines and child/liveness descriptors.
-struct IoBudget {
+pub(crate) const IO_BYTES_PER_TURN: usize = 64 * 1024;
+
+pub struct IoBudget {
     bytes: usize,
     calls: usize,
 }
 
 impl IoBudget {
-    fn new() -> Self {
+    pub fn new() -> Self {
+        Self::with_bytes(IO_BYTES_PER_TURN)
+    }
+
+    /// A smaller turn budget shares the same syscall bound and never raises
+    /// the transport's 64 KiB ceiling.
+    pub fn with_bytes(bytes: usize) -> Self {
         Self {
-            bytes: 64 * 1024,
+            bytes: bytes.min(IO_BYTES_PER_TURN),
             calls: 8,
         }
     }
-    fn available(&self) -> bool {
+
+    pub(crate) fn available(&self) -> bool {
         self.bytes != 0 && self.calls != 0
     }
-    fn length(&self, remaining: usize) -> usize {
+    pub(crate) fn length(&self, remaining: usize) -> usize {
         remaining.min(self.bytes)
     }
-    fn attempted(&mut self) {
+    pub(crate) fn attempted(&mut self) {
         self.calls -= 1;
     }
-    fn transferred(&mut self, bytes: usize) {
+    pub(crate) fn transferred(&mut self, bytes: usize) {
         self.bytes -= bytes;
+    }
+}
+
+impl Default for IoBudget {
+    fn default() -> Self {
+        Self::new()
     }
 }

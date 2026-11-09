@@ -612,7 +612,7 @@ mod tests {
         HelloRequest::new(FeatureSet::EMPTY, limits)
             .unwrap()
             .negotiate(
-                lasper_guest_protocol::PROTOCOL_MAJOR,
+                lasper_guest_protocol::ProtocolVersion::CURRENT,
                 HelloResponse::new(FeatureSet::EMPTY, BrokerId::new([1; 16]), limits).unwrap(),
             )
             .unwrap()

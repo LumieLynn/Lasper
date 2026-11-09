@@ -23,6 +23,7 @@ pub enum GuestErrorCode {
     InvalidRequest,
     InvalidState,
     Expired,
+    WorkerExitedBeforeStart,
     Unavailable,
     System,
 }

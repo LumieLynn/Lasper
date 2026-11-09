@@ -51,16 +51,16 @@ fn request(process: GuestProcess<'_>, interactive: bool) -> PrepareRequestFrame<
     )
 }
 
-fn spawn<'a>(
-    context: &mut GuardianContext,
-    request: &PrepareRequestFrame<'a>,
-) -> SessionGuardian<'a> {
+fn spawn<'a, 'context>(
+    context: &'context GuardianContext,
+    request: &'a PrepareRequestFrame<'a>,
+) -> SessionGuardian<'a, 'context> {
     context
-        .spawn(request.clone(), PREPARATION, now_ms(), fixture::entry)
+        .spawn(request, PREPARATION, now_ms(), fixture::entry)
         .unwrap()
 }
 
-fn prepared(worker: &mut SessionGuardian<'_>) {
+fn prepared(worker: &mut SessionGuardian<'_, '_>) {
     let deadline = Instant::now() + Duration::from_secs(4);
     loop {
         let state = worker.poll(now_ms()).unwrap();
@@ -79,7 +79,7 @@ fn prepared(worker: &mut SessionGuardian<'_>) {
     }
 }
 
-fn assert_credentials(worker: &SessionGuardian<'_>, expected_groups: &[u32]) {
+fn assert_credentials(worker: &SessionGuardian<'_, '_>, expected_groups: &[u32]) {
     let fixture = fixture::get();
     let status = std::fs::read_to_string(format!("/proc/{}/status", worker.pid())).unwrap();
     for (label, expected) in [("Uid:", fixture.uid), ("Gid:", fixture.gid)] {
@@ -105,7 +105,7 @@ fn assert_credentials(worker: &SessionGuardian<'_>, expected_groups: &[u32]) {
     assert_eq!(groups, expected_groups);
 }
 
-fn assert_terminal_owner(worker: &SessionGuardian<'_>) {
+fn assert_terminal_owner(worker: &SessionGuardian<'_, '_>) {
     let stat = std::fs::metadata(format!("/proc/{}/fd/0", worker.pid())).unwrap();
     let fixture = fixture::get();
     assert_eq!((stat.uid(), stat.gid()), (fixture.uid, fixture.gid));
@@ -132,7 +132,7 @@ fn verify_reply(ready: &fixture::ReceivedReady, request: &PrepareRequestFrame<'_
     );
 }
 
-fn start(worker: &mut SessionGuardian<'_>, request: &PrepareRequestFrame<'_>) {
+fn start(worker: &mut SessionGuardian<'_, '_>, request: &PrepareRequestFrame<'_>) {
     worker
         .start(
             now_ms(),
@@ -160,7 +160,7 @@ fn terminal(ready: &fixture::ReceivedReady) -> File {
 }
 
 fn completed(
-    worker: &mut SessionGuardian<'_>,
+    worker: &mut SessionGuardian<'_, '_>,
     mut terminal: Option<File>,
 ) -> (WorkerObservation, String) {
     let deadline = Instant::now() + Duration::from_secs(5);
@@ -213,7 +213,7 @@ fn login_snapshot(context: &mut GuardianContext) {
     prepared(&mut worker);
     assert_credentials(&worker, &fixture.groups);
     assert_terminal_owner(&worker);
-    let ready = fixture::receive_ready(&mut worker, now_ms());
+    let ready = fixture::receive_ready(&mut worker, context.connection(), now_ms());
     verify_reply(&ready, &request);
     let master = terminal(&ready);
     fixture.write_account("/different-home", "/different-shell", 999, 999);
@@ -261,7 +261,7 @@ fn command_arguments(context: &mut GuardianContext) {
     let mut worker = spawn(context, &request);
     prepared(&mut worker);
     assert_credentials(&worker, &fixture.groups);
-    let _ready = fixture::receive_ready(&mut worker, now_ms());
+    let _ready = fixture::receive_ready(&mut worker, context.connection(), now_ms());
     start(&mut worker, &request);
     let (result, output) = completed(&mut worker, None);
     assert_eq!(result.failure, None);
@@ -385,7 +385,7 @@ fn missing_groups(context: &mut GuardianContext) {
     let mut worker = spawn(context, &request);
     prepared(&mut worker);
     assert_credentials(&worker, &[fixture.gid]);
-    let ready = fixture::receive_ready(&mut worker, now_ms());
+    let ready = fixture::receive_ready(&mut worker, context.connection(), now_ms());
     verify_reply(&ready, &request);
     start(&mut worker, &request);
     let (result, output) = completed(&mut worker, None);

@@ -1,14 +1,13 @@
-use lasper_guest_protocol::{
-    BrokerId, ControlFrameHeader, ControlLimits, FeatureSet, HelloRequest, HelloResponse,
-    MessageKind, CONTROL_FRAME_HEADER_BYTES, HELLO_PAYLOAD_BUFFER_BYTES, PROTOCOL_MAJOR,
-};
 use lasper_guest_runtime::session::{GuardianBootstrap, GuardianContext, GUARDIAN_START_BYTE};
-use std::io::{PipeWriter, Read, Write};
+use std::io::{PipeWriter, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command, ExitStatus};
 use std::time::{Duration, Instant};
+
+#[path = "hello.rs"]
+mod hello;
 
 unsafe extern "C" {
     fn fcntl(fd: i32, operation: i32, ...) -> i32;
@@ -94,31 +93,7 @@ impl GuardianProcess {
     }
 
     pub fn hello(&mut self) {
-        self.control
-            .set_read_timeout(Some(Duration::from_secs(3)))
-            .unwrap();
-        self.control
-            .set_write_timeout(Some(Duration::from_secs(3)))
-            .unwrap();
-        let request = HelloRequest::new(FeatureSet::WORKER_PIDFD, ControlLimits::CURRENT).unwrap();
-        let mut payload = [0; HELLO_PAYLOAD_BUFFER_BYTES];
-        let length = request.encode_payload(&mut payload).unwrap();
-        let header =
-            ControlFrameHeader::new(MessageKind::HelloRequest, 1, length as u32, 0).unwrap();
-        self.control.write_all(&header.encode()).unwrap();
-        self.control.write_all(&payload[..length]).unwrap();
-        let mut header = [0; CONTROL_FRAME_HEADER_BYTES];
-        self.control.read_exact(&mut header).unwrap();
-        let header = ControlFrameHeader::decode(&header).unwrap();
-        assert_eq!(header.kind(), MessageKind::HelloResponse);
-        assert_eq!(header.request_id(), 1);
-        self.control
-            .read_exact(&mut payload[..header.payload_bytes() as usize])
-            .unwrap();
-        let response =
-            HelloResponse::decode_payload(&payload[..header.payload_bytes() as usize]).unwrap();
-        request.negotiate(PROTOCOL_MAJOR, response).unwrap();
-        assert_eq!(response.broker_id(), BrokerId::new([1; 16]));
+        hello::exchange(&mut self.control);
     }
 
     pub fn wait(&mut self) -> ExitStatus {

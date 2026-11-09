@@ -133,6 +133,8 @@ fn prepare_errors_can_precede_assignment_but_system_errors_require_errno() {
     let prepare_header =
         ControlFrameHeader::decode(&prepare_payload[..CONTROL_FRAME_HEADER_BYTES]).unwrap();
     for (code, errno) in [
+        (GuestErrorCode::Expired, None),
+        (GuestErrorCode::WorkerExitedBeforeStart, None),
         (GuestErrorCode::Unavailable, None),
         (GuestErrorCode::System, Some(13)),
     ] {

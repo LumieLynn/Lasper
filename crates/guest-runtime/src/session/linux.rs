@@ -1,3 +1,5 @@
+pub(super) mod filesystem;
+
 use core::ffi::CStr;
 use core::mem::{align_of, offset_of, size_of};
 

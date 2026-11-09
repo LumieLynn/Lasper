@@ -74,7 +74,7 @@ fn request<'a>(argv: &[&'a str]) -> PrepareRequestFrame<'a> {
 fn allocation_failure(context: &mut GuardianContext) {
     let request = request(&["/bin/true"]);
     let mut worker = context
-        .spawn(request, PREPARATION, 0, deny_allocation)
+        .spawn(&request, PREPARATION, 0, deny_allocation)
         .unwrap();
     let clock = Instant::now();
     loop {
@@ -115,7 +115,7 @@ fn maximum_argv(context: &mut GuardianContext) {
     let argv: Vec<_> = arguments.iter().map(String::as_str).collect();
     let request = request(&argv);
     let mut worker = context
-        .spawn(request.clone(), PREPARATION, 0, fixture::entry)
+        .spawn(&request, PREPARATION, 0, fixture::entry)
         .unwrap();
     let clock = Instant::now();
     let mut started = false;
@@ -126,7 +126,7 @@ fn maximum_argv(context: &mut GuardianContext) {
         assert_eq!(state.worker.failure, None, "{state:?}");
         assert_eq!(state.worker.error, None, "{state:?}");
         if !started && state.phase == SessionPhase::Prepared {
-            let _ready = fixture::receive_ready(&mut worker, now);
+            let _ready = fixture::receive_ready(&mut worker, context.connection(), now);
             let start = StartRequest::new(&request, PREPARATION, None, None, None).unwrap();
             worker.start(now, StartFrame::new(11, start)).unwrap();
             started = true;

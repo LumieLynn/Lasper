@@ -4,7 +4,7 @@ use crate::syscall::{syscall1, syscall2};
 use core::fmt;
 use lasper_guest_protocol::{
     BrokerId, ControlLimits, EnforcedControlLimits, FeatureSet, HelloNegotiationError,
-    HelloRequest, HelloResponse, MIN_HELPER_CONTROL_FRAME_BYTES,
+    HelloRequest, HelloResponse, ProtocolVersion, MIN_HELPER_CONTROL_FRAME_BYTES,
 };
 
 /// Checked in the broker's execution context before advertising worker pidfds.
@@ -40,7 +40,7 @@ impl GuestWorkerReadiness {
     /// receive it. No successful response is available before this check.
     pub fn accept_hello(
         &self,
-        protocol_major: u16,
+        protocol_version: ProtocolVersion,
         request: HelloRequest,
         broker: BrokerId,
         limits: ControlLimits,
@@ -50,7 +50,7 @@ impl GuestWorkerReadiness {
                 GuestHelloError::Negotiation(HelloNegotiationError::InvalidLimits(error))
             })?;
         let limits = request
-            .negotiate(protocol_major, response)
+            .negotiate(protocol_version, response)
             .map_err(GuestHelloError::Negotiation)?;
         if !request
             .required_features()
@@ -120,7 +120,7 @@ impl fmt::Display for GuestReadinessError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lasper_guest_protocol::{MAX_CONTROL_FRAME_BYTES, PROTOCOL_MAJOR};
+    use lasper_guest_protocol::MAX_CONTROL_FRAME_BYTES;
 
     #[test]
     fn legacy_hosts_are_rejected_even_when_their_descriptor_limit_fits() {
@@ -133,7 +133,7 @@ mod tests {
             .unwrap();
             assert!(matches!(
                 readiness.accept_hello(
-                    PROTOCOL_MAJOR,
+                    ProtocolVersion::CURRENT,
                     request,
                     BrokerId::new([1; 16]),
                     ControlLimits::CURRENT
@@ -153,7 +153,7 @@ mod tests {
         .unwrap();
         let accepted = readiness
             .accept_hello(
-                PROTOCOL_MAJOR,
+                ProtocolVersion::CURRENT,
                 request,
                 BrokerId::new([1; 16]),
                 ControlLimits::CURRENT,
@@ -164,18 +164,21 @@ mod tests {
         assert_eq!(
             accepted.limits(),
             request
-                .negotiate(PROTOCOL_MAJOR, accepted.response())
+                .negotiate(ProtocolVersion::CURRENT, accepted.response())
                 .unwrap()
         );
         assert!(matches!(
             readiness.accept_hello(
-                PROTOCOL_MAJOR + 1,
+                ProtocolVersion {
+                    major: ProtocolVersion::CURRENT.major + 1,
+                    ..ProtocolVersion::CURRENT
+                },
                 request,
                 BrokerId::new([1; 16]),
                 ControlLimits::CURRENT
             ),
             Err(GuestHelloError::Negotiation(
-                HelloNegotiationError::ProtocolMajor { .. }
+                HelloNegotiationError::ProtocolVersion(_)
             )),
         ));
         let unsupported = HelloRequest::new(
@@ -185,7 +188,7 @@ mod tests {
         .unwrap();
         assert!(matches!(
             readiness.accept_hello(
-                PROTOCOL_MAJOR,
+                ProtocolVersion::CURRENT,
                 unsupported,
                 BrokerId::new([1; 16]),
                 ControlLimits::CURRENT

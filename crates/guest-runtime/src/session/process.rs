@@ -9,7 +9,7 @@ use super::children::{visit_direct_children, Children, CleanupProgress};
 use super::error::SystemResultExt;
 use super::lifecycle::ExecOutcome;
 use super::linux::{self, Descriptor, Pipe, Terminal};
-use super::ready::ReadyResources;
+
 use super::status::{WorkerFailure, WorkerStage, WorkerStatus};
 use super::worker::{encode_start, WorkerBootstrap, WorkerChannels, START_BYTES};
 use super::{GuardianError, WorkerExit};
@@ -19,6 +19,7 @@ pub struct WorkerObservation {
     /// Worker account/session setup is complete. Ready delivery and Start
     /// eligibility belong to the guardian's protocol phase.
     pub prepared: bool,
+    pub start_requested: bool,
     pub exec: Option<ExecOutcome>,
     pub exit: Option<WorkerExit>,
     pub failure: Option<WorkerFailure>,
@@ -34,7 +35,7 @@ pub struct WorkerObservation {
 /// guardian, never in the host UI or an async executor.
 #[must_use = "the guardian must retain the worker until cleanup is complete"]
 pub(super) struct GuardianWorker<'a> {
-    request: PrepareRequestFrame<'a>,
+    request: &'a PrepareRequestFrame<'a>,
     preparation: PreparationId,
     pid: i32,
     pidfd: Option<Descriptor>,
@@ -74,7 +75,7 @@ impl<'a> GuardianWorker<'a> {
     /// children or other reaper. Entry must use fork-safe operations and end
     /// through exec or process exit. It must not unwind into the fork caller.
     pub unsafe fn spawn(
-        request: PrepareRequestFrame<'a>,
+        request: &'a PrepareRequestFrame<'a>,
         preparation: PreparationId,
         entry: fn(WorkerBootstrap<'_>) -> !,
     ) -> Result<Self, GuardianError> {
@@ -150,7 +151,7 @@ impl<'a> GuardianWorker<'a> {
         if pid == 0 {
             // Entry never returns, so this child's inherited request frame
             // stays alive through exec without copying its inline paths/argv.
-            entry(child.bootstrap(&request, preparation));
+            entry(child.bootstrap(request, preparation));
         }
         drop(child);
         // This guardian alone owns wait. Even an early-exit child keeps its
@@ -182,6 +183,10 @@ impl<'a> GuardianWorker<'a> {
             children: Children::new(pid),
             not_send: PhantomData,
         })
+    }
+
+    pub fn bounded(&self) -> bool {
+        self.request.request().execution() == ExecutionKind::Bounded
     }
 
     pub const fn pid(&self) -> i32 {
@@ -271,6 +276,7 @@ impl<'a> GuardianWorker<'a> {
     pub fn observation(&self) -> WorkerObservation {
         WorkerObservation {
             prepared: self.setup_ready(),
+            start_requested: self.start.requested(),
             exec: self.exec,
             exit: self.exit,
             failure: self.status.failure(),
@@ -279,7 +285,11 @@ impl<'a> GuardianWorker<'a> {
         }
     }
 
-    pub fn take_ready(&mut self, lease_ms: u32) -> Result<ReadyResources<'_>, GuardianError> {
+    pub fn ready(
+        &mut self,
+        lease_ms: u32,
+        send: impl FnOnce(lasper_guest_protocol::PrepareReadyFrame, &[i32]) -> Result<(), GuardianError>,
+    ) -> Result<lasper_guest_protocol::PrepareReadyFrame, GuardianError> {
         if !self.setup_ready() {
             return Err(GuardianError::NotPrepared);
         }
@@ -288,15 +298,18 @@ impl<'a> GuardianWorker<'a> {
         let frame = self
             .request
             .ready_frame(ready)
-            .map_err(|_| GuardianError::NotPrepared)?;
+            .map_err(GuardianError::PrepareFrame)?;
         let pidfd = self.pidfd.as_ref().ok_or(GuardianError::NotPrepared)?;
         let identity = self.identity.take().ok_or(GuardianError::NotPrepared)?;
-        Ok(ReadyResources::new(
-            frame,
-            self.terminal.take(),
-            identity,
-            pidfd,
-        ))
+        let terminal = self.terminal.take();
+        let (fds, count) = match terminal.as_ref() {
+            Some(terminal) => ([terminal.raw(), identity.raw(), pidfd.raw()], 3),
+            None => ([identity.raw(), pidfd.raw(), -1], 2),
+        };
+        // The transport duplicates these endpoints before returning. Only its
+        // pending sender then owns the export copies; observation keeps pidfd.
+        send(frame, &fds[..count])?;
+        Ok(frame)
     }
 
     pub fn validate_start(&self, start: &StartRequest) -> Result<(), GuardianError> {
@@ -311,7 +324,7 @@ impl<'a> GuardianWorker<'a> {
             ));
         }
         StartRequest::new(
-            &self.request,
+            self.request,
             self.preparation,
             start.wayland_display(),
             start.x11_display(),
@@ -372,6 +385,13 @@ impl<'a> GuardianWorker<'a> {
         }
     }
 
+    pub fn force_cleanup(&mut self) {
+        if matches!(self.start, StartDelivery::Waiting(_)) {
+            self.start = StartDelivery::Cancelled;
+        }
+        self.children.force();
+    }
+
     pub fn read_stderr(&mut self, buffer: &mut [u8]) -> Result<usize, GuardianError> {
         match &self.stderr {
             Some(fd) => {
@@ -398,6 +418,11 @@ impl<'a> GuardianWorker<'a> {
             self.stdout.as_ref().map_or(-1, Descriptor::raw),
             self.stderr.as_ref().map_or(-1, Descriptor::raw),
         ]
+    }
+
+    pub fn close_output(&mut self) {
+        self.stdout.take();
+        self.stderr.take();
     }
 
     fn setup_ready(&self) -> bool {

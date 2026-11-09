@@ -7,6 +7,7 @@ mod identity_channel;
 mod messages;
 mod prepare;
 mod session;
+mod version;
 
 pub use control::{
     ControlFrame, ControlFrameError, ControlFrameHeader, ControlFrameHeaderError, MessageKind,
@@ -43,6 +44,7 @@ pub use session::{
     SessionFrameError, SessionPayloadError, StartAcceptedFrame, StartFrame, StartRequest,
     MAX_CAPTURED_OUTPUT_BYTES, MIN_HELPER_CONTROL_FRAME_BYTES,
 };
+pub use version::{ProtocolVersion, ProtocolVersionMismatch};
 
 pub const PROTOCOL_MAJOR: u16 = 1;
 pub const PROTOCOL_MINOR: u16 = 0;

@@ -36,9 +36,12 @@ pub(crate) mod file {
     pub(crate) const F_DUPFD_CLOEXEC: usize = 1030;
     pub(crate) const FD_CLOEXEC: usize = 1;
     pub(crate) const X_OK: usize = 1;
+    pub(crate) const W_OK: usize = 2;
     pub(crate) const STATX_TYPE: usize = 1;
+    pub(crate) const STATX_INO: usize = 0x100;
     pub(crate) const S_IFMT: u16 = 0o170000;
     pub(crate) const S_IFREG: u16 = 0o100000;
+    pub(crate) const S_IFSOCK: u16 = 0o140000;
 }
 
 pub(crate) mod signal {
@@ -93,9 +96,16 @@ pub(crate) mod time {
     pub(crate) const CLOCK_MONOTONIC: usize = 1;
 }
 
+pub(crate) mod random {
+    pub(crate) const GRND_NONBLOCK: usize = 1;
+}
+
 pub(crate) mod poll {
     pub(crate) const POLLIN: i16 = 1;
     pub(crate) const POLLOUT: i16 = 4;
+    pub(crate) const POLLERR: i16 = 8;
+    pub(crate) const POLLHUP: i16 = 16;
+    pub(crate) const POLLRDHUP: i16 = 0x2000;
 }
 
 pub(crate) mod memory {
@@ -148,6 +158,7 @@ pub(crate) mod nr {
     pub(crate) const SIGNALFD4: usize = 289;
     pub(crate) const DUP3: usize = 292;
     pub(crate) const PIPE2: usize = 293;
+    pub(crate) const GETRANDOM: usize = 318;
     pub(crate) const STATX: usize = 332;
     pub(crate) const PIDFD_OPEN: usize = 434;
 }
@@ -195,6 +206,7 @@ pub(crate) mod nr {
     pub(crate) const EXECVE: usize = 221;
     pub(crate) const MMAP: usize = 222;
     pub(crate) const WAIT4: usize = 260;
+    pub(crate) const GETRANDOM: usize = 278;
     pub(crate) const STATX: usize = 291;
     pub(crate) const PIDFD_OPEN: usize = 434;
 }

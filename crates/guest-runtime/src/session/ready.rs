@@ -1,101 +1,123 @@
-use core::marker::PhantomData;
-use lasper_guest_protocol::PrepareReadyFrame;
+use core::task::Poll;
+use lasper_guest_protocol::{
+    ControlFrameHeader, EnforcedControlLimits, CONTROL_FRAME_HEADER_BYTES,
+};
 
-use super::lifecycle::ReadyTransition;
-use super::linux::Descriptor;
+use crate::memory::Mapping;
+use crate::transport::{FrameSender, GuestControlStream, IoBudget};
 
-/// Keeps Ready resources and its lifecycle transition together. Only a
-/// successful delivery enables Start; dropping or failing delivery closes
-/// these endpoint copies and leaves the guardian responsible for cleanup.
-#[must_use = "deliver Ready or drop it to cancel the preparation"]
-pub struct WorkerReady<'a> {
-    resources: ReadyResources<'a>,
-    transition: ReadyTransition<'a>,
+use super::error::SystemResultExt;
+use super::GuardianError;
+
+pub(super) const IO_TIMEOUT_MS: u64 = 5_000;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ReplyKind {
+    Ready,
+    Command,
+    Exit { final_report: bool },
 }
 
-impl<'a> WorkerReady<'a> {
-    pub(super) fn new(resources: ReadyResources<'a>, transition: ReadyTransition<'a>) -> Self {
-        Self {
-            resources,
-            transition,
-        }
-    }
-
-    pub const fn frame(&self) -> PrepareReadyFrame {
-        self.resources.frame()
-    }
-
-    pub fn descriptors(&self) -> WorkerDescriptors<'_> {
-        self.resources.descriptors()
-    }
-
-    /// The callback must return success only after the complete frame and its
-    /// descriptors have been sent. Encoding or transport errors must propagate;
-    /// even a partial send cancels this preparation rather than enabling Start.
-    pub fn deliver<T, E>(
-        self,
-        send: impl FnOnce(PrepareReadyFrame, WorkerDescriptors<'_>) -> Result<T, E>,
-    ) -> Result<T, E> {
-        let Self {
-            resources,
-            transition,
-        } = self;
-        let result = send(resources.frame(), resources.descriptors())?;
-        transition.complete();
-        Ok(result)
-    }
-}
-
-// PTY/identity move out of the guardian for delivery. The pidfd stays borrowed
-// because the guardian still needs its own copy to observe the worker's exit.
-pub(super) struct ReadyResources<'a> {
-    frame: PrepareReadyFrame,
-    terminal: Option<Descriptor>,
-    identity: Descriptor,
-    pidfd: &'a Descriptor,
-}
-
-impl<'a> ReadyResources<'a> {
-    pub(super) fn new(
-        frame: PrepareReadyFrame,
-        terminal: Option<Descriptor>,
-        identity: Descriptor,
-        pidfd: &'a Descriptor,
-    ) -> Self {
-        Self {
-            frame,
-            terminal,
-            identity,
-            pidfd,
-        }
-    }
-
-    const fn frame(&self) -> PrepareReadyFrame {
-        self.frame
-    }
-
-    fn descriptors(&self) -> WorkerDescriptors<'_> {
-        let (fds, length) = match &self.terminal {
-            Some(terminal) => ([terminal.raw(), self.identity.raw(), self.pidfd.raw()], 3),
-            None => ([self.identity.raw(), self.pidfd.raw(), -1], 2),
-        };
-        WorkerDescriptors {
-            fds,
-            length,
-            owner: PhantomData,
-        }
-    }
-}
-
-/// A wire-order view that cannot outlive its Ready delivery owner.
-pub struct WorkerDescriptors<'a> {
-    fds: [i32; 3],
+pub(super) struct Payload {
+    bytes: Mapping,
+    offset: usize,
     length: usize,
-    owner: PhantomData<&'a Descriptor>,
 }
 
-impl WorkerDescriptors<'_> {
-    pub fn as_raw_fds(&self) -> &[i32] {
-        &self.fds[..self.length]
+impl Payload {
+    pub(super) fn encode(
+        capacity: usize,
+        encode: impl FnOnce(&mut [u8]) -> Result<(ControlFrameHeader, usize), GuardianError>,
+    ) -> Result<(ControlFrameHeader, Self), GuardianError> {
+        let mut bytes = Mapping::new(capacity).context("allocate guardian reply")?;
+        let (header, length) = encode(bytes.as_mut())?;
+        if length > capacity {
+            return Err(GuardianError::ReplyEncoding);
+        }
+        Ok((
+            header,
+            Self {
+                bytes,
+                offset: 0,
+                length,
+            },
+        ))
+    }
+
+    pub(super) fn ready(
+        frame: lasper_guest_protocol::PrepareReadyFrame,
+    ) -> Result<(ControlFrameHeader, Self), GuardianError> {
+        let mut bytes = Mapping::new(512).context("allocate Ready reply")?;
+        let length = frame
+            .encode_into(bytes.as_mut())
+            .map_err(GuardianError::PrepareFrame)?;
+        let header = ControlFrameHeader::decode(&bytes.as_ref()[..CONTROL_FRAME_HEADER_BYTES])
+            .map_err(|_| GuardianError::ReplyEncoding)?;
+        Ok((
+            header,
+            Self {
+                bytes,
+                offset: CONTROL_FRAME_HEADER_BYTES,
+                length: length - CONTROL_FRAME_HEADER_BYTES,
+            },
+        ))
+    }
+}
+
+impl AsRef<[u8]> for Payload {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes.as_ref()[self.offset..self.offset + self.length]
+    }
+}
+
+pub(super) struct PendingReply<'a> {
+    sender: FrameSender<'a, Payload>,
+    kind: ReplyKind,
+    deadline_ms: u64,
+}
+
+impl<'a> PendingReply<'a> {
+    pub(super) fn new(
+        connection: &'a GuestControlStream,
+        limits: EnforcedControlLimits,
+        kind: ReplyKind,
+        now_ms: u64,
+        frame: (ControlFrameHeader, Payload),
+        descriptors: &[i32],
+    ) -> Result<Self, GuardianError> {
+        limits.get().validate_header(frame.0).map_err(|error| {
+            GuardianError::Control(crate::transport::TransportError::Session(
+                lasper_guest_protocol::ControlSessionError::Limit(error),
+            ))
+        })?;
+        let sender = connection
+            .begin_send(frame.0, frame.1, descriptors)
+            .map_err(GuardianError::Control)?;
+        Ok(Self {
+            sender,
+            kind,
+            deadline_ms: now_ms.saturating_add(IO_TIMEOUT_MS),
+        })
+    }
+
+    pub(super) const fn deadline_ms(&self) -> u64 {
+        self.deadline_ms
+    }
+    pub(super) const fn kind(&self) -> ReplyKind {
+        self.kind
+    }
+
+    pub(super) fn advance(
+        &mut self,
+        now_ms: u64,
+        budget: &mut IoBudget,
+    ) -> Result<Poll<ReplyKind>, GuardianError> {
+        if now_ms >= self.deadline_ms {
+            return Err(GuardianError::ControlExpired);
+        }
+        self.sender
+            .advance_with_budget(budget)
+            .map(|progress| progress.map(|()| self.kind))
+            .map_err(GuardianError::Control)
     }
 }

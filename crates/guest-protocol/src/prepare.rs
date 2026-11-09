@@ -561,57 +561,8 @@ pub struct PrepareRequest<'a> {
     projections: ProjectionRequests,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-// The guest decoder keeps argv storage inline and does not allocate.
-#[allow(clippy::large_enum_variant)]
-enum WireGuestProcess<'a> {
-    LoginShell,
-    Command(#[serde(borrow)] WireCommandArgv<'a>),
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields, bound(deserialize = "'de: 'a"))]
-struct WirePrepareRequest<'a> {
-    user: String<MAX_GUEST_USER_NAME_BYTES>,
-    execution: ExecutionKind,
-    #[serde(borrow)]
-    process: WireGuestProcess<'a>,
-    terminal: Option<TerminalEnvironment>,
-    initial_size: Option<WireTerminalSize>,
-    #[serde(default)]
-    projections: ProjectionRequests,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WireTerminalSize {
-    cols: u16,
-    rows: u16,
-}
-
-impl<'a> WirePrepareRequest<'a> {
-    fn into_request(self) -> Result<PrepareRequest<'a>, PayloadCodecError> {
-        let process = match self.process {
-            WireGuestProcess::LoginShell => GuestProcess::LoginShell,
-            WireGuestProcess::Command(argv) => GuestProcess::Command(argv.0),
-        };
-        let initial_size = self
-            .initial_size
-            .map(|size| TerminalSize::new(size.cols, size.rows))
-            .transpose()?;
-        let request = PrepareRequest {
-            user: self.user,
-            execution: self.execution,
-            process,
-            terminal: self.terminal,
-            initial_size,
-            projections: self.projections,
-        };
-        request.validate()?;
-        Ok(request)
-    }
-}
+mod wire;
+use wire::WirePrepareRequest;
 
 impl<'a> PrepareRequest<'a> {
     pub const KIND: MessageKind = MessageKind::PrepareRequest;

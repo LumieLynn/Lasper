@@ -49,7 +49,14 @@ impl<'a, B: AsRef<[u8]>> FrameSender<'a, B> {
     /// Pending keeps the unsent tail and any not-yet-transferred FD copies.
     /// A successful first write transfers SCM_RIGHTS exactly once.
     pub fn advance(&mut self) -> Result<Poll<()>, TransportError> {
-        match self.write_frame() {
+        self.advance_with_budget(&mut IoBudget::new())
+    }
+
+    pub fn advance_with_budget(
+        &mut self,
+        budget: &mut IoBudget,
+    ) -> Result<Poll<()>, TransportError> {
+        match self.write_frame(budget) {
             Ok(result) => Ok(result),
             Err(error) => {
                 self.descriptors.take();
@@ -58,7 +65,7 @@ impl<'a, B: AsRef<[u8]>> FrameSender<'a, B> {
         }
     }
 
-    fn write_frame(&mut self) -> Result<Poll<()>, TransportError> {
+    fn write_frame(&mut self, budget: &mut IoBudget) -> Result<Poll<()>, TransportError> {
         self.operation.stream.ensure_usable()?;
         if self.operation.finished {
             return Ok(Poll::Ready(()));
@@ -68,7 +75,6 @@ impl<'a, B: AsRef<[u8]>> FrameSender<'a, B> {
             .validate_shape(payload.len(), self.header.descriptor_count() as usize)
             .map_err(TransportError::InvalidFrame)?;
         let total = self.encoded.len() + payload.len();
-        let mut budget = IoBudget::new();
         while self.offset < total && budget.available() {
             let head = &self.encoded[self.offset.min(self.encoded.len())..];
             let body = &payload[self.offset.saturating_sub(self.encoded.len())..];

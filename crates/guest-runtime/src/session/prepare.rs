@@ -65,6 +65,9 @@ impl AsMut<[u8]> for PrepareBuffer {
 pub struct PrepareStorage(PrepareBuffer);
 
 impl PrepareStorage {
+    pub(super) const fn header(&self) -> ControlFrameHeader {
+        self.0.header
+    }
     pub fn from_received(
         frame: GuestReceivedFrame<PrepareBuffer>,
     ) -> Result<Self, PrepareStorageError> {

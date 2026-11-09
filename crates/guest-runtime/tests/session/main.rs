@@ -1,4 +1,6 @@
 mod accounts;
+#[path = "../support/control.rs"]
+pub mod control_wire;
 mod fixture;
 #[path = "../support/guardian.rs"]
 pub mod guardian_fixture;
@@ -61,7 +63,24 @@ fn main() {
         let mut guardian = guardian_fixture::GuardianProcess::spawn(command).unwrap();
         guardian.release();
         guardian.hello();
+        let stream = guardian.control.try_clone().unwrap();
+        let relay = std::thread::spawn(move || {
+            use std::os::fd::AsRawFd;
+            while let Ok(frame) = control_wire::receive(stream.as_raw_fd()) {
+                assert_eq!(
+                    frame.header.kind(),
+                    lasper_guest_protocol::MessageKind::PrepareReady
+                );
+                let fds: Vec<_> = frame.descriptors.iter().map(AsRawFd::as_raw_fd).collect();
+                if control_wire::send(stream.as_raw_fd(), frame.header, &frame.payload, &fds)
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         let status = guardian.wait();
+        relay.join().unwrap();
         assert!(status.success(), "session scenario {name}: {status}");
         passed += 1;
     }

@@ -76,14 +76,17 @@ fn readiness() -> WorkerReadiness {
     let accepted = GuestWorkerReadiness::check()
         .unwrap()
         .accept_hello(
-            lasper_guest_protocol::PROTOCOL_MAJOR,
+            lasper_guest_protocol::ProtocolVersion::CURRENT,
             hello.request(),
             BrokerId::new([0x5a; 16]),
             ControlLimits::CURRENT,
         )
         .unwrap();
     hello
-        .negotiate(lasper_guest_protocol::PROTOCOL_MAJOR, accepted.response())
+        .negotiate(
+            lasper_guest_protocol::ProtocolVersion::CURRENT,
+            accepted.response(),
+        )
         .unwrap()
 }
 
@@ -102,7 +105,7 @@ fn helper_hello_rejects_limits_that_cannot_hold_session_results() {
         )
         .unwrap();
         assert!(matches!(
-            guest.accept_hello(lasper_guest_protocol::PROTOCOL_MAJOR, request, BrokerId::new([1; 16]), ControlLimits::new(guest_limit, 3).unwrap()),
+            guest.accept_hello(lasper_guest_protocol::ProtocolVersion::CURRENT, request, BrokerId::new([1; 16]), ControlLimits::new(guest_limit, 3).unwrap()),
             Err(GuestHelloError::FrameLimit { available }) if available == minimum - 1
         ));
     }
@@ -114,7 +117,7 @@ fn helper_hello_rejects_limits_that_cannot_hold_session_results() {
     )
     .unwrap();
     assert!(matches!(
-        host.negotiate(lasper_guest_protocol::PROTOCOL_MAJOR, response),
+        host.negotiate(lasper_guest_protocol::ProtocolVersion::CURRENT, response),
         Err(WorkerReadinessError::FrameLimit { .. })
     ));
 }
@@ -143,11 +146,11 @@ async fn prepare_ready_transfers_the_assigned_worker_for_both_execution_kinds() 
             let mut payload = [0; 256];
             let frame = receive_guest_frame(&guest, &mut payload).unwrap();
             let hello_request = HelloRequest::decode_payload(frame.payload()).unwrap();
-            let major = frame.header().protocol_major();
+            let version = frame.header().protocol_version();
             let accepted = GuestWorkerReadiness::check()
                 .unwrap()
                 .accept_hello(
-                    major,
+                    version,
                     hello_request,
                     ready.response().broker_id(),
                     ControlLimits::CURRENT,
@@ -193,7 +196,7 @@ async fn prepare_ready_transfers_the_assigned_worker_for_both_execution_kinds() 
         let response = host.receive_frame().await.unwrap();
         let readiness = hello
             .negotiate(
-                response.header().protocol_major(),
+                response.header().protocol_version(),
                 HelloResponse::decode_payload(response.payload()).unwrap(),
             )
             .unwrap();
@@ -457,7 +460,7 @@ fn hello_rejects_missing_worker_pidfd_before_any_prepare() {
         .required_features()
         .contains(FeatureSet::WORKER_PIDFD));
     let result = hello.negotiate(
-        lasper_guest_protocol::PROTOCOL_MAJOR,
+        lasper_guest_protocol::ProtocolVersion::CURRENT,
         HelloResponse::new(
             FeatureSet::EMPTY,
             BrokerId::new([0x5a; 16]),
@@ -490,7 +493,7 @@ async fn guest_rejects_legacy_host_during_hello_without_a_prepare_ready() {
             let frame = receive_guest_frame(&guest, &mut payload).unwrap();
             let request = HelloRequest::decode_payload(frame.payload()).unwrap();
             let result = GuestWorkerReadiness::check().unwrap().accept_hello(
-                frame.header().protocol_major(),
+                frame.header().protocol_version(),
                 request,
                 BrokerId::new([0x5a; 16]),
                 ControlLimits::CURRENT,
@@ -528,7 +531,7 @@ fn insufficient_descriptor_limit_is_rejected_before_sending_prepare() {
     let readiness = WorkerHello::new(ControlLimits::CURRENT)
         .unwrap()
         .negotiate(
-            lasper_guest_protocol::PROTOCOL_MAJOR,
+            lasper_guest_protocol::ProtocolVersion::CURRENT,
             HelloResponse::new(
                 FeatureSet::WORKER_PIDFD,
                 BrokerId::new([0x5a; 16]),

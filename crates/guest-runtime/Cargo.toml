@@ -12,6 +12,9 @@ runtime-bin = []
 lasper-guest-protocol = { path = "../guest-protocol" }
 lasper-local-accounts = { path = "../local-accounts" }
 
+[dev-dependencies]
+libc = "0.2"
+
 [lib]
 path = "src/lib.rs"
 
@@ -34,4 +37,9 @@ harness = false
 [[test]]
 name = "guardian"
 path = "tests/guardian/main.rs"
+harness = false
+
+[[test]]
+name = "control"
+path = "tests/control/main.rs"
 harness = false

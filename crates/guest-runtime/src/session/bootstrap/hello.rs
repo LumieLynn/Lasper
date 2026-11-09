@@ -17,6 +17,7 @@ use crate::transport::{GuestControlStream, TransportError};
 use super::supervisor::Supervisor;
 
 pub(super) struct CompletedHello {
+    pub(super) request_id: u64,
     pub(super) limits: EnforcedControlLimits,
     pub(super) completed_at_ms: u64,
 }
@@ -46,7 +47,7 @@ pub(super) fn exchange(
         let accepted = GuestWorkerReadiness::check()
             .map_err(GuardianError::Readiness)?
             .accept_hello(
-                frame.header().protocol_major(),
+                frame.header().protocol_version(),
                 request,
                 broker,
                 ControlLimits::CURRENT,
@@ -67,6 +68,7 @@ pub(super) fn exchange(
             .map_err(GuardianError::Control)?;
         hello.drive(POLLOUT, || writer.advance())?;
         CompletedHello {
+            request_id,
             limits: accepted.limits(),
             completed_at_ms: hello.check()?,
         }

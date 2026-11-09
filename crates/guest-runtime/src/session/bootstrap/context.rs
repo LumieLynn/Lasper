@@ -37,6 +37,16 @@ impl GuardianContext {
         }
     }
 
+    pub(in crate::session) const fn hello_request_id(&self) -> u64 {
+        self.hello.request_id
+    }
+
+    /// Owns this connection through Prepare, execution and descendant cleanup.
+    /// Returns only after all assigned children have been reaped.
+    pub fn run_session(self) -> Result<(), GuardianError> {
+        super::super::control::run(&self)
+    }
+
     pub const fn broker_id(&self) -> BrokerId {
         self.broker_id
     }
@@ -70,11 +80,11 @@ impl GuardianContext {
 
     pub fn spawn<'a>(
         &self,
-        request: PrepareRequestFrame<'a>,
+        request: &'a PrepareRequestFrame<'a>,
         preparation: PreparationId,
         now_ms: u64,
         entry: fn(WorkerBootstrap<'_>) -> !,
-    ) -> Result<SessionGuardian<'a>, GuardianError> {
+    ) -> Result<SessionGuardian<'a, '_>, GuardianError> {
         if self.session_created.get() {
             return Err(GuardianError::SessionAlreadyCreated);
         }
@@ -88,6 +98,15 @@ impl GuardianContext {
         self.session_created.set(true);
         // SAFETY: Only the non-returning fork entry can create this context.
         // It owns child creation/reaping and permits only one worker attempt.
-        unsafe { SessionGuardian::spawn(request, preparation, now_ms, entry) }
+        unsafe {
+            SessionGuardian::spawn(
+                &self.connection,
+                self.hello.limits,
+                request,
+                preparation,
+                now_ms,
+                entry,
+            )
+        }
     }
 }

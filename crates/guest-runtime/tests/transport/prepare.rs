@@ -1,6 +1,6 @@
 use lasper_guest_protocol::{
     BrokerId, ControlLimitError, ControlLimits, FeatureSet, HelloRequest, HelloResponse,
-    MessageKind, PrepareFrameError, PROTOCOL_MAJOR,
+    MessageKind, PrepareFrameError, ProtocolVersion,
 };
 use lasper_guest_runtime::session::{PrepareBuffer, PrepareStorage, PrepareStorageError};
 use std::io::Write;
@@ -12,7 +12,7 @@ fn limits(value: ControlLimits) -> lasper_guest_protocol::EnforcedControlLimits 
     HelloRequest::new(FeatureSet::EMPTY, value)
         .unwrap()
         .negotiate(
-            PROTOCOL_MAJOR,
+            ProtocolVersion::CURRENT,
             HelloResponse::new(FeatureSet::EMPTY, BrokerId::new([1; 16]), value).unwrap(),
         )
         .unwrap()

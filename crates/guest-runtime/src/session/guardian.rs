@@ -1,12 +1,14 @@
+use crate::transport::{GuestControlStream, IoBudget};
+use core::task::Poll;
 use lasper_guest_protocol::{
-    PreparationControl, PreparationControlFrame, PreparationId, PrepareRequestFrame,
-    StartAcceptedFrame, StartFrame, MAX_PREPARED_LEASE_MS,
+    EnforcedControlLimits, PreparationControl, PreparationControlFrame, PreparationId,
+    PrepareReadyFrame, PrepareRequestFrame, StartAcceptedFrame, StartFrame, MAX_PREPARED_LEASE_MS,
 };
 
 use super::process::GuardianWorker;
 use super::{
     CleanupProgress, CleanupReason, ExecOutcome, GuardianError, SessionAction, SessionConnection,
-    SessionLifecycle, SessionPhase, StartDecision, WorkerBootstrap, WorkerObservation, WorkerReady,
+    SessionLifecycle, SessionPhase, StartDecision, WorkerBootstrap, WorkerObservation,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -19,14 +21,22 @@ pub struct GuardianObservation {
 /// Owns the protocol decision and the assigned child through cleanup. All
 /// events are applied by one guardian loop; callers do not synchronize a second
 /// process registry with the preparation state.
-pub struct SessionGuardian<'a> {
+pub struct SessionGuardian<'a, 'control> {
     session: SessionLifecycle,
     worker: GuardianWorker<'a>,
+    connection: &'control GuestControlStream,
+    limits: EnforcedControlLimits,
+    pending: Option<super::ready::PendingReply<'control>>,
+    ready_frame: Option<PrepareReadyFrame>,
+    completed_ready: Option<PrepareReadyFrame>,
+    execution_deadline_ms: Option<u64>,
 }
 
-impl<'a> SessionGuardian<'a> {
+impl<'a, 'control> SessionGuardian<'a, 'control> {
     pub(super) unsafe fn spawn(
-        request: PrepareRequestFrame<'a>,
+        connection: &'control GuestControlStream,
+        limits: EnforcedControlLimits,
+        request: &'a PrepareRequestFrame<'a>,
         preparation: PreparationId,
         now_ms: u64,
         entry: fn(WorkerBootstrap<'_>) -> !,
@@ -43,6 +53,12 @@ impl<'a> SessionGuardian<'a> {
         Ok(Self {
             session: lifecycle,
             worker,
+            connection,
+            limits,
+            pending: None,
+            ready_frame: None,
+            completed_ready: None,
+            execution_deadline_ms: None,
         })
     }
 
@@ -54,29 +70,59 @@ impl<'a> SessionGuardian<'a> {
         self.session.phase()
     }
 
-    /// Used alongside `poll_descriptors` to wait without periodic busy polling.
-    /// Running sessions have no preparation timer; cleanup has its own retries.
-    pub const fn next_deadline_ms(&self) -> Option<u64> {
-        match self.phase() {
+    pub fn next_deadline_ms(&self) -> Option<u64> {
+        let lifecycle = match self.phase() {
             SessionPhase::Preparing
             | SessionPhase::Prepared
             | SessionPhase::DeliveringReady
             | SessionPhase::AwaitingStart => Some(self.session.deadline_ms()),
+            SessionPhase::Starting | SessionPhase::Running => self.execution_deadline_ms,
             SessionPhase::Closing | SessionPhase::CleanupPending => {
                 self.worker.cleanup_deadline_ms()
             }
-            _ => None,
-        }
+            SessionPhase::Closed => None,
+        };
+        [
+            lifecycle,
+            self.pending.as_ref().map(|reply| reply.deadline_ms()),
+        ]
+        .into_iter()
+        .flatten()
+        .min()
+    }
+
+    pub(super) fn accepts_commands(&self) -> bool {
+        matches!(
+            self.phase(),
+            SessionPhase::AwaitingStart | SessionPhase::Starting | SessionPhase::Running
+        )
+    }
+    pub(super) fn remaining_lease_ms(&self, now_ms: u64) -> u32 {
+        self.session
+            .deadline_ms()
+            .saturating_sub(now_ms)
+            .min(u32::MAX as u64) as u32
+    }
+    pub(super) const fn completed_ready(&self) -> Option<PrepareReadyFrame> {
+        self.completed_ready
+    }
+    pub(super) fn has_reply(&self) -> bool {
+        self.pending.is_some()
     }
 
     /// The event loop supplies its monotonic clock. It must continue polling
     /// CleanupPending sessions; a timeout or closed client does not reap a child.
     pub fn poll(&mut self, now_ms: u64) -> Result<GuardianObservation, GuardianError> {
+        if matches!(self.phase(), SessionPhase::Starting | SessionPhase::Running)
+            && self
+                .execution_deadline_ms
+                .is_some_and(|deadline| now_ms >= deadline)
+        {
+            self.fail(now_ms, CleanupReason::ExecutionTimedOut);
+        }
         if let Some(action) = self.session.tick(now_ms) {
             self.perform(action, now_ms);
         }
-        // Ready can be dropped outside poll. Apply its cleanup decision before
-        // observing worker exit, retaining the original reason in the lifecycle.
         if self.session.cleanup_reason().is_some() && self.phase() != SessionPhase::Closed {
             self.worker.begin_cleanup(now_ms);
         }
@@ -125,28 +171,141 @@ impl<'a> SessionGuardian<'a> {
         })
     }
 
-    /// Polls worker setup and expiry before taking the one Ready delivery.
-    /// Call `deliver` on the returned owner to send it. Start is disabled until
-    /// that delivery succeeds; dropping it requests cleanup on the next poll.
-    pub fn take_ready(&mut self, now_ms: u64) -> Result<WorkerReady<'_>, GuardianError> {
+    /// Incrementally sends Ready on this session's connection. Pending keeps
+    /// the FD copies and byte offset here, leaving poll free to drive cleanup.
+    pub fn deliver_ready(
+        &mut self,
+        now_ms: u64,
+        budget: &mut IoBudget,
+    ) -> Result<Poll<PrepareReadyFrame>, GuardianError> {
         self.poll(now_ms)?;
         if self.phase() == SessionPhase::AwaitingStart {
             return Err(GuardianError::ReadyAlreadyTaken);
         }
-        if self.phase() != SessionPhase::Prepared {
+        if self.phase() == SessionPhase::Prepared {
+            self.queue_ready(now_ms)?;
+        }
+        if self.phase() != SessionPhase::DeliveringReady {
             return Err(GuardianError::NotPrepared);
         }
-        let remaining = self
-            .session
-            .deadline_ms()
-            .saturating_sub(now_ms)
-            .min(u32::MAX as u64) as u32;
-        let transition = self
-            .session
+        match self.flush(now_ms, budget)? {
+            Poll::Ready(super::ready::ReplyKind::Ready) => Ok(Poll::Ready(
+                self.ready_frame.ok_or(GuardianError::NotPrepared)?,
+            )),
+            _ => Ok(Poll::Pending),
+        }
+    }
+
+    pub(super) fn queue_ready(&mut self, now_ms: u64) -> Result<(), GuardianError> {
+        if self.pending.is_some() {
+            return Err(GuardianError::ReplyPending);
+        }
+        self.session
             .begin_ready_delivery()
             .map_err(GuardianError::Lifecycle)?;
-        let resources = self.worker.take_ready(remaining)?;
-        Ok(WorkerReady::new(resources, transition))
+        let remaining = self.remaining_lease_ms(now_ms);
+        let result = self.worker.ready(remaining, |frame, descriptors| {
+            let frame = super::ready::Payload::ready(frame)?;
+            self.pending = Some(super::ready::PendingReply::new(
+                self.connection,
+                self.limits,
+                super::ready::ReplyKind::Ready,
+                now_ms,
+                frame,
+                descriptors,
+            )?);
+            Ok(())
+        });
+        match result {
+            Ok(frame) => {
+                self.ready_frame = Some(frame);
+                Ok(())
+            }
+            Err(error) => {
+                self.fail(now_ms, CleanupReason::ReadyDeliveryFailed);
+                Err(error)
+            }
+        }
+    }
+
+    pub(super) fn queue_reply(
+        &mut self,
+        kind: super::ready::ReplyKind,
+        now_ms: u64,
+        frame: (
+            lasper_guest_protocol::ControlFrameHeader,
+            super::ready::Payload,
+        ),
+    ) -> Result<(), GuardianError> {
+        if self.pending.is_some() {
+            return Err(GuardianError::ReplyPending);
+        }
+        self.pending = Some(super::ready::PendingReply::new(
+            self.connection,
+            self.limits,
+            kind,
+            now_ms,
+            frame,
+            &[],
+        )?);
+        Ok(())
+    }
+
+    pub(super) fn flush(
+        &mut self,
+        now_ms: u64,
+        budget: &mut IoBudget,
+    ) -> Result<Poll<super::ready::ReplyKind>, GuardianError> {
+        let Some(reply) = self.pending.as_mut() else {
+            return Ok(Poll::Pending);
+        };
+        match reply.advance(now_ms, budget) {
+            Ok(Poll::Ready(kind)) => {
+                self.pending.take();
+                if kind == super::ready::ReplyKind::Ready {
+                    self.session
+                        .ready_delivered()
+                        .map_err(GuardianError::Lifecycle)?;
+                    self.completed_ready = self.ready_frame;
+                }
+                Ok(Poll::Ready(kind))
+            }
+            Ok(Poll::Pending) => Ok(Poll::Pending),
+            Err(error) => {
+                let kind = reply.kind();
+                self.pending.take();
+                self.fail(
+                    now_ms,
+                    if kind == super::ready::ReplyKind::Ready {
+                        CleanupReason::ReadyDeliveryFailed
+                    } else {
+                        CleanupReason::ClientClosed
+                    },
+                );
+                Err(error)
+            }
+        }
+    }
+
+    pub(super) fn fail(&mut self, now_ms: u64, reason: CleanupReason) {
+        let action = self.session.fail(reason);
+        self.perform(action, now_ms);
+    }
+
+    pub(super) fn close_output(&mut self) {
+        self.worker.close_output();
+    }
+
+    pub(super) fn force_cleanup(&mut self, reason: CleanupReason) {
+        self.session.fail(reason);
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|reply| reply.kind() == super::ready::ReplyKind::Ready)
+        {
+            self.pending.take();
+        }
+        self.worker.force_cleanup();
     }
 
     /// Handles control EOF or the broker-liveness pipe closing. The event loop
@@ -154,6 +313,9 @@ impl<'a> SessionGuardian<'a> {
     pub fn connection_closed(&mut self, now_ms: u64, connection: SessionConnection) {
         let action = self.session.connection_closed(connection);
         self.perform(action, now_ms);
+        if connection == SessionConnection::Client {
+            self.pending.take();
+        }
     }
 
     /// Acknowledges the one Start accepted for this assignment. This says
@@ -189,6 +351,9 @@ impl<'a> SessionGuardian<'a> {
             self.perform(action, now_ms);
             return Err(error);
         }
+        if self.worker.bounded() {
+            self.execution_deadline_ms = Some(now_ms.saturating_add(60_000));
+        }
         Ok(StartAcceptedFrame::new(request_id, token))
     }
 
@@ -220,6 +385,12 @@ impl<'a> SessionGuardian<'a> {
 
     fn perform(&mut self, action: SessionAction, now_ms: u64) {
         if let SessionAction::BeginCleanup(_) = action {
+            if matches!(
+                self.pending.as_ref().map(|reply| reply.kind()),
+                Some(super::ready::ReplyKind::Ready)
+            ) {
+                self.pending.take();
+            }
             self.worker.begin_cleanup(now_ms);
         }
     }

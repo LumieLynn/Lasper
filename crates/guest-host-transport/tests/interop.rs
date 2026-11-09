@@ -3,7 +3,7 @@ mod support;
 use lasper_guest_host_transport::UnixControlStream;
 use lasper_guest_protocol::{
     BrokerId, ControlFrameHeader, ControlLimits, FeatureSet, HelloRequest, HelloResponse,
-    MessageKind, CONTROL_FRAME_HEADER_BYTES,
+    MessageKind, ProtocolVersion, CONTROL_FRAME_HEADER_BYTES,
 };
 use lasper_guest_runtime::transport::GuestControlStream;
 use std::fs::File;
@@ -122,6 +122,36 @@ fn assert_peer_observes_close(mut peer: StdUnixStream) {
 }
 
 #[tokio::test]
+async fn host_rejects_minor_mismatch_before_reading_hello_or_established_payload() {
+    for established_session in [false, true] {
+        let (mut host, mut peer) = raw_stream_pair();
+        if established_session {
+            peer.write_all(&header(MessageKind::HelloResponse, &[], 0).encode())
+                .unwrap();
+            establish_host(&mut host).await;
+        } else {
+            host.send_frame(header(MessageKind::HelloRequest, &[], 0), &[], &[])
+                .await
+                .unwrap();
+        }
+        let kind = if established_session {
+            MessageKind::Exit
+        } else {
+            MessageKind::HelloResponse
+        };
+        let mut bytes = header(kind, b"not sent", 0).encode();
+        bytes[14..16].copy_from_slice(&(ProtocolVersion::CURRENT.minor + 1).to_le_bytes());
+        peer.write_all(&bytes).unwrap();
+        let error = tokio::time::timeout(std::time::Duration::from_secs(1), host.receive_frame())
+            .await
+            .expect("host waited for payload after an incompatible header")
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(!host.can_continue());
+    }
+}
+
+#[tokio::test]
 async fn host_and_guest_round_trip_frames_without_descriptors() {
     let (mut host, guest) = raw_stream_pair();
     let request_payload = b"prepare";
@@ -186,7 +216,7 @@ async fn host_and_guest_transports_exchange_typed_hello_payloads() {
         let mut response_payload = [0; 256];
         let response_len = response.encode_payload(&mut response_payload).unwrap();
         let negotiated = request
-            .negotiate(lasper_guest_protocol::PROTOCOL_MAJOR, response)
+            .negotiate(lasper_guest_protocol::ProtocolVersion::CURRENT, response)
             .unwrap();
         send_guest_frame(
             &guest,
@@ -214,9 +244,9 @@ async fn host_and_guest_transports_exchange_typed_hello_payloads() {
     let response = host.receive_frame().await.unwrap();
     assert_eq!(response.header().kind(), HelloResponse::KIND);
     assert!(response.descriptors().is_empty());
-    let peer_protocol_major = response.header().protocol_major();
+    let peer_protocol_version = response.header().protocol_version();
     let response = HelloResponse::decode_payload(response.payload()).unwrap();
-    let negotiated = request.negotiate(peer_protocol_major, response).unwrap();
+    let negotiated = request.negotiate(peer_protocol_version, response).unwrap();
     host.complete_hello(negotiated).unwrap();
     host.send_frame(
         header(MessageKind::PrepareRequest, b"prepare", 0),
@@ -295,7 +325,7 @@ async fn hello_frames_use_the_fixed_bootstrap_envelope() {
     assert_eq!(received.payload(), &response_payload[..response_len]);
     let response = HelloResponse::decode_payload(received.payload()).unwrap();
     let negotiated = request
-        .negotiate(received.header().protocol_major(), response)
+        .negotiate(received.header().protocol_version(), response)
         .unwrap();
     host.complete_hello(negotiated).unwrap();
 

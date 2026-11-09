@@ -281,3 +281,7 @@ fn fail(status: &Descriptor, failure: WorkerFailure) -> ! {
     let _ = StatusMessage::Failed(failure).send(status);
     linux::exit(126)
 }
+
+#[cfg(test)]
+#[path = "../../tests/support/clock_worker.rs"]
+pub(super) mod clock_fixture;

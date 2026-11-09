@@ -26,7 +26,7 @@ pub fn current_limits() -> EnforcedControlLimits {
     HelloRequest::new(FeatureSet::EMPTY, ControlLimits::CURRENT)
         .unwrap()
         .negotiate(
-            lasper_guest_protocol::PROTOCOL_MAJOR,
+            lasper_guest_protocol::ProtocolVersion::CURRENT,
             HelloResponse::new(
                 FeatureSet::EMPTY,
                 BrokerId::new([0x5a; 16]),

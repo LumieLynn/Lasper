@@ -97,7 +97,7 @@ pub(super) fn child(context: &mut GuardianContext, name: &str) {
         );
         assert_eq!(
             context
-                .spawn(wrong_broker, PreparationId::new([2; 16]), 0, exit_worker)
+                .spawn(&wrong_broker, PreparationId::new([2; 16]), 0, exit_worker)
                 .err(),
             Some(GuardianError::MismatchedBroker {
                 expected: context.broker_id(),
@@ -105,18 +105,18 @@ pub(super) fn child(context: &mut GuardianContext, name: &str) {
             })
         );
         let worker = context
-            .spawn(request.clone(), PreparationId::new([2; 16]), 0, exit_worker)
+            .spawn(&request, PreparationId::new([2; 16]), 0, exit_worker)
             .unwrap();
         assert_eq!(
             context
-                .spawn(request.clone(), PreparationId::new([3; 16]), 0, exit_worker)
+                .spawn(&request, PreparationId::new([3; 16]), 0, exit_worker)
                 .err(),
             Some(GuardianError::SessionAlreadyCreated)
         );
         drop(worker);
         assert_eq!(
             context
-                .spawn(request, PreparationId::new([4; 16]), 0, exit_worker)
+                .spawn(&request, PreparationId::new([4; 16]), 0, exit_worker)
                 .err(),
             Some(GuardianError::SessionAlreadyCreated)
         );
