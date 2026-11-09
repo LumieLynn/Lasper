@@ -71,6 +71,64 @@ fn identity_pair() -> (OwnedFd, OwnedFd) {
     unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) }
 }
 
+fn run_isolated(test: &str) -> bool {
+    const CHILD: &str = "LASPER_PREPARATION_TEST_CHILD";
+    if std::env::var_os(CHILD).as_deref() == Some(std::ffi::OsStr::new(test)) {
+        return false;
+    }
+    // Create the tested endpoints only after exec, with this one test selected.
+    // Other tests can still fork in parallel, but cannot inherit those endpoints.
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            test,
+            "--nocapture",
+            "--test-threads=1",
+            "--format=pretty",
+            "--color=never",
+        ])
+        .env(CHILD, test)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    // libtest also exits successfully when the filter matches nothing or the
+    // selected test is ignored. Require one executed test, not just exit zero.
+    let passed = stdout
+        .lines()
+        .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;"));
+    assert!(
+        output.status.success() && passed,
+        "isolated preparation test {test}: expected exactly one passed test, got {}\n{stdout}\n{stderr}",
+        output.status
+    );
+    true
+}
+
+fn assert_identity_peer_closed(peer: &OwnedFd) {
+    loop {
+        let mut byte = 0u8;
+        // SAFETY: The peer remains owned, and recv writes only to this byte.
+        let received = unsafe {
+            libc::recv(
+                peer.as_raw_fd(),
+                (&mut byte as *mut u8).cast(),
+                1,
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if received < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            panic!("identity peer receive: {error}");
+        }
+        assert_eq!(received, 0, "received identity endpoint was not closed");
+        break;
+    }
+}
+
 fn readiness() -> WorkerReadiness {
     let hello = WorkerHello::new(ControlLimits::CURRENT).unwrap();
     let accepted = GuestWorkerReadiness::check()
@@ -237,6 +295,9 @@ async fn prepare_ready_transfers_the_assigned_worker_for_both_execution_kinds() 
 
 #[tokio::test]
 async fn invalid_preparation_resources_close_the_received_identity_endpoint() {
+    if run_isolated("invalid_preparation_resources_close_the_received_identity_endpoint") {
+        return;
+    }
     for failure in [
         "request",
         "broker",
@@ -322,29 +383,7 @@ async fn invalid_preparation_resources_close_the_received_identity_endpoint() {
             Err(error) => error,
         };
         assert!(!error.to_string().is_empty(), "{failure}");
-        let mut poll = libc::pollfd {
-            fd: identity_guest.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // Forked fixtures close inherited copies before entering their loop.
-        // Wait for that scheduling window, but still fail if a copy leaks.
-        assert_eq!(unsafe { libc::poll(&mut poll, 1, 2000) }, 1, "{failure}");
-        let mut byte = 0u8;
-        // SAFETY: The test owns the peer. MSG_DONTWAIT avoids hanging if an
-        // error path accidentally retains a received identity descriptor.
-        assert_eq!(
-            unsafe {
-                libc::recv(
-                    identity_guest.as_raw_fd(),
-                    (&mut byte as *mut u8).cast(),
-                    1,
-                    libc::MSG_DONTWAIT,
-                )
-            },
-            0,
-            "{failure}"
-        );
+        assert_identity_peer_closed(&identity_guest);
     }
 }
 
@@ -686,6 +725,9 @@ async fn target_exit_while_waiting_for_identity_rejects_the_otherwise_valid_repl
 
 #[tokio::test]
 async fn exited_target_rejects_ready_and_closes_received_resources() {
+    if run_isolated("exited_target_rejects_ready_and_closes_received_resources") {
+        return;
+    }
     let readiness = readiness();
     let request = preparation_request(ExecutionKind::Bounded);
     let ready = request
@@ -710,17 +752,5 @@ async fn exited_target_rejects_ready_and_closes_received_resources() {
         Err(error) => error,
     };
     assert_eq!(error.kind(), io::ErrorKind::NotFound);
-    let mut byte = 0u8;
-    // SAFETY: The peer remains owned, and recv writes only to this byte.
-    assert_eq!(
-        unsafe {
-            libc::recv(
-                peer.as_raw_fd(),
-                (&mut byte as *mut u8).cast(),
-                1,
-                libc::MSG_DONTWAIT,
-            )
-        },
-        0
-    );
+    assert_identity_peer_closed(&peer);
 }

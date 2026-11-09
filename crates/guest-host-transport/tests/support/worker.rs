@@ -11,6 +11,7 @@ pub struct TestWorker {
     pub pidfd: OwnedFd,
     pub terminal: Option<OwnedFd>,
     pub identity: Option<OwnedFd>,
+    lifetime: UnixStream,
 }
 
 impl TestWorker {
@@ -71,7 +72,7 @@ impl TestWorker {
         } else {
             (None, None)
         };
-        let (mut parent, child) = UnixStream::pair().unwrap();
+        let (parent, child) = UnixStream::pair().unwrap();
         let mut retained = [
             guest.as_raw_fd(),
             child.as_raw_fd(),
@@ -118,7 +119,6 @@ impl TestWorker {
                 if libc::write(child.as_raw_fd(), [1u8].as_ptr().cast(), 1) != 1 {
                     libc::_exit(4);
                 }
-                libc::close(child.as_raw_fd());
             }
             let mut channel =
                 unsafe { GuestIdentityChannel::from_raw_fd(guest.into_raw_fd(), preparation) };
@@ -150,6 +150,22 @@ impl TestWorker {
                 }
                 observations += 1;
             }
+            // A rejected observation shuts down the identity channel. Keep
+            // the fixture alive until its owner ends it, so tests can still
+            // distinguish a resource mismatch from an exited worker.
+            let mut byte = 0u8;
+            loop {
+                // SAFETY: The retained endpoint writes at most this one byte.
+                let result =
+                    unsafe { libc::read(child.as_raw_fd(), (&mut byte as *mut u8).cast(), 1) };
+                if result == 0 {
+                    break;
+                }
+                if result < 0 && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                unsafe { libc::_exit(9) };
+            }
             unsafe { libc::_exit(0) };
         }
         drop(child);
@@ -159,16 +175,18 @@ impl TestWorker {
         // the pidfd is opened, matching the guardian's required reap ordering.
         let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
         assert!(fd >= 0, "{}", io::Error::last_os_error());
-        let worker = Self {
+        let mut worker = Self {
             pid,
             pidfd: unsafe { OwnedFd::from_raw_fd(fd as i32) },
             terminal: master,
             identity: Some(host),
+            lifetime: parent,
         };
-        parent
+        worker
+            .lifetime
             .set_read_timeout(Some(std::time::Duration::from_secs(2)))
             .unwrap();
-        parent.read_exact(&mut [0; 1]).unwrap();
+        worker.lifetime.read_exact(&mut [0; 1]).unwrap();
         worker
     }
 }
