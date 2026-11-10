@@ -6,8 +6,10 @@ compile_error!("the Lasper guest runtime is Linux-only");
 
 use lasper_guest_protocol::{Architecture, RuntimeIdentity};
 
+pub mod broker;
 pub mod identity;
 mod linux;
+pub use linux::signals::SupervisorSignal;
 mod memory;
 pub mod readiness;
 pub mod session;

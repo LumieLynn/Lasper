@@ -19,6 +19,8 @@ build-guest-runtime-x86-64 = [
     "-C", "relocation-model=pic",
     "-C", "link-arg=-pie",
     "-C", "link-arg=--no-dynamic-linker",
+    "-C", "link-arg=-zmax-page-size=4096",
+    "-C", "link-arg=-zcommon-page-size=4096",
 ]
 build-guest-runtime-aarch64 = [
     "rustc",
@@ -35,4 +37,7 @@ build-guest-runtime-aarch64 = [
     "-C", "relocation-model=pic",
     "-C", "link-arg=-pie",
     "-C", "link-arg=--no-dynamic-linker",
+    # RELRO must also cover hosts using 16 or 64 KiB pages.
+    "-C", "link-arg=-zmax-page-size=65536",
+    "-C", "link-arg=-zcommon-page-size=65536",
 ]

@@ -5,7 +5,7 @@ use crate::linux::uapi::{
     file::{AT_FDCWD, O_CLOEXEC, O_NOCTTY, O_NONBLOCK, O_PATH, S_IFMT, S_IFREG, X_OK},
     nr,
 };
-use crate::session::linux::{result_or_errno, Descriptor};
+use crate::linux::{result_or_errno, Descriptor};
 use crate::syscall::{syscall1, syscall3};
 
 use super::MAX_ACCOUNT_FILE_BYTES;
@@ -49,7 +49,7 @@ fn open_regular(path: &CStr, flags: usize) -> Result<Descriptor, i32> {
             0,
         )
     })?;
-    let stat = crate::session::linux::filesystem::stat_fd(&file)?;
+    let stat = crate::linux::filesystem::stat_fd(&file)?;
     if stat.mode & S_IFMT != S_IFREG {
         return Err(EACCES);
     }

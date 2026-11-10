@@ -8,9 +8,9 @@ use crate::linux::uapi::{
     errno::EINTR,
     poll::{POLLIN, POLLOUT},
 };
+use crate::linux::{self, PollFd};
 use crate::readiness::GuestWorkerReadiness;
 use crate::session::error::SystemResultExt;
-use crate::session::linux::{self, PollFd};
 use crate::session::GuardianError;
 use crate::transport::{GuestControlStream, TransportError};
 

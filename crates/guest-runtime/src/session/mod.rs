@@ -6,7 +6,6 @@ mod error;
 mod execution;
 mod guardian;
 mod lifecycle;
-mod linux;
 mod memory;
 mod prepare;
 mod process;
@@ -15,9 +14,7 @@ mod ready;
 mod status;
 mod worker;
 
-pub use bootstrap::{
-    GuardianBootstrap, GuardianContext, GuardianSignal, SupervisorStatus, GUARDIAN_START_BYTE,
-};
+pub use bootstrap::{GuardianBootstrap, GuardianContext, SupervisorStatus, GUARDIAN_START_BYTE};
 pub use children::CleanupProgress;
 pub use error::GuardianError;
 pub use guardian::{GuardianObservation, SessionGuardian};
@@ -31,8 +28,4 @@ pub use process::WorkerObservation;
 pub use status::{WorkerFailure, WorkerStage};
 pub use worker::WorkerBootstrap;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum WorkerExit {
-    Exited(i32),
-    Signaled(i32),
-}
+pub use crate::linux::ProcessExit as WorkerExit;

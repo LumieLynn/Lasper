@@ -5,10 +5,11 @@ use lasper_guest_protocol::{
     StartRequest,
 };
 
-use super::children::{visit_direct_children, Children, CleanupProgress};
+use super::children::{Children, CleanupProgress};
 use super::error::SystemResultExt;
 use super::lifecycle::ExecOutcome;
-use super::linux::{self, Descriptor, Pipe, Terminal};
+use crate::linux::children::visit_direct_children;
+use crate::linux::{self, Descriptor, Pipe, Terminal};
 
 use super::status::{WorkerFailure, WorkerStage, WorkerStatus};
 use super::worker::{encode_start, WorkerBootstrap, WorkerChannels, START_BYTES};

@@ -23,7 +23,7 @@ impl ForkedGuardian {
     pub fn spawn(entry: fn(GuardianContext) -> i32) -> Self {
         let (control, child_control) = UnixStream::pair().unwrap();
         let (child_broker, broker) = std::io::pipe().unwrap();
-        let accepted_at = crate::session::linux::monotonic_ms().unwrap();
+        let accepted_at = crate::linux::monotonic_ms().unwrap();
         // The child never returns to the multithreaded test harness. Its entry
         // uses only fork-safe runtime code and never drops inherited Rust owners.
         let pid = unsafe { libc::fork() };

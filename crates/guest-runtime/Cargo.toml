@@ -43,3 +43,13 @@ harness = false
 name = "control"
 path = "tests/control/main.rs"
 harness = false
+
+[[test]]
+name = "broker"
+path = "tests/broker/main.rs"
+harness = false
+
+[[test]]
+name = "entry"
+path = "tests/entry/main.rs"
+harness = false

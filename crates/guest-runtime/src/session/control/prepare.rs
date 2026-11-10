@@ -5,7 +5,6 @@ use lasper_guest_protocol::{
 
 use super::super::error::SystemResultExt;
 use super::super::lifecycle::WORKER_SETUP_TIMEOUT_MS;
-use super::super::linux::{self, PollFd};
 use super::super::ready::IO_TIMEOUT_MS;
 use super::super::{
     GuardianContext, GuardianError, PrepareBuffer, PrepareStorage, PrepareStorageError,
@@ -18,6 +17,7 @@ use crate::linux::uapi::{
     poll::{POLLIN, POLLOUT},
     random::GRND_NONBLOCK,
 };
+use crate::linux::{self, PollFd};
 use crate::syscall::syscall3;
 use crate::transport::TransportError;
 

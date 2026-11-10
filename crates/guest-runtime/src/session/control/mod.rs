@@ -6,8 +6,8 @@ mod prepare;
 mod report;
 
 use super::error::SystemResultExt;
-use super::linux;
 use super::{GuardianContext, GuardianError, WorkerBootstrap};
+use crate::linux;
 
 pub(super) fn run(context: &GuardianContext) -> Result<(), GuardianError> {
     run_with_worker(context, super::projection::entry)

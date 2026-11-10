@@ -1,6 +1,5 @@
 mod context;
 mod hello;
-mod signals;
 mod supervisor;
 
 use core::fmt::Write;
@@ -10,12 +9,12 @@ use crate::linux::uapi::errno::{EAGAIN, EINTR};
 use crate::transport::GuestControlStream;
 
 use super::error::SystemResultExt;
-use super::linux::{self, Descriptor, PollFd};
 use super::GuardianError;
-use signals::{BlockedSignals, Signals};
+use crate::linux::signals::{BlockedSignals, Signals};
+use crate::linux::{self, Descriptor, PollFd};
 
+use crate::SupervisorSignal;
 pub use context::GuardianContext;
-pub use signals::GuardianSignal;
 use supervisor::Supervisor;
 pub use supervisor::SupervisorStatus;
 
@@ -132,7 +131,7 @@ fn wait_for_start(
         if now >= deadline_ms {
             return Err(GuardianError::StartupExpired);
         }
-        if let Some(GuardianSignal::Stop(signal)) =
+        if let Some(SupervisorSignal::Stop(signal)) =
             signals.receive().context("read guardian startup signal")?
         {
             return Err(GuardianError::SupervisorStopped(signal));

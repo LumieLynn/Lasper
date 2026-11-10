@@ -4,17 +4,35 @@ use core::mem::{align_of, offset_of, size_of};
 use super::{result_or_errno, Descriptor};
 use crate::linux::uapi::{
     errno::EIO,
-    file::{AT_EMPTY_PATH, AT_FDCWD, STATX_INO, STATX_TYPE},
+    file::{AT_EMPTY_PATH, AT_FDCWD, STATX_INO, STATX_MODE, STATX_NLINK, STATX_TYPE, STATX_UID},
     nr,
 };
 use crate::syscall::syscall5;
 
-pub(in crate::session) fn stat_fd(file: &Descriptor) -> Result<Statx, i32> {
+pub(crate) fn stat_fd(file: &Descriptor) -> Result<Statx, i32> {
     stat(file.raw() as usize, c"", AT_EMPTY_PATH, STATX_TYPE)
 }
 
-pub(in crate::session) fn stat_path(path: &CStr) -> Result<Statx, i32> {
+pub(crate) fn ownership(file: &Descriptor) -> Result<Statx, i32> {
+    stat(
+        file.raw() as usize,
+        c"",
+        AT_EMPTY_PATH,
+        STATX_TYPE | STATX_MODE | STATX_UID | STATX_NLINK | STATX_INO,
+    )
+}
+
+pub(crate) fn stat_path(path: &CStr) -> Result<Statx, i32> {
     stat(AT_FDCWD, path, 0, STATX_TYPE | STATX_INO)
+}
+
+pub(crate) fn stat_at(directory: &Descriptor, path: &CStr) -> Result<Statx, i32> {
+    stat(
+        directory.raw() as usize,
+        path,
+        crate::linux::uapi::file::AT_SYMLINK_NOFOLLOW,
+        STATX_TYPE | STATX_INO,
+    )
 }
 
 fn stat(fd: usize, path: &CStr, flags: usize, mask: usize) -> Result<Statx, i32> {
@@ -39,16 +57,16 @@ fn stat(fd: usize, path: &CStr, flags: usize, mask: usize) -> Result<Statx, i32>
 
 #[repr(C)]
 #[derive(Default)]
-pub(in crate::session) struct Statx {
+pub(crate) struct Statx {
     mask: u32,
     block_size: u32,
     attributes: u64,
-    links: u32,
-    uid: u32,
+    pub(crate) links: u32,
+    pub(crate) uid: u32,
     gid: u32,
-    pub(in crate::session) mode: u16,
+    pub(crate) mode: u16,
     reserved: u16,
-    pub(in crate::session) inode: u64,
+    pub(crate) inode: u64,
     size: u64,
     blocks: u64,
     attributes_mask: u64,
@@ -61,7 +79,7 @@ pub(in crate::session) struct Statx {
 }
 
 impl Statx {
-    pub(in crate::session) const fn device(&self) -> u64 {
+    pub(crate) const fn device(&self) -> u64 {
         let major = self.device_major as u64;
         let minor = self.device_minor as u64;
         ((major & 0xfff) << 8) | ((major & !0xfff) << 32) | (minor & 0xff) | ((minor & !0xff) << 12)

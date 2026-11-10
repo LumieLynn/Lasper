@@ -184,6 +184,16 @@ jobs:
         shell: bash
         run: .github/scripts/verify-guest-runtime.sh ${{ matrix.target }} --run
 
+      - name: Verify guest ELF entry and artifact checks
+        run: >-
+          cargo test -p lasper-guest-runtime --test entry --locked
+          -- --binary target/${{ matrix.target }}/guest-runtime/lasper-guest-runtime
+
+      - name: Verify broker concurrency and standalone execution
+        run: |
+          cargo test -p lasper-guest-runtime --test broker --locked -- --ignored --binary target/${{ matrix.target }}/guest-runtime/lasper-guest-runtime
+          cargo test -p lasper-guest-runtime --test broker --locked -- --sudo
+
   build:
     name: build (${{ matrix.target }})
     runs-on: ${{ matrix.os }}

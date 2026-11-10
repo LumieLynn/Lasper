@@ -4,13 +4,13 @@ use lasper_guest_protocol::{
     SocketPathObservation, X11PathObservations, MAX_PROJECTION_PATH_BYTES,
 };
 
-use super::linux::{filesystem, result_or_errno};
 use super::{WorkerBootstrap, WorkerFailure, WorkerStage};
 use crate::linux::uapi::{
     errno::EINVAL,
     file::{AT_FDCWD, S_IFMT, S_IFSOCK, W_OK},
     nr,
 };
+use crate::linux::{filesystem, result_or_errno};
 use crate::syscall::syscall3;
 
 pub(super) fn entry(worker: WorkerBootstrap<'_>) -> ! {

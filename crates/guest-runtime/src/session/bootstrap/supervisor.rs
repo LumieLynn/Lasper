@@ -1,11 +1,12 @@
 use core::cell::Cell;
 
 use crate::linux::uapi::errno::EAGAIN;
+use crate::linux::Descriptor;
 use crate::session::error::SystemResultExt;
-use crate::session::linux::Descriptor;
 use crate::session::GuardianError;
 
-use super::signals::{GuardianSignal, Signals};
+use crate::linux::signals::Signals;
+use crate::SupervisorSignal;
 
 pub(super) struct Supervisor {
     broker: Descriptor,
@@ -33,7 +34,7 @@ impl Supervisor {
         [self.broker.raw(), self.signals.raw()]
     }
 
-    pub(super) fn receive_signal(&self) -> Result<Option<GuardianSignal>, GuardianError> {
+    pub(super) fn receive_signal(&self) -> Result<Option<SupervisorSignal>, GuardianError> {
         let signal = match self.signals.receive().context("read guardian signal FD") {
             Ok(signal) => signal,
             Err(error) => {
@@ -43,7 +44,7 @@ impl Supervisor {
                 return Err(error);
             }
         };
-        if let Some(GuardianSignal::Stop(signal)) = signal {
+        if let Some(SupervisorSignal::Stop(signal)) = signal {
             if self.status.get() == Ok(SupervisorStatus::Alive) {
                 self.status.set(Ok(SupervisorStatus::Stopped(signal)));
             }

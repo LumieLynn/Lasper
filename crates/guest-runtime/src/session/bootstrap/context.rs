@@ -6,8 +6,8 @@ use crate::session::{GuardianError, SessionGuardian, WorkerBootstrap};
 use crate::transport::GuestControlStream;
 
 use super::hello::CompletedHello;
-use super::signals::GuardianSignal;
 use super::supervisor::{Supervisor, SupervisorStatus};
+use crate::SupervisorSignal;
 
 /// Process-local authority to create one worker after broker Go and Hello.
 /// The connection, broker liveness and signal FD stay with this guardian.
@@ -69,7 +69,7 @@ impl GuardianContext {
         [self.connection.as_raw_fd(), broker, signals]
     }
 
-    pub fn receive_signal(&self) -> Result<Option<GuardianSignal>, GuardianError> {
+    pub fn receive_signal(&self) -> Result<Option<SupervisorSignal>, GuardianError> {
         self.supervisor.receive_signal()
     }
 

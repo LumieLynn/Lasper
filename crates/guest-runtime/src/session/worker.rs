@@ -8,9 +8,9 @@ use crate::linux::uapi::errno::{EINTR, EINVAL, EIO};
 
 use super::account::Account;
 use super::execution;
-use super::linux::{self, Descriptor, PollFd};
 use super::memory::WorkerMemory;
 use super::status::{StatusMessage, WorkerFailure, WorkerStage};
+use crate::linux::{self, Descriptor, PollFd};
 
 pub(super) struct WorkerChannels {
     pub(super) start: Descriptor,

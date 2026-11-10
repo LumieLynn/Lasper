@@ -11,7 +11,6 @@ use crate::linux::uapi::{
 use crate::transport::{IoBudget, IO_BYTES_PER_TURN};
 
 use super::super::error::SystemResultExt;
-use super::super::linux::{self, PollFd};
 use super::super::ready::{Payload, ReplyKind};
 use super::super::{
     CleanupReason, GuardianContext, GuardianError, GuardianObservation, SessionConnection,
@@ -19,6 +18,7 @@ use super::super::{
 };
 use super::capture::Capture;
 use super::input::{Input, InputProgress};
+use crate::linux::{self, PollFd};
 
 const MAX_EXIT_PAYLOAD_BYTES: usize = 4096 + 4 * MAX_CAPTURED_OUTPUT_BYTES.div_ceil(3);
 // A queued reply must finish before the cleanup report. Each pass can send at

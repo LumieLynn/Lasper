@@ -1,5 +1,5 @@
+use crate::linux::result_or_errno;
 use crate::linux::uapi::{errno::EPERM, nr};
-use crate::session::linux::result_or_errno;
 use crate::session::{WorkerFailure, WorkerStage};
 use crate::syscall::{syscall2, syscall3};
 

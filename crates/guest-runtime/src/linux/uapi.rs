@@ -7,6 +7,7 @@ pub(crate) mod errno {
     pub(crate) const EINTR: i32 = 4;
     pub(crate) const EIO: i32 = 5;
     pub(crate) const E2BIG: i32 = 7;
+    pub(crate) const EBADF: i32 = 9;
     pub(crate) const ECHILD: i32 = 10;
     pub(crate) const EAGAIN: i32 = 11;
     pub(crate) const ENOMEM: i32 = 12;
@@ -18,7 +19,13 @@ pub(crate) mod errno {
 
 pub(crate) mod file {
     pub(crate) const AT_FDCWD: usize = -100isize as usize;
+    pub(crate) const AT_SYMLINK_NOFOLLOW: usize = 0x100;
     pub(crate) const AT_EMPTY_PATH: usize = 0x1000;
+    pub(crate) const O_CREAT: usize = 0o100;
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) const O_NOFOLLOW: usize = 0o400000;
+    #[cfg(target_arch = "aarch64")]
+    pub(crate) const O_NOFOLLOW: usize = 0o100000;
     pub(crate) const O_RDWR: usize = 2;
     pub(crate) const O_NOCTTY: usize = 0o400;
     pub(crate) const O_NONBLOCK: usize = 0o4000;
@@ -37,9 +44,13 @@ pub(crate) mod file {
     pub(crate) const FD_CLOEXEC: usize = 1;
     pub(crate) const X_OK: usize = 1;
     pub(crate) const W_OK: usize = 2;
+    pub(crate) const STATX_MODE: usize = 2;
+    pub(crate) const STATX_NLINK: usize = 4;
+    pub(crate) const STATX_UID: usize = 8;
     pub(crate) const STATX_TYPE: usize = 1;
     pub(crate) const STATX_INO: usize = 0x100;
     pub(crate) const S_IFMT: u16 = 0o170000;
+    pub(crate) const S_IFDIR: u16 = 0o040000;
     pub(crate) const S_IFREG: u16 = 0o100000;
     pub(crate) const S_IFSOCK: u16 = 0o140000;
 }
@@ -62,6 +73,7 @@ pub(crate) mod signal {
 
 pub(crate) mod socket {
     pub(crate) const AF_UNIX: usize = 1;
+    pub(crate) const SOCK_STREAM: usize = 1;
     pub(crate) const SOCK_SEQPACKET: usize = 5;
     pub(crate) const SOL_SOCKET: i32 = 1;
     pub(crate) const SO_PASSCRED: usize = 16;
@@ -121,11 +133,21 @@ pub(crate) mod nr {
     pub(crate) const WRITE: usize = 1;
     pub(crate) const CLOSE: usize = 3;
     pub(crate) const MMAP: usize = 9;
+    #[allow(dead_code)]
+    pub(crate) const MPROTECT: usize = 10;
     pub(crate) const MUNMAP: usize = 11;
     pub(crate) const RT_SIGACTION: usize = 13;
     pub(crate) const RT_SIGPROCMASK: usize = 14;
     pub(crate) const IOCTL: usize = 16;
     pub(crate) const GETPID: usize = 39;
+    pub(crate) const SOCKET: usize = 41;
+    pub(crate) const BIND: usize = 49;
+    pub(crate) const LISTEN: usize = 50;
+    pub(crate) const FLOCK: usize = 73;
+    pub(crate) const UMASK: usize = 95;
+    pub(crate) const UNLINKAT: usize = 263;
+    pub(crate) const FCHMODAT: usize = 268;
+    pub(crate) const ACCEPT4: usize = 288;
     pub(crate) const SENDMSG: usize = 46;
     pub(crate) const RECVMSG: usize = 47;
     pub(crate) const SHUTDOWN: usize = 48;
@@ -165,6 +187,14 @@ pub(crate) mod nr {
 
 #[cfg(target_arch = "aarch64")]
 pub(crate) mod nr {
+    pub(crate) const SOCKET: usize = 198;
+    pub(crate) const BIND: usize = 200;
+    pub(crate) const LISTEN: usize = 201;
+    pub(crate) const FLOCK: usize = 32;
+    pub(crate) const UMASK: usize = 166;
+    pub(crate) const UNLINKAT: usize = 35;
+    pub(crate) const FCHMODAT: usize = 53;
+    pub(crate) const ACCEPT4: usize = 242;
     pub(crate) const DUP3: usize = 24;
     pub(crate) const FCNTL: usize = 25;
     pub(crate) const IOCTL: usize = 29;
@@ -202,6 +232,8 @@ pub(crate) mod nr {
     pub(crate) const SENDMSG: usize = 211;
     pub(crate) const RECVMSG: usize = 212;
     pub(crate) const MUNMAP: usize = 215;
+    #[allow(dead_code)]
+    pub(crate) const MPROTECT: usize = 226;
     pub(crate) const CLONE: usize = 220;
     pub(crate) const EXECVE: usize = 221;
     pub(crate) const MMAP: usize = 222;
