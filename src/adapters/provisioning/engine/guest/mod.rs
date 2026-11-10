@@ -7,7 +7,7 @@ mod users;
 use crate::adapters::process::{CommandRunner, RootfsProcessRunner};
 use crate::adapters::provisioning::engine::failure::{OperationFailure, OperationResult};
 use crate::adapters::provisioning::engine::host::HostResultExt;
-use crate::adapters::storage::rootfs::{access::RootfsAccess, RootfsTarget};
+use crate::adapters::storage::rootfs::{RootfsAccess, RootfsTarget};
 use crate::domain::machine::{validate_login_username, CreateUser, GuestHostname};
 use crate::domain::secret::{validate_chpasswd_secret, SecretString};
 use crate::domain::wayland::ContainerUserIdentity;

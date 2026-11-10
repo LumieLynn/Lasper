@@ -1126,6 +1126,7 @@ dependencies = [
  "futures-util",
  "hex",
  "lasper-local-accounts",
+ "lasper-rootfs-path",
  "libc",
  "linux-raw-sys",
  "log",

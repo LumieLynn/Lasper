@@ -1,5 +1,6 @@
 //! Pin a process generation and the kernel objects needed by the connector.
 
+use crate::adapters::storage::rootfs::RootfsAccess;
 use std::fs::{File, Metadata, OpenOptions};
 use std::io;
 use std::num::NonZeroU64;
@@ -75,9 +76,7 @@ impl GuestBusTarget {
     /// init binary, determines whether this leader is the guest's systemd.
     pub(crate) fn systemd_init(&self) -> io::Result<bool> {
         let executable = std::fs::metadata(pinned_process(&self.process).join("exe"))?;
-        let root = crate::adapters::storage::rootfs::access::RootfsAccess::from_directory(
-            self.root.try_clone()?,
-        )?;
+        let root = RootfsAccess::from_directory(self.root.try_clone()?)?;
         for path in ["/usr/lib/systemd/systemd", "/lib/systemd/systemd"] {
             if let Some(candidate) = root.entry(path)? {
                 if same_object(&executable, &candidate.metadata()?) {

@@ -1,7 +1,6 @@
 //! Read local accounts without executing anything from the guest filesystem.
 
-use crate::adapters::storage::rootfs::access::RootfsAccess;
-use crate::adapters::storage::rootfs::RootfsTarget;
+use crate::adapters::storage::rootfs::{RootfsAccess, RootfsTarget};
 use crate::domain::machine::accounts::{LocalAccount, LocalAccountObservation};
 use lasper_local_accounts::passwd_entries;
 use std::io::{self, Read};

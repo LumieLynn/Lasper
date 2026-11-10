@@ -22,6 +22,7 @@ path = "src/main.rs"
 
 [dependencies]
 lasper-local-accounts = { path = "crates/local-accounts" }
+lasper-rootfs-path = { path = "crates/rootfs-path" }
 ratatui = { version = "0.30", default-features = false, features = [
     "all-widgets",
     "crossterm",
