@@ -11,6 +11,7 @@ members = [
     "crates/guest-protocol",
     "crates/guest-runtime",
     "crates/local-accounts",
+    "crates/rootfs-path",
 ]
 default-members = ["."]
 resolver = "2"

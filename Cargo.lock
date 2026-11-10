@@ -1166,7 +1166,9 @@ version = "0.1.0"
 dependencies = [
  "lasper-guest-protocol",
  "lasper-guest-runtime",
+ "lasper-rootfs-path",
  "libc",
+ "tempfile",
  "tokio",
 ]
 
@@ -1191,6 +1193,14 @@ dependencies = [
 [[package]]
 name = "lasper-local-accounts"
 version = "0.1.0"
+
+[[package]]
+name = "lasper-rootfs-path"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "tempfile",
+]
 
 [[package]]
 name = "lazy_static"

@@ -92,7 +92,7 @@ impl MachineTarget {
         self.verify_process(worker.handle())
     }
 
-    fn verify_process(&self, process: &ProcessHandle) -> io::Result<()> {
+    pub(crate) fn verify_process(&self, process: &ProcessHandle) -> io::Result<()> {
         self.recheck()?;
         process.recheck()?;
         process.verify_location(&self.leader)?;

@@ -90,6 +90,7 @@ jobs:
 
       - name: Run guest runtime Clippy
         run: |
+          cargo clippy -p lasper-rootfs-path --all-targets --locked -- -D warnings
           cargo clippy -p lasper-guest-host-transport --all-targets --locked -- -D warnings
           cargo clippy -p lasper-guest-protocol --all-targets --locked -- -D warnings
           cargo clippy -p lasper-guest-runtime --all-targets --locked -- -D warnings
@@ -99,6 +100,7 @@ jobs:
 
       - name: Run guest runtime tests
         run: |
+          cargo test -p lasper-rootfs-path --all-targets --locked
           cargo test -p lasper-guest-host-transport --all-targets --locked
           cargo test -p lasper-guest-protocol --all-targets --locked
           cargo test -p lasper-guest-runtime --all-targets --locked
@@ -143,6 +145,7 @@ jobs:
         run: >-
           cargo test
           -p lasper-guest-protocol
+          -p lasper-rootfs-path
           -p lasper-guest-host-transport
           -p lasper-guest-runtime
           -p lasper-local-accounts
@@ -155,6 +158,7 @@ jobs:
             sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
           fi
           cargo test -p lasper-guest-host-transport --lib child_user_namespace_maps_packet_and_proc_credentials --locked -- --ignored
+          cargo test -p lasper-guest-host-transport --test broker --locked -- --ignored
 
       - name: Verify guest sessions and account switching
         run: |

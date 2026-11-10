@@ -8,8 +8,8 @@ use lasper_guest_protocol::{
 use lasper_guest_runtime::transport::GuestControlStream;
 use std::fs::File;
 use std::io::{self, Read, Write};
-use std::mem::{size_of, zeroed};
-use std::os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::mem::size_of;
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::task::Poll;
 use support::control::{
@@ -18,8 +18,9 @@ use support::control::{
 };
 use tokio::net::UnixStream;
 
-#[repr(C, align(16))]
-struct AncillaryBuffer([usize; 16]);
+#[path = "support/ancillary.rs"]
+mod ancillary;
+use ancillary::send_with_rights;
 
 fn header(kind: MessageKind, payload: &[u8], descriptor_count: u16) -> ControlFrameHeader {
     ControlFrameHeader::new(kind, 17, payload.len() as u32, descriptor_count).unwrap()
@@ -66,52 +67,6 @@ fn set_small_send_buffer(stream: &StdUnixStream) {
         )
     };
     assert_eq!(result, 0);
-}
-
-fn send_with_rights(
-    stream: &StdUnixStream,
-    bytes: &[u8],
-    descriptors: &[RawFd],
-) -> io::Result<usize> {
-    let mut vector = libc::iovec {
-        iov_base: bytes.as_ptr().cast_mut().cast(),
-        iov_len: bytes.len(),
-    };
-    let mut control = AncillaryBuffer([0; 16]);
-    // The helper fills every field that `sendmsg` reads before the syscall.
-    let mut message: libc::msghdr = unsafe { zeroed() };
-    message.msg_iov = &mut vector;
-    message.msg_iovlen = 1;
-
-    if !descriptors.is_empty() {
-        let data_bytes = std::mem::size_of_val(descriptors);
-        let control_bytes = unsafe { libc::CMSG_SPACE(data_bytes as _) } as usize;
-        assert!(control_bytes <= size_of::<AncillaryBuffer>());
-        message.msg_control = control.0.as_mut_ptr().cast();
-        message.msg_controllen = control_bytes as _;
-        // The local buffer is aligned and sized for this descriptor list.
-        let header = unsafe { libc::CMSG_FIRSTHDR(&message) };
-        assert!(!header.is_null());
-        // `header` points into the checked control allocation above.
-        unsafe {
-            (*header).cmsg_level = libc::SOL_SOCKET;
-            (*header).cmsg_type = libc::SCM_RIGHTS;
-            (*header).cmsg_len = libc::CMSG_LEN(data_bytes as _) as _;
-            std::ptr::copy_nonoverlapping(
-                descriptors.as_ptr().cast::<u8>(),
-                libc::CMSG_DATA(header),
-                data_bytes,
-            );
-        }
-    }
-
-    // The kernel only borrows the live byte and control buffers for this call.
-    let written = unsafe { libc::sendmsg(stream.as_raw_fd(), &message, libc::MSG_NOSIGNAL) };
-    if written < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(written as usize)
-    }
 }
 
 fn assert_peer_observes_close(mut peer: StdUnixStream) {
