@@ -101,6 +101,10 @@ impl BrokerConnection {
         }
         self.target.verify_process(&self.peer)
     }
+
+    pub(crate) fn control(&mut self) -> &mut UnixControlStream {
+        &mut self.control
+    }
 }
 
 async fn connect_endpoint(

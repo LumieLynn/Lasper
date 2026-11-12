@@ -1,17 +1,20 @@
 use super::channel::invalid_data;
 use super::process::WorkerProcess;
 use super::UnixIdentityChannel;
-use lasper_guest_protocol::{GuestIdentityReply, PrepareRequest, IDENTITY_CHALLENGE_BYTES};
+use lasper_guest_protocol::{
+    GuestIdentityReply, PrepareRequest, PrepareRequestFrame, IDENTITY_CHALLENGE_BYTES,
+};
 use std::io;
+use std::sync::Arc;
 
 /// Keeps the identity channel and its request together for Prepare and Recheck.
 /// The worker is assigned before the first reply. Reported guest IDs must map
 /// to its kernel credentials; machine membership still needs checking before
 /// desktop authorization. Account-name resolution belongs to the trusted
 /// guest helper, not this credential check.
-pub struct IdentityWorker<'request, 'payload> {
+pub struct IdentityWorker<'payload> {
     channel: UnixIdentityChannel,
-    request: &'request PrepareRequest<'payload>,
+    request: Arc<PrepareRequestFrame<'payload>>,
     process: WorkerProcess,
     observed_ids: Option<ObservedIds>,
 }
@@ -24,10 +27,10 @@ struct ObservedIds {
     guest_gid: u32,
 }
 
-impl<'request, 'payload> IdentityWorker<'request, 'payload> {
+impl<'payload> IdentityWorker<'payload> {
     pub(crate) fn new(
         channel: UnixIdentityChannel,
-        request: &'request PrepareRequest<'payload>,
+        request: Arc<PrepareRequestFrame<'payload>>,
         process: WorkerProcess,
     ) -> Self {
         Self {
@@ -60,7 +63,7 @@ impl<'request, 'payload> IdentityWorker<'request, 'payload> {
             channel: &mut self.channel,
             completed: false,
         };
-        let result = observe_worker(check.channel, self.request, &self.process)
+        let result = observe_worker(check.channel, self.request.request(), &self.process)
             .await
             .and_then(|observation| {
                 let ids = ObservedIds {
@@ -228,17 +231,22 @@ mod tests {
         (host, guest, guest_fd, host_fd)
     }
 
-    fn owner<'request, 'payload>(
+    fn owner<'payload>(
         channel: UnixIdentityChannel,
-        request: &'request PrepareRequest<'payload>,
+        request: &PrepareRequest<'payload>,
         pid: libc::pid_t,
-    ) -> IdentityWorker<'request, 'payload> {
+    ) -> IdentityWorker<'payload> {
         // SAFETY: These tests retain their own process or an unreaped child,
         // so obtaining the assigned pidfd cannot race with PID reuse.
         let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
         assert!(fd >= 0, "{}", io::Error::last_os_error());
         // SAFETY: pidfd_open returned a new descriptor owned by this value.
         let pidfd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+        let request = Arc::new(PrepareRequestFrame::new(
+            7,
+            BrokerId::new([1; 16]),
+            request.clone(),
+        ));
         IdentityWorker::new(channel, request, WorkerProcess::open(pidfd).unwrap())
     }
 

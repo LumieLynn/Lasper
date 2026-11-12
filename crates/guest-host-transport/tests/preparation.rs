@@ -6,6 +6,8 @@ mod target;
 use lasper_guest_host_transport::{
     PreparedWorker, WorkerHello, WorkerReadiness, WorkerReadinessError,
 };
+// The shared fixture's gated rechecks are used by tests/session/lease.rs.
+#[allow(dead_code)]
 #[path = "support/worker.rs"]
 mod worker;
 use lasper_guest_protocol::{
@@ -19,7 +21,7 @@ use lasper_guest_runtime::transport::GuestControlStream;
 use std::fs::File;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
-use support::control::{establish_guest, establish_host, raw_stream_pair};
+use support::handshake::{establish_guest, establish_host, raw_stream_pair};
 use worker::TestWorker;
 
 fn preparation_request(execution: ExecutionKind) -> PrepareRequestFrame<'static> {
@@ -277,7 +279,7 @@ async fn prepare_ready_transfers_the_assigned_worker_for_both_execution_kinds() 
         let mut prepared = PreparedWorker::from_frame(
             target::current_target().await,
             &readiness,
-            &request,
+            std::sync::Arc::new(request.clone()),
             response,
         )
         .unwrap();
@@ -376,7 +378,7 @@ async fn invalid_preparation_resources_close_the_received_identity_endpoint() {
         let error = match PreparedWorker::from_frame(
             target::current_target().await,
             &readiness(),
-            &request,
+            std::sync::Arc::new(request.clone()),
             response,
         ) {
             Ok(_) => panic!("accepted invalid preparation: {failure}"),
@@ -444,7 +446,7 @@ async fn another_workers_pty_cannot_be_combined_with_valid_identity_resources() 
     let error = match PreparedWorker::from_frame(
         target::current_target().await,
         &readiness,
-        &request,
+        std::sync::Arc::new(request.clone()),
         frame,
     ) {
         Ok(_) => panic!("accepted another worker's PTY"),
@@ -480,9 +482,13 @@ async fn terminal_assignment_is_rechecked_before_accepting_another_observation()
         worker.pidfd.try_clone().unwrap(),
     ];
     let frame = deliver_ready(ready, descriptors).await;
-    let mut prepared =
-        PreparedWorker::from_frame(target::current_target().await, &readiness, &request, frame)
-            .unwrap();
+    let mut prepared = PreparedWorker::from_frame(
+        target::current_target().await,
+        &readiness,
+        std::sync::Arc::new(request.clone()),
+        frame,
+    )
+    .unwrap();
     prepared.observe().await.unwrap();
     assert_eq!(prepared.process().pid(), worker.pid);
     let error = prepared.observe().await.unwrap_err();
@@ -609,8 +615,13 @@ async fn target_leader_exit_invalidates_preparation_without_rebinding_to_a_repla
         worker.pidfd.try_clone().unwrap(),
     ];
     let frame = deliver_ready(ready, descriptors).await;
-    let mut prepared =
-        PreparedWorker::from_frame(target.clone(), &readiness, &request, frame).unwrap();
+    let mut prepared = PreparedWorker::from_frame(
+        target.clone(),
+        &readiness,
+        std::sync::Arc::new(request.clone()),
+        frame,
+    )
+    .unwrap();
     prepared.observe().await.unwrap();
 
     // SAFETY: TestWorker exclusively owns waitpid for this unreaped child.
@@ -673,7 +684,13 @@ async fn target_exit_while_waiting_for_identity_rejects_the_otherwise_valid_repl
     let target = target::target_for(leader.pid as u32).await;
     let (host, guest) = identity_pair();
     let frame = deliver_ready(ready, vec![host, assigned_pidfd()]).await;
-    let mut prepared = PreparedWorker::from_frame(target, &readiness, &request, frame).unwrap();
+    let mut prepared = PreparedWorker::from_frame(
+        target,
+        &readiness,
+        std::sync::Arc::new(request.clone()),
+        frame,
+    )
+    .unwrap();
     let (waiting, challenge_received) = tokio::sync::oneshot::channel();
     let (release, released) = mpsc::channel();
     let worker_request = request.request().clone();
@@ -747,7 +764,12 @@ async fn exited_target_rejects_ready_and_closes_received_resources() {
     assert_eq!(unsafe { libc::poll(&mut descriptor, 1, 2000) }, 1);
     let (identity, peer) = identity_pair();
     let frame = deliver_ready(ready, vec![identity, assigned_pidfd()]).await;
-    let error = match PreparedWorker::from_frame(target, &readiness, &request, frame) {
+    let error = match PreparedWorker::from_frame(
+        target,
+        &readiness,
+        std::sync::Arc::new(request.clone()),
+        frame,
+    ) {
         Ok(_) => panic!("accepted resources for an exited target"),
         Err(error) => error,
     };

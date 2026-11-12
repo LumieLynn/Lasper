@@ -10,6 +10,10 @@ use tokio::net::UnixStream;
 
 use crate::SCM_PIDFD;
 
+mod progress;
+use progress::ControlIo;
+pub(crate) use progress::ControlIoEvent;
+
 // Keep one overflow slot so an excessive FD count can be rejected explicitly.
 const MAX_RECEIVED_DESCRIPTORS: usize = MAX_CONTROL_DESCRIPTORS as usize + 1;
 const SEND_CONTROL_BYTES: usize = unsafe {
@@ -26,10 +30,13 @@ struct AncillaryBuffer<const BYTES: usize>([u8; BYTES]);
 /// Once an operation has consumed part of a frame, an error leaves no safe
 /// frame boundary to resume from. The transport shuts the socket down instead
 /// of risking that a frame tail is parsed as the next header.
+/// The internal session driver can finish reading cleanup reports after a
+/// write failure, but cannot send again or recover the stream for public use.
 pub struct UnixControlStream {
     stream: UnixStream,
     poisoned: bool,
     session: ControlSessionState,
+    io: ControlIo,
 }
 
 impl UnixControlStream {
@@ -38,6 +45,7 @@ impl UnixControlStream {
             stream,
             poisoned: false,
             session: ControlSessionState::host(),
+            io: ControlIo::default(),
         }
     }
 
@@ -52,14 +60,15 @@ impl UnixControlStream {
             .map_err(invalid_outbound_session)
     }
 
-    /// Returns true while the stream is still aligned to a frame boundary.
+    /// A partial frame does not make this false while its progress is retained.
+    /// False means the stream was invalidated and must not be reused.
     pub fn can_continue(&self) -> bool {
-        !self.poisoned
+        !self.poisoned && !self.io.write_failed()
     }
 
-    /// Returns the socket only while its framing state is still known.
+    /// Fails if the stream was invalidated or still has buffered input or output.
     pub fn into_inner(self) -> io::Result<UnixStream> {
-        if self.poisoned {
+        if !self.can_continue() || self.io.is_busy() {
             Err(invalid_data("control stream was interrupted mid-frame"))
         } else {
             Ok(self.stream)
@@ -82,8 +91,10 @@ impl UnixControlStream {
             .next_outbound(header)
             .map_err(invalid_outbound_session)?;
 
-        let (stream, poisoned) = (&self.stream, &mut self.poisoned);
-        let mut operation = StreamOperation::new(stream, poisoned)?;
+        if self.io.has_output() {
+            return Err(invalid_data("a control frame is already being sent"));
+        }
+        let mut operation = StreamOperation::new(&self.stream, &mut self.poisoned, &mut self.io)?;
         let result = send_frame_inner(operation.stream(), header, payload, descriptors).await;
         if result.is_ok() {
             operation.finish();
@@ -94,16 +105,20 @@ impl UnixControlStream {
         result
     }
 
-    /// Receives one frame and takes ownership of its descriptors immediately.
-    ///
-    /// Descriptor ownership is established before the rest of the frame is
-    /// validated, so cancellation or malformed input cannot leak them.
+    /// Cancelling shuts down the stream, including when no bytes were read.
+    /// Received FDs are owned before payload validation, so a malformed frame
+    /// or cancellation releases them rather than leaving them open.
     pub async fn receive_frame(&mut self) -> io::Result<ReceivedControlFrame> {
+        if self.io.is_busy() {
+            return Err(invalid_data("incremental control I/O is in progress"));
+        }
         let session = self.session;
-        let (stream, poisoned) = (&self.stream, &mut self.poisoned);
-        let mut operation = StreamOperation::new(stream, poisoned)?;
-        match receive_frame_inner(operation.stream(), session).await {
-            Ok((frame, next_session)) => {
+        let mut operation = StreamOperation::new(&self.stream, &mut self.poisoned, &mut self.io)?;
+        match operation.receive_frame(session).await {
+            Ok(frame) => {
+                let next_session = session
+                    .next_inbound(frame.header())
+                    .map_err(invalid_inbound_session)?;
                 operation.finish();
                 self.session = next_session;
                 Ok(frame)
@@ -146,23 +161,36 @@ impl ReceivedControlFrame {
 struct StreamOperation<'a> {
     stream: &'a UnixStream,
     poisoned: &'a mut bool,
+    io: &'a mut ControlIo,
     finished: bool,
 }
 
 impl<'a> StreamOperation<'a> {
-    fn new(stream: &'a UnixStream, poisoned: &'a mut bool) -> io::Result<Self> {
-        if *poisoned {
+    fn new(
+        stream: &'a UnixStream,
+        poisoned: &'a mut bool,
+        io: &'a mut ControlIo,
+    ) -> io::Result<Self> {
+        if *poisoned || io.write_failed() {
             return Err(invalid_data("control stream cannot be reused"));
         }
         Ok(Self {
             stream,
             poisoned,
+            io,
             finished: false,
         })
     }
 
     fn stream(&self) -> &UnixStream {
         self.stream
+    }
+
+    async fn receive_frame(
+        &mut self,
+        session: ControlSessionState,
+    ) -> io::Result<ReceivedControlFrame> {
+        self.io.receive_frame(self.stream, session).await
     }
 
     fn finish(&mut self) {
@@ -172,6 +200,7 @@ impl<'a> StreamOperation<'a> {
     fn poison(&mut self) {
         *self.poisoned = true;
         shutdown_stream(self.stream);
+        self.io.discard();
         self.finished = true;
     }
 }
@@ -181,6 +210,7 @@ impl Drop for StreamOperation<'_> {
         if !self.finished {
             *self.poisoned = true;
             shutdown_stream(self.stream);
+            self.io.discard();
         }
     }
 }
@@ -232,68 +262,6 @@ async fn write_all(stream: &UnixStream, mut bytes: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-async fn receive_frame_inner(
-    stream: &UnixStream,
-    session: ControlSessionState,
-) -> io::Result<(ReceivedControlFrame, ControlSessionState)> {
-    // `SCM_RIGHTS` is tied to a byte position on a stream socket. Reading the
-    // anchor alone prevents rights from a later byte being accepted by this frame.
-    let mut first = [0; CONTROL_FRAME_DESCRIPTOR_ANCHOR_BYTES];
-    let (read, descriptors) = receive_chunk(stream, &mut first).await?;
-    if read == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::UnexpectedEof,
-            "control stream closed before a frame began",
-        ));
-    }
-
-    let mut encoded_header = [0; CONTROL_FRAME_HEADER_BYTES];
-    encoded_header[..CONTROL_FRAME_DESCRIPTOR_ANCHOR_BYTES].copy_from_slice(&first);
-    read_exact_without_descriptors(
-        stream,
-        &mut encoded_header[CONTROL_FRAME_DESCRIPTOR_ANCHOR_BYTES..],
-    )
-    .await?;
-    let header = ControlFrameHeader::decode(&encoded_header).map_err(invalid_header)?;
-    let next_session = session
-        .next_inbound(header)
-        .map_err(invalid_inbound_session)?;
-    let descriptors = validate_descriptors(descriptors, header.descriptor_count())?;
-
-    let mut payload = vec![0; header.payload_bytes() as usize];
-    read_exact_without_descriptors(stream, &mut payload).await?;
-    Ok((
-        ReceivedControlFrame {
-            header,
-            payload,
-            descriptors,
-        },
-        next_session,
-    ))
-}
-
-async fn read_exact_without_descriptors(
-    stream: &UnixStream,
-    mut bytes: &mut [u8],
-) -> io::Result<()> {
-    while !bytes.is_empty() {
-        let (read, descriptors) = receive_chunk(stream, bytes).await?;
-        if !descriptors.is_empty() {
-            return Err(invalid_data(
-                "control frame descriptors were not attached to its first byte",
-            ));
-        }
-        if read == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "control stream closed before the frame was complete",
-            ));
-        }
-        bytes = &mut bytes[read..];
-    }
-    Ok(())
-}
-
 fn validate_descriptors(descriptors: Vec<OwnedFd>, expected: u16) -> io::Result<Vec<OwnedFd>> {
     if descriptors.len() != usize::from(expected) {
         return Err(invalid_data(
@@ -301,20 +269,6 @@ fn validate_descriptors(descriptors: Vec<OwnedFd>, expected: u16) -> io::Result<
         ));
     }
     Ok(descriptors)
-}
-
-async fn receive_chunk(stream: &UnixStream, bytes: &mut [u8]) -> io::Result<(usize, Vec<OwnedFd>)> {
-    loop {
-        stream.readable().await?;
-        match stream.try_io(tokio::io::Interest::READABLE, || {
-            recvmsg_once(stream, bytes)
-        }) {
-            Ok(result) => return Ok(result),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error),
-        }
-    }
 }
 
 fn recvmsg_once(stream: &UnixStream, bytes: &mut [u8]) -> io::Result<(usize, Vec<OwnedFd>)> {
@@ -336,8 +290,13 @@ fn recvmsg_once(stream: &UnixStream, bytes: &mut [u8]) -> io::Result<(usize, Vec
     message.msg_controllen = control.0.len() as _;
 
     // The byte and control buffers stay live for the call and bound every write.
-    let received =
-        unsafe { libc::recvmsg(stream.as_raw_fd(), &mut message, libc::MSG_CMSG_CLOEXEC) };
+    let received = unsafe {
+        libc::recvmsg(
+            stream.as_raw_fd(),
+            &mut message,
+            libc::MSG_CMSG_CLOEXEC | libc::MSG_DONTWAIT,
+        )
+    };
     if received < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -618,7 +577,7 @@ mod tests {
             .unwrap()
     }
 
-    fn established_stream(stream: UnixStream) -> UnixControlStream {
+    pub(super) fn established_stream(stream: UnixStream) -> UnixControlStream {
         established_stream_with_descriptor_limit(stream, 2)
     }
 
@@ -629,7 +588,7 @@ mod tests {
         established_stream_with_negotiated_limits(stream, negotiated_limits(max_descriptors))
     }
 
-    fn established_stream_with_current_limits(
+    pub(super) fn established_stream_with_current_limits(
         stream: UnixStream,
         max_descriptors: u16,
     ) -> UnixControlStream {
@@ -922,3 +881,7 @@ mod tests {
 #[cfg(test)]
 #[path = "../tests/transport/ancillary.rs"]
 mod ancillary_tests;
+
+#[cfg(test)]
+#[path = "../tests/transport/progress.rs"]
+mod progress_tests;

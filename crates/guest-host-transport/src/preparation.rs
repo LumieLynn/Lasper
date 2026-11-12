@@ -14,18 +14,18 @@ use std::sync::Arc;
 /// The guardian is trusted to assign that worker to this preparation and to
 /// deliver Start to it. The host checks the resources agree; it cannot recover
 /// the guardian's assignment history from a pidfd.
-pub struct PreparedWorker<'request, 'payload> {
+pub struct PreparedWorker<'payload> {
     ready: PrepareReadyFrame,
     target: Arc<MachineTarget>,
     terminal: Option<OwnedFd>,
-    identity: IdentityWorker<'request, 'payload>,
+    identity: IdentityWorker<'payload>,
 }
 
-impl<'request, 'payload> PreparedWorker<'request, 'payload> {
+impl<'payload> PreparedWorker<'payload> {
     pub fn from_frame(
         target: Arc<MachineTarget>,
         readiness: &WorkerReadiness,
-        request: &'request PrepareRequestFrame<'payload>,
+        request: Arc<PrepareRequestFrame<'payload>>,
         frame: ReceivedControlFrame,
     ) -> io::Result<Self> {
         if request.broker_id() != readiness.broker_id() {
@@ -64,7 +64,7 @@ impl<'request, 'payload> PreparedWorker<'request, 'payload> {
             ready,
             target,
             terminal,
-            identity: IdentityWorker::new(channel, request.request(), process),
+            identity: IdentityWorker::new(channel, request, process),
         })
     }
 
@@ -74,6 +74,10 @@ impl<'request, 'payload> PreparedWorker<'request, 'payload> {
 
     pub fn terminal(&self) -> Option<BorrowedFd<'_>> {
         self.terminal.as_ref().map(AsFd::as_fd)
+    }
+
+    pub(crate) fn into_terminal(self) -> Option<OwnedFd> {
+        self.terminal
     }
 
     pub fn process(&self) -> &WorkerProcess {
@@ -103,7 +107,7 @@ impl<'request, 'payload> PreparedWorker<'request, 'payload> {
         result
     }
 
-    fn verify_resources(&self) -> io::Result<()> {
+    pub(crate) fn verify_resources(&self) -> io::Result<()> {
         self.target.verify_worker(self.process())?;
         if let Some(terminal) = &self.terminal {
             verify_terminal(terminal.as_fd(), self.process())?;

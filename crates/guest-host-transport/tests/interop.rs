@@ -12,10 +12,8 @@ use std::mem::size_of;
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::task::Poll;
-use support::control::{
-    current_limits, establish_guest, establish_host, raw_stream_pair, receive_guest_frame,
-    send_guest_frame,
-};
+use support::control::{receive_guest_frame, send_guest_frame};
+use support::handshake::{current_limits, establish_guest, establish_host, raw_stream_pair};
 use tokio::net::UnixStream;
 
 #[path = "support/ancillary.rs"]

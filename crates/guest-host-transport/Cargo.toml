@@ -9,12 +9,12 @@ publish = false
 lasper-guest-protocol = { path = "../guest-protocol" }
 lasper-rootfs-path = { path = "../rootfs-path" }
 libc = "0.2"
-tokio = { version = "1", features = ["io-util", "net", "rt", "time"] }
+tokio = { version = "1", features = ["io-util", "net", "rt", "sync", "time"] }
 
 [dev-dependencies]
 tempfile = "3"
 lasper-guest-runtime = { path = "../guest-runtime" }
-tokio = { version = "1", features = ["macros", "sync", "time"] }
+tokio = { version = "1", features = ["macros", "sync", "time", "test-util"] }
 
 [[test]]
 name = "broker"

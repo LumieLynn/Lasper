@@ -1,4 +1,5 @@
 mod fixture;
+mod session;
 #[path = "../support/target.rs"]
 mod target;
 
@@ -13,6 +14,9 @@ fn main() {
     let arguments: Vec<_> = std::env::args().collect();
     if arguments.get(1).map(String::as_str) == Some("--broker-child") {
         fixture::enter_user_namespace();
+        if arguments.iter().any(|argument| argument == "--accounts") {
+            fixture::install_accounts(std::path::Path::new(&arguments[2]));
+        }
         std::io::stdout().write_all(&[1]).unwrap();
         std::io::stdout().flush().unwrap();
         let mut go = [0];
@@ -120,4 +124,5 @@ async fn scenarios() {
     failed.expect_failed_start().await;
     assert!(matches!(attempt.await, Err(BrokerConnectError::Target(_))));
     println!("host broker: 5 scenarios passed");
+    session::run().await;
 }

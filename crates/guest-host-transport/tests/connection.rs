@@ -309,7 +309,16 @@ async fn hello_rejects_smuggled_descriptors_at_the_header_and_payload() {
             peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
             let mut byte = [0];
             assert_eq!(peer.read(&mut byte).unwrap(), 0, "received FD leaked");
-            assert_eq!(stream.read(&mut byte).unwrap(), 0);
+            // Rejecting the anchor can leave unread Hello bytes, so Linux may
+            // reset this stream. The separate peer above still proves FD release.
+            loop {
+                match stream.read(&mut byte) {
+                    Ok(0) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => break,
+                    result => panic!("rejected Hello must close the control stream: {result:?}"),
+                }
+            }
         });
         assert!(
             matches!(

@@ -2,7 +2,7 @@ use lasper_guest_protocol::{
     GuestIdentityReply, PreparationId, PrepareRequest, MAX_IDENTITY_MESSAGE_BYTES,
 };
 use lasper_guest_runtime::identity::GuestIdentityChannel;
-use std::io::{self, Read};
+use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 
@@ -14,22 +14,53 @@ pub struct TestWorker {
     lifetime: UnixStream,
 }
 
+#[derive(Clone, Copy)]
+enum RecheckBehavior {
+    Reply,
+    ReleaseTerminal,
+    WaitForRelease(usize),
+}
+
 impl TestWorker {
     pub fn spawn(request: PrepareRequest<'static>, preparation: PreparationId) -> Self {
-        Self::spawn_with_terminal_release(request, preparation, false)
+        Self::spawn_with_recheck(request, preparation, RecheckBehavior::Reply)
     }
 
     pub fn releasing_terminal_on_recheck(
         request: PrepareRequest<'static>,
         preparation: PreparationId,
     ) -> Self {
-        Self::spawn_with_terminal_release(request, preparation, true)
+        Self::spawn_with_recheck(request, preparation, RecheckBehavior::ReleaseTerminal)
     }
 
-    fn spawn_with_terminal_release(
+    pub fn pausing_on_recheck(
         request: PrepareRequest<'static>,
         preparation: PreparationId,
-        release_on_recheck: bool,
+    ) -> Self {
+        Self::spawn_with_recheck(request, preparation, RecheckBehavior::WaitForRelease(1))
+    }
+
+    pub fn pausing_on_first_observation(
+        request: PrepareRequest<'static>,
+        preparation: PreparationId,
+    ) -> Self {
+        Self::spawn_with_recheck(request, preparation, RecheckBehavior::WaitForRelease(0))
+    }
+
+    pub fn wait_for_recheck(&mut self) {
+        let mut notification = [0];
+        self.lifetime.read_exact(&mut notification).unwrap();
+        assert_eq!(notification, [2]);
+    }
+
+    pub fn release_recheck(&mut self) {
+        self.lifetime.write_all(&[2]).unwrap();
+    }
+
+    fn spawn_with_recheck(
+        request: PrepareRequest<'static>,
+        preparation: PreparationId,
+        recheck: RecheckBehavior,
     ) -> Self {
         let mut endpoints = [-1; 2];
         // SAFETY: Both result slots are live and receive new owned descriptors.
@@ -125,13 +156,39 @@ impl TestWorker {
             let mut bytes = [0; MAX_IDENTITY_MESSAGE_BYTES];
             let mut observations = 0;
             while let Ok(challenge) = channel.receive_challenge(&mut bytes) {
-                if release_on_recheck && observations == 1 {
+                if matches!(recheck, RecheckBehavior::ReleaseTerminal) && observations == 1 {
                     // Keep the assigned sender alive, but remove its terminal
                     // ownership while the host is awaiting the next reply.
                     unsafe {
                         libc::signal(libc::SIGHUP, libc::SIG_IGN);
                         if libc::ioctl(0, libc::TIOCNOTTY, 0) < 0 {
                             libc::_exit(8);
+                        }
+                    }
+                }
+                if matches!(recheck, RecheckBehavior::WaitForRelease(index) if observations == index)
+                {
+                    // Notify the parent after receiving the challenge. It can
+                    // then cancel while observation is awaiting this reply.
+                    // SAFETY: the child retains this endpoint; each syscall
+                    // reads or writes only its live one-byte buffer.
+                    unsafe {
+                        if libc::write(child.as_raw_fd(), [2u8].as_ptr().cast(), 1) != 1 {
+                            libc::_exit(10);
+                        }
+                        let mut release = 0u8;
+                        loop {
+                            let read =
+                                libc::read(child.as_raw_fd(), (&mut release as *mut u8).cast(), 1);
+                            if read == 1 && release == 2 {
+                                break;
+                            }
+                            if read < 0
+                                && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
+                            {
+                                continue;
+                            }
+                            libc::_exit(10);
                         }
                     }
                 }

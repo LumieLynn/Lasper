@@ -12,14 +12,18 @@ pub struct Broker {
 
 impl Broker {
     pub fn spawn() -> Self {
-        Self::spawn_with(false)
+        Self::spawn_with(None)
     }
 
     pub fn failed_start() -> Self {
-        Self::spawn_with(true)
+        Self::spawn_with(Some("--fail-start"))
     }
 
-    fn spawn_with(fail: bool) -> Self {
+    pub fn with_accounts() -> Self {
+        Self::spawn_with(Some("--accounts"))
+    }
+
+    fn spawn_with(option: Option<&str>) -> Self {
         let directory = tempfile::tempdir().unwrap();
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let mut command = Command::new(std::env::current_exe().unwrap());
@@ -28,8 +32,8 @@ impl Broker {
             .arg(directory.path())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped());
-        if fail {
-            command.arg("--fail-start");
+        if let Some(option) = option {
+            command.arg(option);
         }
         let mut child = command.spawn().unwrap();
         let launch = child.stdin.take();
@@ -123,4 +127,59 @@ pub fn enter_user_namespace() {
     std::fs::write("/proc/self/setgroups", "deny\n").unwrap();
     std::fs::write("/proc/self/uid_map", format!("0 {uid} 1\n")).unwrap();
     std::fs::write("/proc/self/gid_map", format!("0 {gid} 1\n")).unwrap();
+}
+
+pub fn install_accounts(directory: &std::path::Path) {
+    // Replace the account files in a private mount namespace so these tests
+    // can still use the real /proc and devpts for process checks and PTYs.
+    assert_eq!(unsafe { libc::unshare(libc::CLONE_NEWNS) }, 0);
+    assert_eq!(
+        unsafe {
+            libc::mount(
+                std::ptr::null(),
+                c"/".as_ptr(),
+                std::ptr::null(),
+                libc::MS_REC | libc::MS_PRIVATE,
+                std::ptr::null(),
+            )
+        },
+        0
+    );
+    let passwd = directory.join("passwd");
+    std::fs::write(
+        &passwd,
+        format!("root:x:0:0::{}:/bin/sh\n", directory.display()),
+    )
+    .unwrap();
+    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    assert!(count >= 0);
+    let mut groups = vec![0; count as usize];
+    assert_eq!(
+        unsafe { libc::getgroups(count, groups.as_mut_ptr()) },
+        count
+    );
+    groups.push(0);
+    groups.sort_unstable();
+    groups.dedup();
+    let group = directory.join("group");
+    let content: String = groups
+        .iter()
+        .map(|gid| format!("g{gid}:x:{gid}:root\n"))
+        .collect();
+    std::fs::write(&group, content).unwrap();
+    for (source, destination) in [(passwd, c"/etc/passwd"), (group, c"/etc/group")] {
+        let source = std::ffi::CString::new(source.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(
+            unsafe {
+                libc::mount(
+                    source.as_ptr(),
+                    destination.as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_BIND,
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+    }
 }

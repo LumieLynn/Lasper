@@ -8,6 +8,7 @@ mod identity;
 mod preparation;
 mod process;
 mod readiness;
+mod session;
 mod stream;
 mod target;
 
@@ -19,5 +20,9 @@ pub use identity::{
 };
 pub use preparation::PreparedWorker;
 pub use readiness::{WorkerHello, WorkerReadiness, WorkerReadinessError};
+pub use session::{
+    BrokerSession, BrokerSessionError, SessionPhase, SessionSnapshot, SessionStartOptions,
+};
+pub use session::{CapturedStream, SessionExit, SessionOutput};
 pub use stream::{ReceivedControlFrame, UnixControlStream};
 pub use target::{MachineRegistration, MachineTarget, MachineTargetSource};
