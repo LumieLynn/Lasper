@@ -1,6 +1,6 @@
 use super::fixture::{
-    command, exit_report, final_exit, publish_ready, ready, reply, send_guest_bytes, Server,
-    BROKER, PREPARATION,
+    command, exit_report, final_exit, publish_ready, ready, reply, send_guest_bytes,
+    send_guest_fragment, Server, BROKER, PREPARATION,
 };
 use crate::control::{receive_guest_frame, send_guest_frame};
 use crate::session_clock::{advance_with_queued_frame, assert_expired, drive_io, snapshot};
@@ -119,6 +119,7 @@ async fn start_delivery_expiry_keeps_the_execution_report() {
 
 async fn expired_start(accepted: bool) {
     let (starting, started) = tokio::sync::oneshot::channel();
+    let (release_ack, ack_released) = std::sync::mpsc::channel();
     let (release, released) = std::sync::mpsc::channel();
     let (sent, queued) = std::sync::mpsc::channel();
     let server = Server::spawn(move |guest, request| {
@@ -136,8 +137,10 @@ async fn expired_start(accepted: bool) {
             frame.descriptors().len(),
         )
         .unwrap();
+        drop(frame);
+        starting.send(()).unwrap();
         if accepted {
-            drop(frame);
+            ack_released.recv_timeout(Duration::from_secs(3)).unwrap();
             let ack = StartAcceptedFrame::new(
                 start.request_id(),
                 PreparationControl::new(BROKER, PREPARATION),
@@ -145,7 +148,6 @@ async fn expired_start(accepted: bool) {
             let (header, length) = ack.encode_parts(&mut bytes).unwrap();
             send_guest_frame(&guest, header, &bytes[..length], &[]).unwrap();
         }
-        starting.send(()).unwrap();
         released.recv_timeout(Duration::from_secs(3)).unwrap();
         exit_report(
             &guest,
@@ -173,7 +175,10 @@ async fn expired_start(accepted: bool) {
         }
     })
     .await;
+    assert_eq!(state.borrow().phase(), SessionPhase::Starting);
     if accepted {
+        // Leave Start unpolled once the ack can arrive so its result stays uncollected.
+        release_ack.send(()).unwrap();
         snapshot(&mut state, |state| state.phase() == SessionPhase::Started).await;
     }
     advance_with_queued_frame(
@@ -238,7 +243,7 @@ async fn expired_frame(complete: bool) {
         let mut payload = [0; 4096];
         let (header, length) = exit.encode_parts(&mut payload).unwrap();
         let bytes = [header.encode().as_slice(), &payload[..length]].concat();
-        send_guest_bytes(&guest, &bytes[..1]);
+        send_guest_fragment(&guest, &bytes[..1]);
         fragment.send(()).unwrap();
         let keep = command(&guest, &request);
         assert_eq!(keep.kind(), PreparationControlKind::KeepPrepared);
@@ -255,10 +260,9 @@ async fn expired_frame(complete: bool) {
     tokio::time::pause();
     begin.send(()).unwrap();
     drive_io(received).await.unwrap();
-    tokio::task::yield_now().await;
-    // A Keep exchange after the fragment ensures its first byte has been
-    // processed before advancing across the independent frame deadline.
-    tokio::time::advance(Duration::from_secs(10)).await;
+    // Tokio rounds timers up to a millisecond, so exactly ten seconds can
+    // leave Keep pending while the paused clock waits for the peer.
+    tokio::time::advance(Duration::from_millis(10_001)).await;
     drive_io(renewal).await.unwrap();
     advance_with_queued_frame(Duration::from_millis(5001), release, queued).await;
     let failed = snapshot(&mut state, |state| state.phase() == SessionPhase::Failed).await;

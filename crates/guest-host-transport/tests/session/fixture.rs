@@ -255,3 +255,24 @@ pub(super) fn send_guest_bytes(guest: &GuestControlStream, mut bytes: &[u8]) {
     })
     .unwrap();
 }
+
+pub(super) fn send_guest_fragment(guest: &GuestControlStream, bytes: &[u8]) {
+    send_guest_bytes(guest, bytes);
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    // Unix socket buffers are released when the peer reads them. Wait for
+    // that so the host starts its frame timer before the test advances time.
+    loop {
+        let mut queued = 0i32;
+        // SAFETY: guest owns the socket and TIOCOUTQ writes one live int.
+        let result = unsafe { libc::ioctl(guest.as_raw_fd(), libc::TIOCOUTQ, &mut queued) };
+        assert_eq!(result, 0, "{}", std::io::Error::last_os_error());
+        if queued == 0 {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "host did not consume the frame fragment"
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
