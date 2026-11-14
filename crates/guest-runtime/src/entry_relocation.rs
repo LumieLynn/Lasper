@@ -13,8 +13,17 @@ struct Rela {
     addend: isize,
 }
 
-// No loader runs for this static PIE. Resolve linker-generated relative
-// relocations before Rust can use function pointers or static references.
+/// Relocates the static PIE and makes RELRO pages read-only.
+///
+/// No dynamic loader runs for this ELF, so relocation must finish before Rust
+/// uses function pointers or static references.
+///
+/// # Safety
+///
+/// `base` and `dynamic` must describe this process's trusted, mapped ELF image.
+/// All referenced metadata must be readable and relocation targets writable.
+/// `stack` must satisfy [`page_size`]'s requirements. Call once, before code
+/// uses relocated pointers or protected data.
 pub(super) unsafe extern "C" fn relocate(
     base: usize,
     dynamic: *const Dynamic,
@@ -85,8 +94,12 @@ struct ProgramHeader {
     alignment: u64,
 }
 
-// The kernel maps PT_LOAD but does not apply PT_GNU_RELRO for an ELF without
-// an interpreter. Once relocated, those pages must become read-only here.
+/// Applies RELRO protection that the kernel leaves to the ELF interpreter.
+///
+/// # Safety
+///
+/// `base` must describe the same trusted image as [`relocate`], with all relative
+/// relocations complete. `page_size` must be the kernel page size.
 unsafe fn protect_relro(base: usize, page_size: usize) {
     let header = base as *const ElfHeader;
     if unsafe { (*header).program_bytes as usize } != core::mem::size_of::<ProgramHeader>() {
@@ -105,7 +118,7 @@ unsafe fn protect_relro(base: usize, page_size: usize) {
                 super::exit_group(127);
             };
             // Rounding an unaligned end down would leave RELRO bytes writable.
-            // Check again here in case the artifact check was not run.
+            // This check is needed even when artifact verification was skipped.
             if !end.is_multiple_of(page_size) {
                 super::exit_group(127);
             }
@@ -118,6 +131,12 @@ unsafe fn protect_relro(base: usize, page_size: usize) {
     }
 }
 
+/// Reads `AT_PAGESZ` from the initial auxiliary vector.
+///
+/// # Safety
+///
+/// `stack` must point to a complete, readable Linux initial stack. The argc value,
+/// pointer-array terminators and auxiliary-vector terminator must match that layout.
 pub(super) unsafe fn page_size(stack: *const usize) -> usize {
     let mut cursor = unsafe { stack.add(*stack + 2) };
     while unsafe { *cursor } != 0 {

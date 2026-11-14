@@ -2,6 +2,7 @@ mod context;
 mod hello;
 mod supervisor;
 
+use crate::diagnostic::Diagnostic;
 use core::fmt::Write;
 use lasper_guest_protocol::BrokerId;
 
@@ -21,8 +22,7 @@ pub use supervisor::SupervisorStatus;
 pub const GUARDIAN_START_BYTE: u8 = 1;
 const HELLO_TIMEOUT_MS: u64 = 1000;
 
-/// The only transition from a broker child into a guardian. Inherited FD owners
-/// on the broker's stack must never be dropped after the whitelist is applied.
+/// Initializes a guardian child before any worker is created.
 pub struct GuardianBootstrap {
     control: i32,
     broker: i32,
@@ -31,22 +31,24 @@ pub struct GuardianBootstrap {
 }
 
 impl GuardianBootstrap {
-    /// Completes Go and Hello within one second of accept before calling entry.
-    /// Failure exits this child without creating a worker.
+    /// Waits for the broker's Go, completes Hello and calls `entry`.
+    ///
+    /// The deadline is one second after `accepted_at_ms`, measured in
+    /// `CLOCK_MONOTONIC` milliseconds. Failure exits without creating a worker.
     ///
     /// # Safety
     ///
-    /// Call only in the single-threaded fork child, which owns no children yet.
-    /// `control` must be a connected Unix stream; `broker` must be the read end
+    /// Call only in a single-threaded fork child with no children of its own.
+    /// Keep it single-threaded with exclusive child creation and reaping while
+    /// the context is live. Entry and worker callbacks must not unwind, and their
+    /// call chain must reserve `WORKER_STACK_BUDGET_BYTES` for worker setup and exec.
+    ///
+    /// `control` must be a connected Unix stream. `broker` must be the read end
     /// of this guardian's broker liveness pipe. They must be distinct FDs >= 3.
-    /// This call takes exclusive ownership of both: the caller and callbacks
-    /// must not use or close them through old raw FDs or Rust owners. Inherited
-    /// owners may remain on the abandoned caller stack but must never be dropped.
-    /// `accepted_at_ms` uses CLOCK_MONOTONIC milliseconds.
-    /// While the context is live, keep this process single-threaded and retain
-    /// exclusive child creation/reaping. Entry and worker callbacks must not
-    /// unwind or use/drop inherited FD owners. Their call chain must reserve
-    /// WORKER_STACK_BUDGET_BYTES for worker setup and exec.
+    /// This call takes exclusive ownership of both. The caller and callbacks
+    /// must not use or close them through old raw FDs or owners. Initialization
+    /// also closes unrelated inherited FDs, so their owners on the abandoned
+    /// caller stack must never be used or dropped.
     pub unsafe fn run(
         control: i32,
         broker: i32,
@@ -154,20 +156,5 @@ fn wait_for_start(
             Err(EINTR) => continue,
             result => result.context("wait for guardian startup gate")?,
         }
-    }
-}
-
-struct Diagnostic;
-
-impl core::fmt::Write for Diagnostic {
-    fn write_str(&mut self, text: &str) -> core::fmt::Result {
-        let mut bytes = text.as_bytes();
-        while !bytes.is_empty() {
-            match linux::write(2, bytes) {
-                Ok(0) | Err(_) => return Err(core::fmt::Error),
-                Ok(count) => bytes = &bytes[count..],
-            }
-        }
-        Ok(())
     }
 }

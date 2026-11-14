@@ -1,5 +1,5 @@
 use crate::linux::uapi::{file::F_DUPFD_CLOEXEC, nr, socket::SHUT_RDWR};
-use crate::syscall::{syscall1, syscall2, syscall3};
+use crate::syscall::{syscall1, syscall2, syscall3, syscall6};
 use core::ffi::c_void;
 use core::mem::{align_of, offset_of, size_of};
 
@@ -73,6 +73,22 @@ pub(crate) unsafe fn cmsg_data(header: *mut ControlMessageHeader) -> *mut u8 {
         header
             .cast::<u8>()
             .add(cmsg_align(size_of::<ControlMessageHeader>()))
+    }
+}
+
+pub(crate) fn send(fd: i32, bytes: &[u8], flags: usize) -> isize {
+    // SAFETY: bytes stays readable for the call. A connected socket needs no
+    // destination address, so the address pointer and length are both zero.
+    unsafe {
+        syscall6(
+            nr::SENDTO,
+            fd as usize,
+            bytes.as_ptr() as usize,
+            bytes.len(),
+            flags,
+            0,
+            0,
+        )
     }
 }
 

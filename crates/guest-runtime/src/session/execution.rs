@@ -9,7 +9,6 @@ use super::{WorkerFailure, WorkerStage};
 use crate::linux;
 
 const MAX_ENVIRONMENT_ENTRIES: usize = 10;
-const GUEST_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 pub(super) fn execute(
     account: &Account,
@@ -109,7 +108,7 @@ impl<'a> Environment<'a> {
         self.push("USER", account.username.as_str())?;
         self.push("LOGNAME", account.username.as_str())?;
         self.push("SHELL", account.shell.as_str())?;
-        self.push("PATH", GUEST_PATH)?;
+        self.push("PATH", crate::paths::EXEC_PATH)?;
         if let Some(terminal) = request.terminal() {
             self.push("TERM", terminal.term())?;
             if let Some(value) = terminal.colorterm() {

@@ -1,6 +1,7 @@
 mod listener;
 mod registry;
 
+use crate::diagnostic::Diagnostic;
 use core::ffi::CStr;
 use core::fmt::Write;
 use lasper_guest_protocol::BrokerId;
@@ -8,7 +9,7 @@ use lasper_guest_protocol::BrokerId;
 use crate::linux::children::visit_direct_children;
 use crate::linux::signals::{BlockedSignals, Signals};
 use crate::linux::uapi::{
-    errno::{EAGAIN, ECHILD, EINTR, EIO, ESRCH},
+    errno::{EAGAIN, ECHILD, EINTR, EIO, ESRCH, ETIMEDOUT},
     nr,
     random::GRND_NONBLOCK,
     signal::SIGKILL,
@@ -27,7 +28,7 @@ pub struct BrokerError {
     pub errno: i32,
 }
 
-trait BrokerResult<T> {
+pub(crate) trait BrokerResult<T> {
     fn at(self, operation: &'static str) -> Result<T, BrokerError>;
 }
 
@@ -37,18 +38,50 @@ impl<T> BrokerResult<T> for Result<T, i32> {
     }
 }
 
-/// Runs the guest-side listener and owns every guardian until wait completes.
+/// Runs the guest listener and owns its guardians until they are reaped.
+///
 /// The socket directory must already exist, be owned by this guest's root, and
 /// have mode 0700. A lock excludes another broker before a stale socket is removed.
 ///
 /// # Safety
+///
 /// Call from a single-threaded process with no children and exclusive child
-/// creation/reaping. The process must exit after this function returns: signal
-/// dispositions, the blocked mask and subreaper status are intentionally retained.
-/// Reserve WORKER_STACK_BUDGET_BYTES for the forked worker's call chain.
-/// Inherited FD owners on the caller stack must not be used or dropped after
-/// this call; startup prunes them. stderr is the launcher's diagnostic FD.
+/// creation and reaping. Reserve `WORKER_STACK_BUDGET_BYTES` for worker setup in
+/// addition to the live broker and guardian frames.
+///
+/// Initialization closes inherited FDs. Their owners on the caller's stack must
+/// not be used or dropped afterwards. The caller must exit when this returns
+/// because signal state and subreaper status are not restored.
 pub unsafe fn run(directory: &CStr) -> Result<(), BrokerError> {
+    unsafe { run_inner(directory, None) }
+}
+
+/// Holds the broker's endpoints for the wrapper startup handshake.
+///
+/// The broker binds its listener and sends Ready before the parent attempts
+/// `execve`. It waits for the exec-status result before accepting sessions.
+pub(crate) struct Startup {
+    /// Write end of the Ready pipe. The broker writes byte 1, then closes it.
+    pub(crate) ready: Descriptor,
+    /// Read end of the status socket. The parent sends a native-endian `i32` errno
+    /// on failure. Successful `execve` closes its sole writer through CLOEXEC.
+    pub(crate) exec_status: Descriptor,
+    /// Pidfd for the parent process, which becomes the payload after `execve`.
+    /// The broker checks it before accepting EOF as success and monitors it for exit.
+    pub(crate) parent: Descriptor,
+}
+
+/// Runs the broker with the wrapper's startup protocol.
+///
+/// # Safety
+///
+/// The caller must satisfy [`run`]'s requirements and supply the broker-side
+/// endpoints described by [`Startup`].
+pub(crate) unsafe fn run_wrapped(directory: &CStr, startup: Startup) -> Result<(), BrokerError> {
+    unsafe { run_inner(directory, Some(startup)) }
+}
+
+unsafe fn run_inner(directory: &CStr, startup: Option<Startup>) -> Result<(), BrokerError> {
     let blocked = BlockedSignals::block().at("block broker signals")?;
     standard_streams().at("initialize broker standard streams")?;
     let signals = blocked.finish().at("initialize broker signals")?;
@@ -74,8 +107,26 @@ pub unsafe fn run(directory: &CStr) -> Result<(), BrokerError> {
     let id = broker_id().at("generate broker ID")?;
     let listener = Listener::bind(directory).at("create broker listener")?;
     let [socket, directory, lock] = listener.descriptors();
-    linux::close_unrelated(&[socket, directory, lock, signals.raw()])
-        .at("close inherited broker descriptors")?;
+    let [ready, exec_status, parent] = startup.as_ref().map_or([-1; 3], |startup| {
+        [
+            startup.ready.raw(),
+            startup.exec_status.raw(),
+            startup.parent.raw(),
+        ]
+    });
+    let keep = [
+        socket,
+        directory,
+        lock,
+        signals.raw(),
+        ready,
+        exec_status,
+        parent,
+    ];
+    linux::close_unrelated(&keep).at("close inherited broker descriptors")?;
+    let parent = startup
+        .map(|startup| startup.handoff(&signals))
+        .transpose()?;
     Broker {
         listener: Some(listener),
         signals,
@@ -84,8 +135,79 @@ pub unsafe fn run(directory: &CStr) -> Result<(), BrokerError> {
         failure: None,
         has_orphans: false,
         signals_usable: true,
+        parent,
     }
     .drive()
+}
+
+impl Startup {
+    fn handoff(self, signals: &Signals) -> Result<Descriptor, BrokerError> {
+        self.ready.write_all(&[1]).at("report broker Ready")?;
+        drop(self.ready);
+        let deadline = linux::monotonic_ms()
+            .at("read handoff clock")?
+            .saturating_add(crate::wrapper::STARTUP_TIMEOUT_MS);
+        loop {
+            let remaining =
+                deadline.saturating_sub(linux::monotonic_ms().at("read handoff clock")?);
+            if remaining == 0 {
+                return Err(BrokerError {
+                    operation: "wait payload exec",
+                    errno: ETIMEDOUT,
+                });
+            }
+            let mut events = [
+                PollFd::new(self.exec_status.raw()),
+                PollFd::new(self.parent.raw()),
+                PollFd::new(signals.raw()),
+            ];
+            match linux::poll(&mut events, Some(remaining)) {
+                Ok(()) => {}
+                Err(EINTR) => continue,
+                Err(errno) => {
+                    return Err(BrokerError {
+                        operation: "poll payload handoff",
+                        errno,
+                    })
+                }
+            }
+            if events[1].ready() || events[2].ready() {
+                return Err(BrokerError {
+                    operation: "wrapper stopped before handoff",
+                    errno: EIO,
+                });
+            }
+            if events[0].ready() {
+                let mut error = [0; 4];
+                let count = self
+                    .exec_status
+                    .read(&mut error)
+                    .at("read payload exec status")?;
+                if count != 0 {
+                    let errno = i32::from_ne_bytes(error);
+                    return Err(BrokerError {
+                        operation: "payload exec failed",
+                        errno: if count == 4 && (1..=4095).contains(&errno) {
+                            errno
+                        } else {
+                            EIO
+                        },
+                    });
+                }
+                // Parent death also closes the channel. EOF indicates successful
+                // execve only if the pinned parent process is still alive.
+                let mut parent = [PollFd::new(self.parent.raw())];
+                linux::poll(&mut parent, Some(0)).at("check payload lifetime")?;
+                if parent[0].ready() {
+                    return Err(BrokerError {
+                        operation: "payload exited during handoff",
+                        errno: EIO,
+                    });
+                }
+                return Ok(self.parent);
+            }
+        }
+    }
 }
 
 fn standard_streams() -> Result<(), i32> {
@@ -107,6 +229,7 @@ struct Broker {
     failure: Option<BrokerError>,
     has_orphans: bool,
     signals_usable: bool,
+    parent: Option<Descriptor>,
 }
 
 impl Broker {
@@ -132,15 +255,18 @@ impl Broker {
                     }
                 }
             }
-            let mut events = [PollFd::new(-1), PollFd::new(-1)];
+            let mut events = [PollFd::new(-1), PollFd::new(-1), PollFd::new(-1)];
             if self.signals_usable {
                 events[0] = PollFd::new(self.signals.raw());
             }
             if let Some(listener) = &self.listener {
                 events[1] = PollFd::new(listener.raw());
             }
-            // A killed guardian can leave adopted children after its SIGCHLD
-            // has been consumed. Revisit them without waiting for another exit.
+            if let Some(parent) = &self.parent {
+                events[2] = PollFd::new(parent.raw());
+            }
+            // A guardian can leave adopted children after its SIGCHLD was consumed.
+            // Periodic polls keep cleanup moving without waiting for another exit.
             let retry = (self.has_orphans || !self.signals_usable).then_some(50);
             if let Err(errno) = linux::poll(&mut events, retry) {
                 if errno != EINTR {
@@ -155,6 +281,14 @@ impl Broker {
     }
 
     fn advance(&mut self) -> Result<(), BrokerError> {
+        if let Some(parent) = &self.parent {
+            let mut events = [PollFd::new(parent.raw())];
+            linux::poll(&mut events, Some(0)).at("check payload lifetime")?;
+            if events[0].ready() {
+                self.parent = None;
+                self.stop();
+            }
+        }
         for _ in 0..32 {
             if !self.signals_usable {
                 break;
@@ -328,18 +462,4 @@ fn broker_id() -> Result<BrokerId, i32> {
         filled += count;
     }
     Ok(BrokerId::new(bytes))
-}
-
-pub(crate) struct Diagnostic;
-impl core::fmt::Write for Diagnostic {
-    fn write_str(&mut self, text: &str) -> core::fmt::Result {
-        let mut bytes = text.as_bytes();
-        while !bytes.is_empty() {
-            match linux::write(2, bytes) {
-                Ok(0) | Err(_) => return Err(core::fmt::Error),
-                Ok(count) => bytes = &bytes[count..],
-            }
-        }
-        Ok(())
-    }
 }

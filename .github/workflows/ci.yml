@@ -30,6 +30,7 @@ jobs:
       - run: cargo clippy -p lasper-guest-host-transport --all-targets --locked -- -D warnings
       - run: cargo clippy -p lasper-guest-protocol --all-targets --locked -- -D warnings
       - run: cargo clippy -p lasper-guest-runtime --all-targets --locked -- -D warnings
+      - run: cargo clippy -p lasper-guest-test-client --all-targets --locked -- -D warnings
       - run: cargo clippy -p lasper-local-accounts --all-targets --locked -- -D warnings
 
   test:
@@ -44,6 +45,7 @@ jobs:
       - run: cargo test -p lasper-guest-host-transport --all-targets --locked
       - run: cargo test -p lasper-guest-protocol --all-targets --locked
       - run: cargo test -p lasper-guest-runtime --all-targets --locked
+      - run: cargo test -p lasper-guest-test-client --all-targets --locked
       - run: cargo test -p lasper-local-accounts --all-targets --locked
 
   guest-runtime:
@@ -123,6 +125,11 @@ jobs:
         run: |
           cargo test -p lasper-guest-runtime --test broker --locked -- --ignored --binary target/${{ matrix.target }}/guest-runtime/lasper-guest-runtime
           cargo test -p lasper-guest-runtime --test broker --locked -- --sudo
+
+      - name: Verify wrapper handoff and PID 1 entry
+        run: |
+          cargo test -p lasper-guest-runtime --test wrapper --locked -- --binary target/${{ matrix.target }}/guest-runtime/lasper-guest-runtime
+          cargo test -p lasper-guest-runtime --test wrapper --locked -- --sudo --pid1 --binary target/${{ matrix.target }}/guest-runtime/lasper-guest-runtime
 
   audit:
     name: dependency audit

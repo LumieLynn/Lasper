@@ -2,6 +2,7 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+mod cli;
 mod entry_memory;
 mod entry_relocation;
 mod entry_stack;
@@ -15,6 +16,7 @@ use uapi::{errno::EINTR, nr};
 use core::arch::{asm, global_asm};
 use core::ffi::CStr;
 use core::panic::PanicInfo;
+use lasper_guest_runtime::paths;
 
 #[cfg(not(target_os = "linux"))]
 compile_error!("the Lasper guest runtime is Linux-only");
@@ -22,12 +24,7 @@ compile_error!("the Lasper guest runtime is Linux-only");
 #[cfg(panic = "unwind")]
 compile_error!("build the Lasper guest runtime with the guest-runtime profile");
 
-const IDENTIFY_ARGUMENT: &[u8] = b"--identify";
-const BROKER_ARGUMENT: &[u8] = b"--broker";
-const HELP_ARGUMENT: &[u8] = b"--help";
-const USAGE: &[u8] = b"Usage: lasper-guest-runtime --identify | --broker DIRECTORY\n";
-
-// Linux ELF entry ABI: sp points to argc followed by the argv pointers.
+// The initial stack contains argc, argv, envp and the auxiliary vector.
 #[cfg(target_arch = "x86_64")]
 global_asm!(
     ".global _start",
@@ -70,42 +67,107 @@ fn panic(_: &PanicInfo<'_>) -> ! {
     exit_group(127)
 }
 
+/// Dispatches the invocation supplied on the Linux process entry stack.
+///
+/// # Safety
+///
+/// `initial_stack` must retain the complete kernel-provided layout, including
+/// readable argument strings and the terminated auxiliary vector. Its argv slots
+/// must be writable. Relocations and RELRO protection must already be complete.
+/// Call only from the single-threaded ELF entry before any child is created.
 #[no_mangle]
 unsafe extern "C" fn runtime_entry(initial_stack: *const usize) -> ! {
     let argc = unsafe { *initial_stack };
+    let argv = unsafe { initial_stack.add(1) as *mut *const core::ffi::c_char };
+    let envp = unsafe { argv.add(argc + 1) as *const *const core::ffi::c_char };
+    let page_size = unsafe { entry_relocation::page_size(initial_stack) };
+    // Init entry detection precedes flag parsing so arguments such as --help
+    // reach the guest init.
+    if argc > 0
+        && paths::INIT_CANDIDATES
+            .iter()
+            .any(|path| unsafe { c_string_equals((*argv).cast(), path.to_bytes()) })
+    {
+        if unsafe { syscall::syscall1(nr::GETPID, 0) } != 1 {
+            let _ = write_all(
+                2,
+                b"lasper guest runtime: automatic init wrapper requires PID 1\n",
+            );
+            exit_group(64);
+        }
+        let init = paths::ORIGINAL_INIT.as_ptr();
+        // BusyBox chooses its init applet from argv[0].
+        unsafe { *argv = init };
+        let invocation = entry_stack::Invocation::Wrapper {
+            executable: init,
+            argv,
+            envp,
+        };
+        unsafe { entry_stack::run(&invocation, page_size) };
+    }
+    if argc >= 2 && unsafe { c_string_equals((*argv.add(1)).cast(), cli::WRAP_COMMAND) } {
+        if argc == 3 && unsafe { is_help((*argv.add(2)).cast()) } {
+            exit_group(if write_all(1, cli::WRAP_HELP) { 0 } else { 74 });
+        }
+        if argc >= 4 && unsafe { c_string_equals((*argv.add(2)).cast(), b"--") } {
+            let payload = unsafe { argv.add(3) };
+            let invocation = entry_stack::Invocation::Wrapper {
+                executable: unsafe { *payload },
+                argv: payload,
+                envp,
+            };
+            unsafe { entry_stack::run(&invocation, page_size) };
+        }
+        let _ = write_all(2, cli::WRAP_ERROR);
+        exit_group(64);
+    }
     if argc == 3 {
         let argument = unsafe { *initial_stack.add(2) as *const u8 };
-        if unsafe { c_string_equals(argument, BROKER_ARGUMENT) } {
+        if unsafe { c_string_equals(argument, cli::BROKER_ARGUMENT) } {
             let directory =
                 unsafe { CStr::from_ptr(*initial_stack.add(3) as *const core::ffi::c_char) };
-            let page_size = unsafe { entry_relocation::page_size(initial_stack) };
-            unsafe { entry_stack::run(directory.as_ptr(), page_size) };
+            unsafe {
+                entry_stack::run(
+                    &entry_stack::Invocation::Broker(directory.as_ptr()),
+                    page_size,
+                )
+            };
         }
     }
     if argc == 2 {
         let argument = unsafe { *initial_stack.add(2) as *const u8 };
-        if unsafe { c_string_equals(argument, IDENTIFY_ARGUMENT) } {
+        if unsafe { c_string_equals(argument, cli::IDENTIFY_ARGUMENT) } {
             let identity = lasper_guest_runtime::identity_frame();
             if write_all(1, &identity) {
                 exit_group(0);
             }
             exit_group(74);
         }
-        if unsafe { c_string_equals(argument, HELP_ARGUMENT) } {
-            if write_all(1, USAGE) {
+        if unsafe { is_help(argument) } {
+            if write_all(1, cli::HELP) {
                 exit_group(0);
             }
             exit_group(74);
         }
     }
 
-    let _ = write_all(2, USAGE);
+    let _ = write_all(2, cli::ERROR);
     exit_group(64)
 }
 
 /// # Safety
 ///
-/// `value` must point to a readable, NUL-terminated process argument.
+/// `value` must point to a readable NUL-terminated string within one allocation.
+unsafe fn is_help(value: *const u8) -> bool {
+    unsafe {
+        c_string_equals(value, cli::HELP_ARGUMENT)
+            || c_string_equals(value, cli::HELP_SHORT_ARGUMENT)
+    }
+}
+
+/// # Safety
+///
+/// `value` must point to a readable NUL-terminated string within one allocation.
 unsafe fn c_string_equals(value: *const u8, expected: &[u8]) -> bool {
     let mut index = 0;
     while index < expected.len() {
@@ -116,17 +178,6 @@ unsafe fn c_string_equals(value: *const u8, expected: &[u8]) -> bool {
         index += 1;
     }
     unsafe { *value.add(expected.len()) == 0 }
-}
-
-struct Diagnostic;
-impl core::fmt::Write for Diagnostic {
-    fn write_str(&mut self, text: &str) -> core::fmt::Result {
-        if write_all(2, text.as_bytes()) {
-            Ok(())
-        } else {
-            Err(core::fmt::Error)
-        }
-    }
 }
 
 fn write_all(fd: usize, mut bytes: &[u8]) -> bool {

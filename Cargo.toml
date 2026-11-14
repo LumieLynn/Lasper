@@ -10,11 +10,15 @@ members = [
     "crates/guest-host-transport",
     "crates/guest-protocol",
     "crates/guest-runtime",
+    "crates/guest-test-client",
     "crates/local-accounts",
     "crates/rootfs-path",
 ]
 default-members = ["."]
 resolver = "2"
+
+[workspace.dependencies]
+clap = { version = "4.6", default-features = false, features = ["std", "help", "usage", "error-context"] }
 
 [[bin]]
 name = "lasper"

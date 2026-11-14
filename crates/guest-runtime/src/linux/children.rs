@@ -1,3 +1,4 @@
+use crate::paths::PROC_ROOT;
 use core::ffi::CStr;
 use core::fmt::{self, Write};
 
@@ -10,7 +11,8 @@ pub(crate) fn visit_direct_children(
     mut visit: impl FnMut(i32) -> Result<(), i32>,
 ) -> Result<(), i32> {
     let mut path = ProcPath::new();
-    write!(path, "/proc/self/task/{tid}/children").map_err(|_| EIO)?;
+    let proc_root = PROC_ROOT.to_str().map_err(|_| EIO)?;
+    write!(path, "{proc_root}/self/task/{tid}/children").map_err(|_| EIO)?;
     match linux::open(path.as_c_str(), false) {
         Ok(file) => read_children(&file, &mut visit),
         Err(2 | 20) => scan_children(parent, visit),
@@ -54,7 +56,8 @@ fn read_children(
 }
 
 fn scan_children(parent: i32, mut visit: impl FnMut(i32) -> Result<(), i32>) -> Result<(), i32> {
-    let directory = linux::open(c"/proc", true)?;
+    let directory = linux::open(PROC_ROOT, true)?;
+    let proc_root = PROC_ROOT.to_str().map_err(|_| EIO)?;
     let mut entries = [0; 4096];
     loop {
         let length = linux::read_directory(&directory, &mut entries)?;
@@ -66,7 +69,7 @@ fn scan_children(parent: i32, mut visit: impl FnMut(i32) -> Result<(), i32>) -> 
                 return Ok(());
             };
             let mut path = ProcPath::new();
-            write!(path, "/proc/{pid}/stat").map_err(|_| EIO)?;
+            write!(path, "{proc_root}/{pid}/stat").map_err(|_| EIO)?;
             let file = match linux::open(path.as_c_str(), false) {
                 Ok(file) => file,
                 Err(2 | ESRCH) => return Ok(()),

@@ -234,7 +234,11 @@ pub fn initialize_guest(privileged: bool) {
 }
 
 pub fn initialize_guest_binary(binary: &str) {
-    initialize_guest_inner(false, Some(binary));
+    initialize_guest_binary_as(binary, false);
+}
+
+pub fn initialize_guest_binary_as(binary: &str, privileged: bool) {
+    initialize_guest_inner(privileged, Some(binary));
 }
 
 fn initialize_guest_inner(privileged: bool, binary: Option<&str>) {

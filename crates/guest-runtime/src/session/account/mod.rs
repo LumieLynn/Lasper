@@ -39,10 +39,10 @@ impl Account {
     }
 
     pub(super) fn load(&mut self, user: &str, buffer: &mut [u8]) -> Result<(), WorkerFailure> {
-        let length = files::read(c"/etc/passwd", buffer)
+        let length = files::read(crate::paths::PASSWD, buffer)
             .map_err(|errno| WorkerFailure::new(WorkerStage::Account, errno))?;
         self.read_passwd(user, &buffer[..length])?;
-        match files::read(c"/etc/group", buffer) {
+        match files::read(crate::paths::GROUP, buffer) {
             Ok(length) => self.read_groups(&buffer[..length])?,
             // Minimal rootfs images can omit the group database. Credential
             // setup must still replace inherited groups with the primary GID.

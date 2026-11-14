@@ -7,15 +7,19 @@ compile_error!("the Lasper guest runtime is Linux-only");
 use lasper_guest_protocol::{Architecture, RuntimeIdentity};
 
 pub mod broker;
+#[doc(hidden)]
+pub mod diagnostic;
 pub mod identity;
 mod linux;
 pub use linux::signals::SupervisorSignal;
 mod memory;
+pub mod paths;
 pub mod readiness;
 pub mod session;
 mod socket;
 mod syscall;
 pub mod transport;
+pub mod wrapper;
 
 #[cfg(target_arch = "x86_64")]
 const RUNTIME_ARCHITECTURE: Architecture = Architecture::X86_64;

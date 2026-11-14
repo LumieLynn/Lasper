@@ -15,9 +15,12 @@ pub(crate) mod errno {
     pub(crate) const EEXIST: i32 = 17;
     pub(crate) const EINVAL: i32 = 22;
     pub(crate) const EFBIG: i32 = 27;
+    pub(crate) const ENAMETOOLONG: i32 = 36;
+    pub(crate) const ETIMEDOUT: i32 = 110;
 }
 
 pub(crate) mod file {
+    pub(crate) const PATH_MAX: usize = 4096;
     pub(crate) const AT_FDCWD: usize = -100isize as usize;
     pub(crate) const AT_SYMLINK_NOFOLLOW: usize = 0x100;
     pub(crate) const AT_EMPTY_PATH: usize = 0x1000;
@@ -148,6 +151,7 @@ pub(crate) mod nr {
     pub(crate) const UNLINKAT: usize = 263;
     pub(crate) const FCHMODAT: usize = 268;
     pub(crate) const ACCEPT4: usize = 288;
+    pub(crate) const SENDTO: usize = 44;
     pub(crate) const SENDMSG: usize = 46;
     pub(crate) const RECVMSG: usize = 47;
     pub(crate) const SHUTDOWN: usize = 48;
@@ -175,6 +179,7 @@ pub(crate) mod nr {
     pub(crate) const EXIT_GROUP: usize = 231;
     pub(crate) const WAITID: usize = 247;
     pub(crate) const OPENAT: usize = 257;
+    pub(crate) const MKDIRAT: usize = 258;
     pub(crate) const FACCESSAT: usize = 269;
     pub(crate) const PPOLL: usize = 271;
     pub(crate) const SIGNALFD4: usize = 289;
@@ -183,6 +188,7 @@ pub(crate) mod nr {
     pub(crate) const GETRANDOM: usize = 318;
     pub(crate) const STATX: usize = 332;
     pub(crate) const PIDFD_OPEN: usize = 434;
+    pub(crate) const PIDFD_SEND_SIGNAL: usize = 424;
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -203,6 +209,7 @@ pub(crate) mod nr {
     pub(crate) const FCHMOD: usize = 52;
     pub(crate) const FCHOWN: usize = 55;
     pub(crate) const OPENAT: usize = 56;
+    pub(crate) const MKDIRAT: usize = 34;
     pub(crate) const CLOSE: usize = 57;
     pub(crate) const PIPE2: usize = 59;
     pub(crate) const GETDENTS64: usize = 61;
@@ -227,6 +234,7 @@ pub(crate) mod nr {
     pub(crate) const GETPID: usize = 172;
     pub(crate) const GETTID: usize = 178;
     pub(crate) const SOCKETPAIR: usize = 199;
+    pub(crate) const SENDTO: usize = 206;
     pub(crate) const SETSOCKOPT: usize = 208;
     pub(crate) const SHUTDOWN: usize = 210;
     pub(crate) const SENDMSG: usize = 211;
@@ -241,4 +249,5 @@ pub(crate) mod nr {
     pub(crate) const GETRANDOM: usize = 278;
     pub(crate) const STATX: usize = 291;
     pub(crate) const PIDFD_OPEN: usize = 434;
+    pub(crate) const PIDFD_SEND_SIGNAL: usize = 424;
 }

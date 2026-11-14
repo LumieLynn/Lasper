@@ -29,6 +29,7 @@ use crate::linux::uapi::{
     terminal::{TIOCGPTPEER, TIOCSCTTY, TIOCSPGRP, TIOCSPTLCK, TIOCSWINSZ},
     time::CLOCK_MONOTONIC,
 };
+use crate::paths;
 use crate::socket::close;
 use crate::syscall::{syscall1, syscall2, syscall3, syscall4, syscall5};
 use lasper_guest_protocol::TerminalSize;
@@ -41,7 +42,8 @@ impl Descriptor {
         if fd >= 3 {
             return Ok(Self(fd));
         }
-        // Keep private channels out of stdin/stdout/stderr before child setup.
+        // Private descriptors stay out of stdin/stdout/stderr so child stdio
+        // setup cannot overwrite them.
         let duplicate = unsafe { syscall3(nr::FCNTL, fd as usize, F_DUPFD_CLOEXEC, 3) };
         let _ = close(fd);
         result_or_errno(duplicate).map(|fd| Self(fd as i32))
@@ -147,7 +149,8 @@ impl Pipe {
     }
 }
 
-pub(crate) fn identity_pair() -> Result<(Descriptor, Descriptor), i32> {
+/// Creates connected CLOEXEC endpoints without enabling credential delivery.
+pub(crate) fn seqpacket_pair() -> Result<(Descriptor, Descriptor), i32> {
     let mut fds = [-1i32; 2];
     // SAFETY: socketpair initializes two FD slots; SOCK_CLOEXEC applies to both.
     result_or_errno(unsafe {
@@ -159,9 +162,14 @@ pub(crate) fn identity_pair() -> Result<(Descriptor, Descriptor), i32> {
             fds.as_mut_ptr() as usize,
         )
     })?;
-    let parent = Descriptor::adopt(fds[0] as isize);
-    let child = Descriptor::adopt(fds[1] as isize);
-    let (parent, child) = (parent?, child?);
+    let first = Descriptor::adopt(fds[0] as isize);
+    let second = Descriptor::adopt(fds[1] as isize);
+    Ok((first?, second?))
+}
+
+/// Returns `(receiver, sender)`, with `SO_PASSCRED` enabled only on the receiver.
+pub(crate) fn identity_pair() -> Result<(Descriptor, Descriptor), i32> {
+    let (parent, child) = seqpacket_pair()?;
     let enabled = 1i32;
     // SAFETY: SO_PASSCRED reads this one integer during the call.
     result_or_errno(unsafe {
@@ -188,7 +196,7 @@ pub(crate) fn null_device() -> Result<Descriptor, i32> {
         syscall4(
             nr::OPENAT,
             AT_FDCWD,
-            c"/dev/null".as_ptr() as usize,
+            paths::NULL_DEVICE.as_ptr() as usize,
             O_CLOEXEC | O_RDWR,
             0,
         )
@@ -206,7 +214,7 @@ impl Terminal {
             syscall4(
                 nr::OPENAT,
                 AT_FDCWD,
-                c"/dev/ptmx".as_ptr() as usize,
+                paths::PTY_MULTIPLEXER.as_ptr() as usize,
                 O_RDWR | O_NOCTTY | O_CLOEXEC,
                 0,
             )
@@ -622,7 +630,7 @@ pub(crate) fn parse_pid(bytes: &[u8]) -> Option<i32> {
 }
 
 pub(crate) fn close_unrelated(retained: &[i32]) -> Result<(), i32> {
-    let directory = open(c"/proc/self/fd", true)?;
+    let directory = open(paths::PROC_SELF_FD, true)?;
     let mut bytes = [0; 4096];
     loop {
         let length = read_directory(&directory, &mut bytes)?;

@@ -98,10 +98,13 @@ if [[ -n "${run_binary}" ]]; then
   fi
   "${binary}" --identify | cargo run --quiet --locked \
     -p lasper-guest-protocol --example verify_identity -- "${target}"
-  if [[ "$("${binary}" --help)" != "Usage: lasper-guest-runtime --identify | --broker DIRECTORY" ]]; then
-    echo "Guest runtime returned an unexpected help response" >&2
-    exit 1
-  fi
+  help=$("${binary}" --help)
+  for expected in 'Usage:' 'Commands:' 'Options:' '--identify' '--broker' 'wrap'; do
+    if ! grep -Fq -- "${expected}" <<<"${help}"; then
+      echo "Guest runtime help is missing ${expected}" >&2
+      exit 1
+    fi
+  done
   if "${binary}" --invalid >/dev/null 2>&1; then
     status=0
   else

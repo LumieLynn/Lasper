@@ -13,10 +13,9 @@ use crate::linux::uapi::{
     socket::{AF_UNIX, SOCK_STREAM},
 };
 use crate::linux::{result_or_errno, Descriptor};
+use crate::paths::{BROKER_LOCK_NAME, BROKER_SOCKET_NAME, PROC_SELF_FD};
 use crate::syscall::{syscall1, syscall2, syscall3, syscall4};
 
-const SOCKET_NAME: &CStr = c"guest-exec.sock";
-const LOCK_NAME: &CStr = c"broker.lock";
 const LOCK_EXCLUSIVE_NONBLOCKING: usize = 2 | 4;
 
 pub(super) struct Listener {
@@ -28,8 +27,8 @@ pub(super) struct Listener {
 
 impl Listener {
     pub(super) fn bind(path: &CStr) -> Result<Self, i32> {
-        // The private lock and socket need owner access regardless of the
-        // launcher's mask. Restore it before any guardian can be forked.
+        // The lock and socket need owner access regardless of the caller's umask.
+        // The original mask is restored before any guardian is forked.
         let old_mask = result_or_errno(unsafe { syscall1(nr::UMASK, 0o077) })?;
         let listener = Self::bind_private(path);
         result_or_errno(unsafe { syscall1(nr::UMASK, old_mask) })?;
@@ -37,8 +36,8 @@ impl Listener {
     }
 
     fn bind_private(path: &CStr) -> Result<Self, i32> {
-        // Pin the private directory so a rename cannot redirect later writes.
-        // SAFETY: The syscall borrows a live path and returns a fresh owned FD.
+        // The open fd keeps later socket operations tied to this directory if
+        // its pathname changes.
         let directory = Descriptor::adopt(unsafe {
             syscall4(
                 nr::OPENAT,
@@ -52,12 +51,12 @@ impl Listener {
         if stat.mode & S_IFMT != S_IFDIR || stat.mode & 0o7777 != 0o700 || stat.uid != 0 {
             return Err(EACCES);
         }
-        // SAFETY: directory remains open; LOCK_NAME is NUL-terminated.
+        // SAFETY: directory remains open; BROKER_LOCK_NAME is NUL-terminated.
         let lock = Descriptor::adopt(unsafe {
             syscall4(
                 nr::OPENAT,
                 directory.raw() as usize,
-                LOCK_NAME.as_ptr() as usize,
+                BROKER_LOCK_NAME.as_ptr() as usize,
                 O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK,
                 0o600,
             )
@@ -73,8 +72,8 @@ impl Listener {
         result_or_errno(unsafe {
             syscall2(nr::FLOCK, lock.raw() as usize, LOCK_EXCLUSIVE_NONBLOCKING)
         })?;
-        // Only the broker holding this directory's persistent lock may remove
-        // a stale endpoint. The lock file itself is never unlinked.
+        // Only the lock holder may remove a stale socket, otherwise startup could
+        // unlink another broker's listener.
         match stat_entry(&directory) {
             Ok(stat) if stat.mode & S_IFMT == S_IFSOCK => unlink(&directory)?,
             Ok(_) => return Err(EINVAL),
@@ -105,7 +104,7 @@ impl Listener {
             syscall4(
                 nr::FCHMODAT,
                 listener.directory.raw() as usize,
-                SOCKET_NAME.as_ptr() as usize,
+                BROKER_SOCKET_NAME.as_ptr() as usize,
                 0o600,
                 0,
             )
@@ -130,8 +129,8 @@ impl Listener {
 
     pub(super) fn accept(&self) -> Result<Descriptor, i32> {
         loop {
-            // No peer address is needed; host authorization is performed by the
-            // elevated client, not by interpreting mapped peer UID 0 here.
+            // Host authorization is enforced by the elevated client. This
+            // listener relies on the socket's guest-root-only permissions.
             let result = unsafe {
                 syscall4(
                     nr::ACCEPT4,
@@ -150,7 +149,7 @@ impl Listener {
 
 impl Drop for Listener {
     fn drop(&mut self) {
-        // Do not remove a replacement someone installed while we were running.
+        // This listener only owns the socket inode it created.
         if stat_entry(&self.directory)
             .is_ok_and(|stat| stat.inode == self.inode && stat.mode & S_IFMT == S_IFSOCK)
         {
@@ -160,7 +159,7 @@ impl Drop for Listener {
 }
 
 fn stat_entry(directory: &Descriptor) -> Result<Statx, i32> {
-    filesystem::stat_at(directory, SOCKET_NAME)
+    filesystem::stat_at(directory, BROKER_SOCKET_NAME)
 }
 
 fn unlink(directory: &Descriptor) -> Result<(), i32> {
@@ -168,7 +167,7 @@ fn unlink(directory: &Descriptor) -> Result<(), i32> {
         syscall3(
             nr::UNLINKAT,
             directory.raw() as usize,
-            SOCKET_NAME.as_ptr() as usize,
+            BROKER_SOCKET_NAME.as_ptr() as usize,
             0,
         )
     })
@@ -190,7 +189,11 @@ impl Address {
             bytes: &mut value.path,
             length: 0,
         };
-        write!(path, "/proc/self/fd/{directory}/guest-exec.sock").map_err(|_| EINVAL)?;
+        let proc_fd = PROC_SELF_FD.to_str().map_err(|_| EINVAL)?;
+        let socket = BROKER_SOCKET_NAME.to_str().map_err(|_| EINVAL)?;
+        // bind cannot take a directory fd. The procfs path keeps socket creation
+        // tied to the open directory if its pathname changes.
+        write!(path, "{proc_fd}/{directory}/{socket}").map_err(|_| EINVAL)?;
         Ok(value)
     }
     fn length(&self) -> usize {
