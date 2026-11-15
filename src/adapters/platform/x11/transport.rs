@@ -566,7 +566,7 @@ mod tests {
     fn pathname_address_keeps_filesystem_nul_termination() {
         let (sockaddr, length) = sockaddr_for(Path::new("/tmp/.X11-unix/X0")).unwrap();
         assert_eq!(sockaddr.sun_family, libc::AF_UNIX as libc::sa_family_t);
-        assert_eq!(sockaddr.sun_path[0], '/' as libc::c_char);
+        assert_eq!(i32::from(sockaddr.sun_path[0]), i32::from(b'/'));
         let path = b"/tmp/.X11-unix/X0";
         assert_eq!(sockaddr.sun_path[path.len()], 0);
         assert_eq!(

@@ -82,8 +82,8 @@ async fn a_starting_write_failure_retains_the_queued_final_exit() {
         reply(&guest, recheck, 45_000);
         released.recv_timeout(Duration::from_secs(3)).unwrap();
         final_exit(&guest, &request, ExitReason::WorkerExitedBeforeStart);
-        // SAFETY: only the guest's receiving half is closed; its reply and
-        // Exit remain queued for the host while the Start write fails.
+        // SAFETY: SHUT_RD rejects Start without discarding the queued Exit
+        // on the sending half. The guest retains ownership of the socket.
         assert_eq!(
             unsafe { libc::shutdown(guest.as_raw_fd(), libc::SHUT_RD) },
             0
