@@ -5,7 +5,9 @@ use super::fixture::{
 use crate::control::{receive_guest_frame, send_guest_frame};
 use crate::session_clock::{advance_with_queued_frame, assert_expired, drive_io, snapshot};
 use crate::worker::TestWorker;
-use lasper_guest_host_transport::{BrokerSessionError, SessionPhase, SessionStartOptions};
+use lasper_guest_host_transport::{
+    BrokerSessionError, SessionPhase, SessionStartOptions, StartOutcome,
+};
 use lasper_guest_protocol::{
     CapturedOutput, CleanupStatus, ExecutionStatus, ExitFrame, ExitReason, ExitReport, ExitStatus,
     OutputStream, PreparationControl, PreparationControlKind, StartAcceptedFrame, StartFrame,
@@ -179,7 +181,10 @@ async fn expired_start(accepted: bool) {
     if accepted {
         // Leave Start unpolled once the ack can arrive so its result stays uncollected.
         release_ack.send(()).unwrap();
-        snapshot(&mut state, |state| state.phase() == SessionPhase::Started).await;
+        snapshot(&mut state, |state| {
+            state.phase() == SessionPhase::StartAccepted
+        })
+        .await;
     }
     advance_with_queued_frame(
         Duration::from_millis(if accepted { 15_001 } else { 5001 }),
@@ -191,13 +196,13 @@ async fn expired_start(accepted: bool) {
     if accepted {
         assert_expired(&failed);
     } else {
-        assert!(
-            matches!(drive_io(&mut start).await, Err(BrokerSessionError::StartOutcomeUnknown(cause)) if matches!(cause.as_ref(), BrokerSessionError::Deadline))
-        );
         assert!(matches!(
-            failed.error(),
-            Some(BrokerSessionError::StartOutcomeUnknown(_))
+            drive_io(&mut start).await,
+            Ok(StartOutcome::Unknown {
+                cause: BrokerSessionError::Deadline
+            })
         ));
+        assert!(matches!(failed.error(), Some(BrokerSessionError::Deadline)));
     }
     drop(start);
     let exit = failed.exit().unwrap();

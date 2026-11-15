@@ -1,9 +1,12 @@
 mod support;
 
-use lasper_guest_host_transport::UnixControlStream;
+use lasper_guest_host_transport::{
+    HandshakeError, UnixControlStream, WorkerHello, WorkerReadinessError,
+};
 use lasper_guest_protocol::{
-    BrokerId, ControlFrameHeader, ControlLimits, FeatureSet, HelloRequest, HelloResponse,
-    MessageKind, ProtocolVersion, CONTROL_FRAME_HEADER_BYTES,
+    BrokerId, ControlFrameHeader, ControlLimits, EnforcedControlLimits, FeatureSet,
+    HelloNegotiationError, HelloRequest, HelloResponse, MessageKind, ProtocolVersion,
+    CONTROL_FRAME_HEADER_BYTES,
 };
 use lasper_guest_runtime::transport::GuestControlStream;
 use std::fs::File;
@@ -13,7 +16,7 @@ use std::os::fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::net::UnixStream as StdUnixStream;
 use std::task::Poll;
 use support::control::{receive_guest_frame, send_guest_frame};
-use support::handshake::{current_limits, establish_guest, establish_host, raw_stream_pair};
+use support::handshake::{establish_guest, establish_host, raw_stream_pair};
 use tokio::net::UnixStream;
 
 #[path = "support/ancillary.rs"]
@@ -22,6 +25,265 @@ use ancillary::send_with_rights;
 
 fn header(kind: MessageKind, payload: &[u8], descriptor_count: u16) -> ControlFrameHeader {
     ControlFrameHeader::new(kind, 17, payload.len() as u32, descriptor_count).unwrap()
+}
+
+fn current_limits() -> EnforcedControlLimits {
+    HelloRequest::new(FeatureSet::EMPTY, ControlLimits::CURRENT)
+        .unwrap()
+        .negotiate(
+            lasper_guest_protocol::ProtocolVersion::CURRENT,
+            HelloResponse::new(
+                FeatureSet::EMPTY,
+                BrokerId::new([0x5a; 16]),
+                ControlLimits::CURRENT,
+            )
+            .unwrap(),
+        )
+        .unwrap()
+}
+
+fn write_hello_response(peer: &mut StdUnixStream) {
+    let response = HelloResponse::new(
+        FeatureSet::EMPTY,
+        BrokerId::new([0x5a; 16]),
+        ControlLimits::CURRENT,
+    )
+    .unwrap();
+    write_hello_frame(peer, response);
+}
+
+fn write_hello_frame(peer: &mut StdUnixStream, response: HelloResponse) {
+    let mut payload = [0; lasper_guest_protocol::HELLO_PAYLOAD_BUFFER_BYTES];
+    let length = response.encode_payload(&mut payload).unwrap();
+    let header = ControlFrameHeader::new(MessageKind::HelloResponse, 17, length as u32, 0).unwrap();
+    peer.write_all(&header.encode()).unwrap();
+    peer.write_all(&payload[..length]).unwrap();
+}
+
+#[tokio::test]
+async fn handshake_enforces_both_offers_from_its_own_exchange() {
+    for (local, remote) in [(512, 1024), (1024, 512)] {
+        let (mut host, mut peer) = raw_stream_pair();
+        let request =
+            HelloRequest::new(FeatureSet::EMPTY, ControlLimits::new(local, 0).unwrap()).unwrap();
+        let response = HelloResponse::new(
+            FeatureSet::EMPTY,
+            BrokerId::new([0x5a; 16]),
+            ControlLimits::new(remote, 0).unwrap(),
+        )
+        .unwrap();
+        let mut bytes = [0; lasper_guest_protocol::HELLO_PAYLOAD_BUFFER_BYTES];
+        let length = response.encode_payload(&mut bytes).unwrap();
+        peer.write_all(&header(HelloResponse::KIND, &bytes[..length], 0).encode())
+            .unwrap();
+        peer.write_all(&bytes[..length]).unwrap();
+        let negotiated = host.handshake(17, request).await.unwrap();
+        assert_eq!(negotiated.request(), request);
+        assert_eq!(negotiated.response(), response);
+        assert_eq!(
+            negotiated.limits().get(),
+            ControlLimits::new(local.min(remote), 0).unwrap()
+        );
+
+        let error = host.handshake(18, request).await.unwrap_err();
+        assert!(
+            matches!(error, HandshakeError::Transport(error) if error.kind() == io::ErrorKind::InvalidInput)
+        );
+        assert!(host.can_continue());
+        let oversized = vec![
+            0;
+            negotiated.limits().get().max_control_frame_bytes() as usize
+                - CONTROL_FRAME_HEADER_BYTES
+                + 1
+        ];
+        let error = host
+            .send_frame(
+                header(MessageKind::PrepareRequest, &oversized, 0),
+                &oversized,
+                &[],
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(host.can_continue());
+    }
+}
+
+#[tokio::test]
+async fn worker_readiness_uses_the_limits_installed_on_the_stream() {
+    for (local_bytes, peer_bytes, local_fds, peer_fds) in [(4096, 8192, 3, 2), (8192, 4096, 2, 3)] {
+        let (mut host, mut peer) = raw_stream_pair();
+        let hello = WorkerHello::new(ControlLimits::new(local_bytes, local_fds).unwrap()).unwrap();
+        let response = HelloResponse::new(
+            FeatureSet::WORKER_PIDFD,
+            BrokerId::new([0x5a; 16]),
+            ControlLimits::new(peer_bytes, peer_fds).unwrap(),
+        )
+        .unwrap();
+        let mut bytes = [0; lasper_guest_protocol::HELLO_PAYLOAD_BUFFER_BYTES];
+        let length = response.encode_payload(&mut bytes).unwrap();
+        peer.write_all(&header(HelloResponse::KIND, &bytes[..length], 0).encode())
+            .unwrap();
+        peer.write_all(&bytes[..length]).unwrap();
+        let negotiated = host.handshake(17, hello.request()).await.unwrap();
+        let installed = negotiated.limits();
+        let readiness = hello.complete(&host).unwrap();
+        assert_eq!(readiness.limits(), installed);
+        assert_eq!(
+            readiness.limits().get(),
+            ControlLimits::new(local_bytes.min(peer_bytes), local_fds.min(peer_fds)).unwrap()
+        );
+        assert_eq!(readiness.broker_id(), response.broker_id());
+
+        let maximum =
+            installed.get().max_control_frame_bytes() as usize - CONTROL_FRAME_HEADER_BYTES;
+        let payload = vec![0; maximum];
+        host.send_frame(
+            header(MessageKind::PrepareRequest, &payload, 0),
+            &payload,
+            &[],
+        )
+        .await
+        .unwrap();
+        let oversized = vec![0; maximum + 1];
+        let error = host
+            .send_frame(
+                header(MessageKind::PrepareRequest, &oversized, 0),
+                &oversized,
+                &[],
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(host.can_continue());
+    }
+}
+
+#[tokio::test]
+async fn equal_requests_on_two_streams_keep_their_limits_and_brokers_separate() {
+    let (mut first, mut first_peer) = raw_stream_pair();
+    let (mut second, mut second_peer) = raw_stream_pair();
+    let first_hello = WorkerHello::new(ControlLimits::CURRENT).unwrap();
+    let second_hello = WorkerHello::new(ControlLimits::CURRENT).unwrap();
+    assert_eq!(first_hello.request(), second_hello.request());
+    let first_response = HelloResponse::new(
+        FeatureSet::WORKER_PIDFD,
+        BrokerId::new([1; 16]),
+        ControlLimits::new(4096, 2).unwrap(),
+    )
+    .unwrap();
+    let second_response = HelloResponse::new(
+        FeatureSet::WORKER_PIDFD,
+        BrokerId::new([2; 16]),
+        ControlLimits::new(8192, 3).unwrap(),
+    )
+    .unwrap();
+    write_hello_frame(&mut first_peer, first_response);
+    let first_snapshot = first.handshake(17, first_hello.request()).await.unwrap();
+    assert!(matches!(
+        WorkerHello::new(ControlLimits::CURRENT)
+            .unwrap()
+            .complete(&second),
+        Err(WorkerReadinessError::HelloUnavailable)
+    ));
+    write_hello_frame(&mut second_peer, second_response);
+    let second_snapshot = second.handshake(17, second_hello.request()).await.unwrap();
+    assert_ne!(first_snapshot.limits(), second_snapshot.limits());
+
+    let second_readiness = first_hello.complete(&second).unwrap();
+    assert_eq!(second_readiness.broker_id(), second_response.broker_id());
+    assert_eq!(second_readiness.limits(), second_snapshot.limits());
+    let first_readiness = second_hello.complete(&first).unwrap();
+    assert_eq!(first_readiness.broker_id(), first_response.broker_id());
+    assert_eq!(first_readiness.limits(), first_snapshot.limits());
+}
+
+#[tokio::test]
+async fn moving_a_stream_retains_hello_but_rewrapping_its_socket_does_not() {
+    let (mut host, mut peer) = raw_stream_pair();
+    let hello = WorkerHello::new(ControlLimits::CURRENT).unwrap();
+    let response = HelloResponse::new(
+        FeatureSet::WORKER_PIDFD,
+        BrokerId::new([1; 16]),
+        ControlLimits::CURRENT,
+    )
+    .unwrap();
+    write_hello_frame(&mut peer, response);
+    host.handshake(17, hello.request()).await.unwrap();
+    let moved = host;
+    assert_eq!(
+        hello.complete(&moved).unwrap().broker_id(),
+        response.broker_id()
+    );
+    let rewrapped = UnixControlStream::new(moved.into_inner().unwrap());
+    assert!(matches!(
+        WorkerHello::new(ControlLimits::CURRENT)
+            .unwrap()
+            .complete(&rewrapped),
+        Err(WorkerReadinessError::HelloUnavailable)
+    ));
+}
+
+#[tokio::test]
+async fn an_invalidated_stream_cannot_complete_worker_readiness() {
+    let (mut host, mut peer) = raw_stream_pair();
+    let hello = WorkerHello::new(ControlLimits::CURRENT).unwrap();
+    let response = HelloResponse::new(
+        FeatureSet::WORKER_PIDFD,
+        BrokerId::new([1; 16]),
+        ControlLimits::CURRENT,
+    )
+    .unwrap();
+    write_hello_frame(&mut peer, response);
+    host.handshake(17, hello.request()).await.unwrap();
+    drop(peer);
+    host.receive_frame().await.unwrap_err();
+    assert!(!host.can_continue());
+    assert!(matches!(
+        hello.complete(&host),
+        Err(WorkerReadinessError::HelloUnavailable)
+    ));
+}
+
+#[tokio::test]
+async fn invalid_hello_payload_or_features_cannot_establish_a_stream() {
+    for invalid_payload in [true, false] {
+        let (mut host, mut peer) = raw_stream_pair();
+        let request = HelloRequest::new(FeatureSet::WORKER_PIDFD, ControlLimits::CURRENT).unwrap();
+        if invalid_payload {
+            peer.write_all(&header(HelloResponse::KIND, b"{}", 0).encode())
+                .unwrap();
+            peer.write_all(b"{}").unwrap();
+        } else {
+            write_hello_response(&mut peer);
+        }
+        let error = host.handshake(17, request).await.unwrap_err();
+        if invalid_payload {
+            assert!(
+                matches!(error, HandshakeError::Transport(error) if error.kind() == io::ErrorKind::InvalidData)
+            );
+        } else {
+            assert!(matches!(
+                error,
+                HandshakeError::Negotiation(HelloNegotiationError::UnsupportedFeatures { .. })
+            ));
+        }
+        assert!(!host.can_continue());
+        assert!(host.into_inner().is_err());
+    }
+}
+
+#[tokio::test]
+async fn abandoning_a_hello_exchange_invalidates_the_stream() {
+    let (mut host, _peer) = raw_stream_pair();
+    let request = HelloRequest::new(FeatureSet::EMPTY, ControlLimits::CURRENT).unwrap();
+    assert!(tokio::time::timeout(
+        std::time::Duration::from_millis(20),
+        host.handshake(17, request)
+    )
+    .await
+    .is_err());
+    assert!(!host.can_continue());
 }
 
 fn establish_guest_with_peer(peer: &mut StdUnixStream, guest: &mut GuestControlStream) {
@@ -79,8 +341,7 @@ async fn host_rejects_minor_mismatch_before_reading_hello_or_established_payload
     for established_session in [false, true] {
         let (mut host, mut peer) = raw_stream_pair();
         if established_session {
-            peer.write_all(&header(MessageKind::HelloResponse, &[], 0).encode())
-                .unwrap();
+            write_hello_response(&mut peer);
             establish_host(&mut host).await;
         } else {
             host.send_frame(header(MessageKind::HelloRequest, &[], 0), &[], &[])
@@ -147,8 +408,6 @@ async fn host_and_guest_round_trip_frames_without_descriptors() {
 async fn host_and_guest_transports_exchange_typed_hello_payloads() {
     let (mut host, guest) = raw_stream_pair();
     let request = HelloRequest::new(FeatureSet::EMPTY, ControlLimits::CURRENT).unwrap();
-    let mut request_payload = [0; 256];
-    let request_len = request.encode_payload(&mut request_payload).unwrap();
 
     let guest_task = tokio::task::spawn_blocking(move || {
         // Ownership moves into the guest transport; the original socket is not
@@ -187,20 +446,8 @@ async fn host_and_guest_transports_exchange_typed_hello_payloads() {
         negotiated
     });
 
-    host.send_frame(
-        header(HelloRequest::KIND, &request_payload[..request_len], 0),
-        &request_payload[..request_len],
-        &[],
-    )
-    .await
-    .unwrap();
-    let response = host.receive_frame().await.unwrap();
-    assert_eq!(response.header().kind(), HelloResponse::KIND);
-    assert!(response.descriptors().is_empty());
-    let peer_protocol_version = response.header().protocol_version();
-    let response = HelloResponse::decode_payload(response.payload()).unwrap();
-    let negotiated = request.negotiate(peer_protocol_version, response).unwrap();
-    host.complete_hello(negotiated).unwrap();
+    let negotiated = host.handshake(17, request).await.unwrap();
+    assert_eq!(negotiated.response().broker_id(), BrokerId::new([0x5a; 16]));
     host.send_frame(
         header(MessageKind::PrepareRequest, b"prepare", 0),
         b"prepare",
@@ -209,7 +456,7 @@ async fn host_and_guest_transports_exchange_typed_hello_payloads() {
     .await
     .unwrap();
 
-    assert_eq!(guest_task.await.unwrap().get(), ControlLimits::CURRENT);
+    assert_eq!(guest_task.await.unwrap(), negotiated.limits());
 }
 
 #[tokio::test]
@@ -253,9 +500,6 @@ async fn hello_frames_use_the_fixed_bootstrap_envelope() {
         CONTROL_FRAME_HEADER_BYTES as u32 + request_header.payload_bytes()
             > declared_limits.max_control_frame_bytes()
     );
-    host.send_frame(request_header, &request_payload[..request_len], &[])
-        .await
-        .unwrap();
 
     let response = HelloResponse::new(
         FeatureSet::EMPTY,
@@ -273,14 +517,9 @@ async fn hello_frames_use_the_fixed_bootstrap_envelope() {
     peer.write_all(&response_header.encode()).unwrap();
     peer.write_all(&response_payload[..response_len]).unwrap();
 
-    let received = host.receive_frame().await.unwrap();
-    assert_eq!(received.header().kind(), HelloResponse::KIND);
-    assert_eq!(received.payload(), &response_payload[..response_len]);
-    let response = HelloResponse::decode_payload(received.payload()).unwrap();
-    let negotiated = request
-        .negotiate(received.header().protocol_version(), response)
-        .unwrap();
-    host.complete_hello(negotiated).unwrap();
+    let negotiated = host.handshake(17, request).await.unwrap();
+    assert_eq!(negotiated.response(), response);
+    assert_eq!(negotiated.limits().get(), declared_limits);
 
     let error = host
         .send_frame(header(MessageKind::PrepareRequest, b"x", 0), b"x", &[])

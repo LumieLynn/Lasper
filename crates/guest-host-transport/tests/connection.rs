@@ -1,7 +1,9 @@
-use lasper_guest_host_transport::{BrokerConnectError, BrokerConnection, MachineTarget};
+use lasper_guest_host_transport::{
+    BrokerConnectError, BrokerConnection, MachineTarget, WorkerReadinessError,
+};
 use lasper_guest_protocol::{
-    BrokerId, ControlFrameHeader, ControlLimits, FeatureSet, HelloRequest, HelloResponse,
-    MessageKind, CONTROL_FRAME_HEADER_BYTES, HELLO_PAYLOAD_BUFFER_BYTES,
+    BrokerId, ControlFrameHeader, ControlLimits, FeatureSet, HelloNegotiationError, HelloRequest,
+    HelloResponse, MessageKind, CONTROL_FRAME_HEADER_BYTES, HELLO_PAYLOAD_BUFFER_BYTES,
 };
 use std::future::Future;
 use std::io::{Read, Write};
@@ -61,8 +63,11 @@ fn receive_hello(stream: &mut UnixStream) -> ControlFrameHeader {
 }
 
 fn hello_response(request_id: u64) -> Vec<u8> {
-    let response =
-        HelloResponse::new(FeatureSet::WORKER_PIDFD, BROKER, ControlLimits::CURRENT).unwrap();
+    hello_response_with_features(request_id, FeatureSet::WORKER_PIDFD)
+}
+
+fn hello_response_with_features(request_id: u64, features: FeatureSet) -> Vec<u8> {
+    let response = HelloResponse::new(features, BROKER, ControlLimits::CURRENT).unwrap();
     let mut bytes = [0; HELLO_PAYLOAD_BUFFER_BYTES];
     let length = response.encode_payload(&mut bytes).unwrap();
     let header =
@@ -263,6 +268,35 @@ async fn hello_response_must_match_this_request() {
     assert!(
         matches!(result, Err(BrokerConnectError::Hello(error)) if error.kind() == std::io::ErrorKind::InvalidData)
     );
+    server.join().unwrap();
+}
+
+#[tokio::test]
+async fn missing_worker_capability_remains_a_readiness_failure() {
+    let (directory, listener) = listener();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let request = receive_hello(&mut stream);
+        stream
+            .write_all(&hello_response_with_features(
+                request.request_id(),
+                FeatureSet::EMPTY,
+            ))
+            .unwrap();
+        let mut byte = [0];
+        assert_eq!(stream.read(&mut byte).unwrap(), 0);
+    });
+    let result = connect(
+        target::current_target().await,
+        &directory.path().join("broker.sock"),
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(BrokerConnectError::Readiness(
+            WorkerReadinessError::Negotiation(HelloNegotiationError::UnsupportedFeatures { .. })
+        ))
+    ));
     server.join().unwrap();
 }
 

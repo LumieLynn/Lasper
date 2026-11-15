@@ -1,7 +1,7 @@
 use super::fixture::{request, Server, BROKER};
 use crate::control::{receive_guest_frame, send_guest_frame};
 use lasper_guest_host_transport::{BrokerSession, BrokerSessionError};
-use lasper_guest_protocol::{ErrorFrame, GuestErrorCode, GuestOperation};
+use lasper_guest_protocol::{ErrorFrame, GuestErrorCode, GuestFailureStage, GuestOperation};
 use lasper_guest_runtime::transport::TransportError;
 use std::time::Duration;
 use tokio::time::Instant;
@@ -77,5 +77,39 @@ async fn prepare_rejection_retains_the_guest_error_code() {
     assert!(
         matches!(result, Err(BrokerSessionError::Rejected(error)) if error.code() == GuestErrorCode::Expired)
     );
+    server.finish().await;
+}
+
+#[tokio::test]
+async fn prepare_rejection_retains_the_worker_stage_and_errno() {
+    let server = Server::spawn(|guest, request| {
+        let error = ErrorFrame::new(
+            request.request_id(),
+            BROKER,
+            None,
+            GuestOperation::Prepare,
+            GuestErrorCode::System,
+            Some(13),
+        )
+        .unwrap()
+        .with_stage(Some(GuestFailureStage::HomeDirectory))
+        .unwrap();
+        let mut bytes = [0; 4096];
+        let (header, length) = error.encode_parts(&mut bytes).unwrap();
+        send_guest_frame(&guest, header, &bytes[..length], &[]).unwrap();
+    });
+    let error = BrokerSession::prepare(
+        server.connection().await,
+        request(),
+        Instant::now() + Duration::from_secs(2),
+    )
+    .await
+    .err()
+    .unwrap();
+    assert!(matches!(&error, BrokerSessionError::Rejected(frame)
+        if frame.stage() == Some(GuestFailureStage::HomeDirectory) && frame.errno() == Some(13)));
+    let diagnostic = error.to_string();
+    assert!(diagnostic.contains("HomeDirectory"));
+    assert!(diagnostic.contains("errno 13"));
     server.finish().await;
 }

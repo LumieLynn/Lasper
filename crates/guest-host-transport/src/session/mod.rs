@@ -4,16 +4,17 @@
 mod driver;
 mod error;
 mod output;
+mod start;
 mod wire;
 
 pub use error::BrokerSessionError;
 pub use output::{CapturedStream, SessionExit, SessionOutput};
+pub use start::{StartError, StartOutcome};
 
 use crate::{BrokerConnection, WorkerObservation};
 use lasper_guest_protocol::{
     ControlFrameHeader, PreparationId, PrepareRequest, ProjectionObservations, TerminalSize,
 };
-use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{timeout_at, Duration, Instant};
@@ -30,7 +31,7 @@ pub enum SessionPhase {
     /// the worker will not execute.
     Starting,
     /// The guest accepted Start; only Exit can establish whether exec succeeded.
-    Started,
+    StartAccepted,
     /// Cleanup is being observed; progress reports do not extend its deadline.
     Closing,
     Closed,
@@ -77,6 +78,10 @@ pub struct SessionStartOptions {
     pub wayland_display: Option<String>,
     pub x11_display: Option<u16>,
     pub terminal_size: Option<TerminalSize>,
+    /// Execution budget from guest acceptance of Start. None means unlimited.
+    /// Positive durations are rounded up to whole milliseconds and must not
+    /// exceed [`lasper_guest_protocol::MAX_EXECUTION_TIMEOUT_MS`].
+    pub execution_timeout: Option<Duration>,
 }
 
 /// Dropping the handle requests cleanup but does not wait for it. The host
@@ -97,6 +102,7 @@ pub struct BrokerSession {
 }
 
 type Reply<T> = oneshot::Sender<Result<T, BrokerSessionError>>;
+type StartReply = oneshot::Sender<Result<StartOutcome, StartError>>;
 
 enum Command {
     Recheck {
@@ -107,7 +113,7 @@ enum Command {
         deadline: Instant,
         options: SessionStartOptions,
         evidence: ProjectionObservations,
-        reply: Reply<Option<OwnedFd>>,
+        reply: StartReply,
         delivered: oneshot::Receiver<()>,
     },
     Cancel {
@@ -152,7 +158,7 @@ impl Command {
                 let _ = reply.send(Err(error));
             }
             Self::Start { reply, .. } => {
-                let _ = reply.send(Err(error));
+                let _ = reply.send(Err(StartError::NotSubmitted(error)));
             }
             Self::Cancel { reply, .. } | Self::Close { reply, .. } => {
                 let _ = reply.send(Err(error));
@@ -268,16 +274,17 @@ impl BrokerSession {
 
     /// Start has a five-second budget, including queueing and identity checks.
     /// Changed projection evidence leaves the worker prepared for the caller
-    /// to review. Success means Start was accepted, not that exec succeeded.
+    /// to review. Acceptance does not confirm exec success.
     ///
     /// Before Start is queued for sending, an observed cancellation preserves
     /// preparation. Cancellation racing with that point requests Close, since
     /// the worker may already execute. A lost acknowledgement is reported as
-    /// StartOutcomeUnknown and is never retried.
+    /// Unknown and is never retried. Err means this attempt was not submitted
+    /// or was explicitly rejected. Losing the driver after queueing is Unknown.
     pub async fn start(
         &mut self,
         options: SessionStartOptions,
-    ) -> Result<Option<OwnedFd>, BrokerSessionError> {
+    ) -> Result<StartOutcome, StartError> {
         let (reply, received) = oneshot::channel();
         let (delivered, delivery) = oneshot::channel();
         self.send(Command::Start {
@@ -287,14 +294,9 @@ impl BrokerSession {
             reply,
             delivered: delivery,
         })
-        .await?;
-        let terminal = received
-            .await
-            .map_err(|_| BrokerSessionError::DriverStopped)??;
-        // The driver needs to distinguish a delivered result from a reply
-        // abandoned in the oneshot slot. Do not yield between this and return.
-        let _ = delivered.send(());
-        Ok(terminal)
+        .await
+        .map_err(StartError::NotSubmitted)?;
+        start::receive(received, delivered).await
     }
 
     pub async fn cancel(&mut self) -> Result<(), BrokerSessionError> {

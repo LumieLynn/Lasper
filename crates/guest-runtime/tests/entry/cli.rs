@@ -97,7 +97,7 @@ fn payload_help(binary: &str) {
         .args(["wrap", "--", "/proc/self/fd/-1", "--help"])
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(70), "{output:?}");
+    assert_eq!(output.status.code(), Some(126), "{output:?}");
     assert!(output.stdout.is_empty(), "{output:?}");
     let error = String::from_utf8(output.stderr).unwrap();
     assert!(error.contains("stat wrapper payload"), "{error}");

@@ -1,0 +1,191 @@
+name: Shared checks
+
+on:
+  workflow_call:
+    inputs:
+      build-version:
+        description: Version embedded in release verification builds
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  LASPER_BUILD_VERSION: ${{ inputs.build-version }}
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - run: cargo fmt --all -- --check
+
+  package:
+    name: ${{ matrix.package }} (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+        package:
+          - lasper
+          - lasper-rootfs-path
+          - lasper-local-accounts
+          - lasper-guest-protocol
+          - lasper-guest-host-transport
+          - lasper-guest-runtime
+          - lasper-guest-test-client
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: checks-${{ matrix.os }}-${{ matrix.package }}
+
+      # Check without test dependencies or sibling packages masking missing features.
+      - name: Check package independently
+        run: cargo check -p ${{ matrix.package }} --locked
+
+      # runtime-bin has its own no_std build profile in the guest-runtime job.
+      - name: Run Clippy
+        run: cargo clippy -p ${{ matrix.package }} --all-targets --locked -- -D warnings
+
+      - name: Run unit and integration tests
+        run: cargo test -p ${{ matrix.package }} --all-targets --locked
+
+      - name: Run documentation tests
+        if: matrix.package != 'lasper' && matrix.package != 'lasper-guest-test-client'
+        run: cargo test -p ${{ matrix.package }} --doc --locked
+
+      - name: Install D-Bus test dependency
+        if: matrix.package == 'lasper'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes dbus-daemon
+
+      - name: Verify isolated D-Bus integrations
+        if: matrix.package == 'lasper'
+        run: >-
+          cargo test -p lasper --bin lasper --locked --
+          --ignored --skip live_systemd_properties_match_systemctl
+
+      - name: Verify properties against the host systemd manager
+        if: matrix.package == 'lasper'
+        run: >-
+          cargo test -p lasper --bin lasper --locked
+          live_systemd_properties_match_systemctl -- --ignored
+
+  guest-runtime:
+    name: guest namespaces and ELF (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-24.04
+            build-alias: build-guest-runtime-x86-64
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            build-alias: build-guest-runtime-aarch64
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - run: rustup target add ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: guest-runtime-${{ matrix.target }}
+
+      - name: Enable namespace tests
+        shell: bash
+        run: |
+          sudo -n true
+          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
+      - name: Verify worker identity across user namespaces
+        run: >-
+          cargo test -p lasper-guest-host-transport --lib --locked
+          child_user_namespace_maps_packet_and_proc_credentials -- --ignored
+
+      - name: Verify host connections and sessions against a real broker
+        run: cargo test -p lasper-guest-host-transport --test broker --locked -- --ignored
+
+      - name: Verify guest sessions in a user namespace
+        run: cargo test -p lasper-guest-runtime --test session --locked -- --ignored
+
+      - name: Verify guest sessions and account switching as root
+        run: cargo test -p lasper-guest-runtime --test session --locked -- --sudo
+
+      - name: Verify guest control loop in a user namespace
+        run: cargo test -p lasper-guest-runtime --test control --locked -- --ignored
+
+      - name: Verify guest control loop as root
+        run: cargo test -p lasper-guest-runtime --test control --locked -- --sudo
+
+      - name: Check static guest runtime binary
+        run: >-
+          cargo clippy
+          --package lasper-guest-runtime
+          --profile guest-runtime
+          --target ${{ matrix.target }}
+          --bin lasper-guest-runtime
+          --features runtime-bin
+          --locked
+          -- -D warnings
+
+      - name: Build static guest runtime
+        run: cargo ${{ matrix.build-alias }}
+
+      - name: Verify static ELF layout, identity and CLI
+        run: .github/scripts/verify-guest-runtime.sh ${{ matrix.target }} --run
+
+      - name: Verify ELF entry and relocation protection
+        run: >-
+          cargo test -p lasper-guest-runtime --test entry --locked
+          -- --binary target/${{ matrix.target }}/guest-runtime/lasper-guest-runtime
+
+      - name: Verify broker and standalone ELF in a user namespace
+        run: >-
+          cargo test -p lasper-guest-runtime --test broker --locked
+          -- --ignored --binary target/${{ matrix.target }}/guest-runtime/lasper-guest-runtime
+
+      - name: Verify broker as root
+        run: cargo test -p lasper-guest-runtime --test broker --locked -- --sudo
+
+      - name: Verify wrapper handoff in a user namespace
+        run: >-
+          cargo test -p lasper-guest-runtime --test wrapper --locked
+          -- --binary target/${{ matrix.target }}/guest-runtime/lasper-guest-runtime
+
+      - name: Verify wrapper handoff and PID 1 init entry as root
+        run: >-
+          cargo test -p lasper-guest-runtime --test wrapper --locked
+          -- --sudo --pid1 --binary target/${{ matrix.target }}/guest-runtime/lasper-guest-runtime
+
+  audit:
+    name: dependency audit
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup show
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked --version 0.22.2
+      - name: Audit dependencies
+        run: cargo audit
+
+      - name: Install cargo-about
+        run: cargo install cargo-about --locked --version 0.9.2 --features cli
+
+      - name: Check dependency licenses
+        run: |
+          cargo about generate --locked --fail about.hbs --output-file /tmp/lasper-dependency-notices.md
+          cmp THIRD_PARTY_NOTICES.md /tmp/lasper-dependency-notices.md

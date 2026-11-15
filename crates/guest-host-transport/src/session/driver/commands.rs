@@ -3,7 +3,8 @@ use super::operation::{CheckPurpose, Operation, StartPlan};
 use super::worker::Worker;
 use super::Owner;
 use crate::session::{
-    wire, BrokerSessionError, Command, SessionPhase, SessionStartOptions, OPERATION_TIMEOUT,
+    wire, BrokerSessionError, Command, SessionPhase, SessionStartOptions, StartError,
+    OPERATION_TIMEOUT,
 };
 use lasper_guest_protocol::{
     PreparationControlFrame, PreparationControlKind, StartRequest, CONTROL_FRAME_HEADER_BYTES,
@@ -22,7 +23,7 @@ impl Owner<'_> {
         let allowed = match &command {
             Command::Close { .. } => matches!(
                 self.phase(),
-                SessionPhase::Prepared | SessionPhase::Starting | SessionPhase::Started
+                SessionPhase::Prepared | SessionPhase::Starting | SessionPhase::StartAccepted
             ),
             _ => self.phase() == SessionPhase::Prepared,
         };
@@ -69,7 +70,7 @@ impl Owner<'_> {
                 let payload = match self.start_payload(options) {
                     Ok(start) => start,
                     Err(error) => {
-                        let _ = reply.send(Err(error));
+                        let _ = reply.send(Err(StartError::NotSubmitted(error)));
                         return Ok(());
                     }
                 };
@@ -204,6 +205,10 @@ impl Owner<'_> {
             options.wayland_display.as_deref(),
             options.x11_display,
             options.terminal_size,
+            options
+                .execution_timeout
+                .map(wire::execution_timeout_ms)
+                .transpose()?,
         )
         .map_err(wire::encoding)?;
         let maximum = self

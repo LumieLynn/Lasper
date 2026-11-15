@@ -1,5 +1,6 @@
 use lasper_guest_host_transport::{
     BrokerConnection, BrokerSession, BrokerSessionError, SessionPhase, SessionStartOptions,
+    StartError, StartOutcome,
 };
 use lasper_guest_protocol::{
     CommandArgv, ControlLimits, ExecutionKind, ExecutionStatus, ExitReason, ExitStatus,
@@ -37,11 +38,10 @@ async fn exercise(target: Arc<lasper_guest_host_transport::MachineTarget>, path:
     assert_eq!(session.snapshot().phase(), SessionPhase::Prepared);
     assert_eq!(session.observation().reply().guest_user(), "root");
     session.recheck().await.unwrap();
-    assert!(session
-        .start(SessionStartOptions::default())
-        .await
-        .unwrap()
-        .is_none());
+    assert!(matches!(
+        session.start(SessionStartOptions::default()).await.unwrap(),
+        StartOutcome::Accepted { terminal: None }
+    ));
     let exit = finish(&mut session).await;
     assert_eq!(exit.report().exit(), Some(ExitStatus::Exited(7)));
     let output = exit.output().unwrap();
@@ -50,7 +50,7 @@ async fn exercise(target: Arc<lasper_guest_host_transport::MachineTarget>, path:
     assert!(output.stdout().complete() && output.stderr().complete());
     assert!(matches!(
         session.start(SessionStartOptions::default()).await,
-        Err(BrokerSessionError::DriverStopped)
+        Err(StartError::NotSubmitted(BrokerSessionError::DriverStopped))
     ));
 
     let mut session = BrokerSession::prepare(
@@ -73,14 +73,18 @@ async fn exercise(target: Arc<lasper_guest_host_transport::MachineTarget>, path:
     )
     .await
     .unwrap();
-    let terminal = session
+    let StartOutcome::Accepted {
+        terminal: Some(terminal),
+    } = session
         .start(SessionStartOptions {
             terminal_size: Some(TerminalSize::new(100, 30).unwrap()),
             ..Default::default()
         })
         .await
         .unwrap()
-        .unwrap();
+    else {
+        panic!("interactive Start was not accepted with a PTY");
+    };
     assert!(terminal.as_raw_fd() >= 0);
     assert_eq!(
         finish(&mut session).await.report().exit(),
@@ -103,7 +107,10 @@ async fn failed_exec(
     )
     .await
     .unwrap();
-    session.start(SessionStartOptions::default()).await.unwrap();
+    assert!(matches!(
+        session.start(SessionStartOptions::default()).await.unwrap(),
+        StartOutcome::Accepted { .. }
+    ));
     let exit = finish(&mut session).await;
     assert_eq!(
         exit.report().execution(),
@@ -141,7 +148,10 @@ async fn large_request_and_output(
         .await
         .unwrap()
     };
-    session.start(SessionStartOptions::default()).await.unwrap();
+    assert!(matches!(
+        session.start(SessionStartOptions::default()).await.unwrap(),
+        StartOutcome::Accepted { .. }
+    ));
     let exit = finish(&mut session).await;
     assert_eq!(exit.report().exit(), Some(ExitStatus::Exited(0)));
     let output = exit.output().unwrap();
@@ -170,15 +180,21 @@ async fn concurrent_sessions(
     .await
     .unwrap();
     assert_ne!(first.preparation_id(), second.preparation_id());
-    first.start(SessionStartOptions::default()).await.unwrap();
-    second.start(SessionStartOptions::default()).await.unwrap();
+    assert!(matches!(
+        first.start(SessionStartOptions::default()).await.unwrap(),
+        StartOutcome::Accepted { .. }
+    ));
+    assert!(matches!(
+        second.start(SessionStartOptions::default()).await.unwrap(),
+        StartOutcome::Accepted { .. }
+    ));
     let first_state = first.subscribe();
     drop(first);
     assert_eq!(
         observe_exit(first_state).await.report().reason(),
         ExitReason::ClientClosed
     );
-    assert_eq!(second.snapshot().phase(), SessionPhase::Started);
+    assert_eq!(second.snapshot().phase(), SessionPhase::StartAccepted);
     second.close().await.unwrap();
     assert_eq!(
         finish(&mut second).await.report().reason(),
@@ -229,7 +245,9 @@ async fn changed_projection(
     };
     assert!(matches!(
         session.start(start()).await,
-        Err(BrokerSessionError::ProjectionChanged)
+        Err(StartError::NotSubmitted(
+            BrokerSessionError::ProjectionChanged
+        ))
     ));
     assert_eq!(session.snapshot().phase(), SessionPhase::Prepared);
     assert_eq!(session.observation().reply().projections(), previous);
@@ -237,7 +255,12 @@ async fn changed_projection(
         session.recheck().await.unwrap().reply().projections(),
         previous
     );
-    let terminal = session.start(start()).await.unwrap().unwrap();
+    let StartOutcome::Accepted {
+        terminal: Some(terminal),
+    } = session.start(start()).await.unwrap()
+    else {
+        panic!("interactive Start was not accepted with a PTY");
+    };
     assert_eq!(
         finish(&mut session).await.report().exit(),
         Some(ExitStatus::Exited(0))

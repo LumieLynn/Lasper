@@ -1,7 +1,9 @@
 use clap::{
     builder::NonEmptyStringValueParser, error::ErrorKind, CommandFactory, Parser, Subcommand,
 };
+use lasper_guest_protocol::MAX_EXECUTION_TIMEOUT_MS;
 use std::ffi::OsString;
+use std::time::Duration;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -42,6 +44,9 @@ struct ExecOptions {
     /// Use an interactive PTY; requires a host terminal
     #[arg(long)]
     tty: bool,
+    /// Limit execution to this many seconds (default: unlimited)
+    #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..=MAX_EXECUTION_TIMEOUT_MS / 1000))]
+    timeout: Option<u64>,
     /// Absolute guest program path followed by its arguments
     #[arg(last = true, required = true, num_args = 1.., value_name = "PROGRAM")]
     command: Vec<String>,
@@ -61,6 +66,7 @@ pub struct Args {
     pub user: String,
     pub socket: String,
     pub tty: bool,
+    pub execution_timeout: Option<Duration>,
     pub command: Vec<String>,
 }
 
@@ -74,10 +80,16 @@ impl Args {
         I: IntoIterator<Item = T>,
         T: Into<OsString> + Clone,
     {
-        let (target, tty, command) = match Cli::try_parse_from(arguments)?.command {
-            Action::Exec(options) => (options.target, options.tty, options.command),
-            Action::Shell(target) => (target, true, Vec::new()),
-        };
+        let (target, tty, command, execution_timeout) =
+            match Cli::try_parse_from(arguments)?.command {
+                Action::Exec(options) => (
+                    options.target,
+                    options.tty,
+                    options.command,
+                    options.timeout.map(Duration::from_secs),
+                ),
+                Action::Shell(target) => (target, true, Vec::new(), None),
+            };
         if command.first().is_some_and(|path| !path.starts_with('/')) {
             let mut cli = Cli::command();
             cli.build();
@@ -91,6 +103,7 @@ impl Args {
             user: target.user,
             socket: target.socket,
             tty,
+            execution_timeout,
             command,
         })
     }
@@ -123,12 +136,72 @@ mod tests {
         );
         assert_eq!(args.user, "root");
         assert!(!args.tty);
+        assert_eq!(args.execution_timeout, None);
     }
     #[test]
     fn account_shell_is_interactive_without_a_command() {
         let args = parse(&["shell", "--machine", "demo", "--user", "alice"]).unwrap();
         assert!(args.tty && args.command.is_empty());
         assert_eq!(args.user, "alice");
+        assert_eq!(args.execution_timeout, None);
+    }
+
+    #[test]
+    fn exec_accepts_a_positive_timeout_with_or_without_a_pty() {
+        for tty in [false, true] {
+            let mut arguments = vec!["exec", "--machine", "demo", "--timeout", "180"];
+            if tty {
+                arguments.push("--tty");
+            }
+            arguments.extend(["--", "/bin/sleep", "120"]);
+            let args = parse(&arguments).unwrap();
+            assert_eq!(args.execution_timeout, Some(Duration::from_secs(180)));
+            assert_eq!(args.tty, tty);
+        }
+    }
+
+    #[test]
+    fn exec_rejects_invalid_or_excessive_timeouts() {
+        let above_maximum = (MAX_EXECUTION_TIMEOUT_MS / 1000 + 1).to_string();
+        for value in [
+            "0",
+            "-1",
+            "1.5",
+            above_maximum.as_str(),
+            "18446744073709551",
+            "18446744073709552",
+            "18446744073709551616",
+        ] {
+            assert!(
+                parse(&[
+                    "exec",
+                    "--machine",
+                    "demo",
+                    "--timeout",
+                    value,
+                    "--",
+                    "/bin/true"
+                ])
+                .is_err(),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_accepts_the_protocols_largest_whole_second_timeout() {
+        let maximum = MAX_EXECUTION_TIMEOUT_MS / 1000;
+        let args = parse(&[
+            "exec",
+            "--machine",
+            "demo",
+            "--timeout",
+            &maximum.to_string(),
+            "--",
+            "/bin/true",
+        ])
+        .unwrap();
+        assert_eq!(args.execution_timeout, Some(Duration::from_secs(maximum)));
     }
     #[test]
     fn rejects_incomplete_or_ambiguous_invocations() {
@@ -173,9 +246,15 @@ mod tests {
             "--help",
             "--user",
             "other",
+            "--timeout",
+            "0",
         ])
         .unwrap();
         assert_eq!(args.user, "root");
-        assert_eq!(args.command, ["/bin/sh", "--help", "--user", "other"]);
+        assert_eq!(
+            args.command,
+            ["/bin/sh", "--help", "--user", "other", "--timeout", "0"]
+        );
+        assert_eq!(args.execution_timeout, None);
     }
 }

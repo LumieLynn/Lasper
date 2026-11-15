@@ -2,54 +2,7 @@ use super::GuardianError;
 use crate::linux::uapi::errno::EAGAIN;
 use crate::linux::Descriptor;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u32)]
-pub enum WorkerStage {
-    Descriptors = 1,
-    Session = 2,
-    StandardIo = 3,
-    Account = 4,
-    Start = 5,
-    Exec = 6,
-    Signals = 7,
-    Projection = 8,
-    GroupDatabase = 9,
-    SupplementaryGroups = 10,
-    GroupIdentity = 11,
-    UserIdentity = 12,
-    HomeDirectory = 13,
-    LoginShell = 14,
-    LoginDisabled = 15,
-    TerminalOwnership = 16,
-    Environment = 17,
-    Memory = 18,
-}
-
-impl WorkerStage {
-    fn decode(value: u32) -> Option<Self> {
-        match value {
-            1 => Some(Self::Descriptors),
-            2 => Some(Self::Session),
-            3 => Some(Self::StandardIo),
-            4 => Some(Self::Account),
-            5 => Some(Self::Start),
-            6 => Some(Self::Exec),
-            7 => Some(Self::Signals),
-            8 => Some(Self::Projection),
-            9 => Some(Self::GroupDatabase),
-            10 => Some(Self::SupplementaryGroups),
-            11 => Some(Self::GroupIdentity),
-            12 => Some(Self::UserIdentity),
-            13 => Some(Self::HomeDirectory),
-            14 => Some(Self::LoginShell),
-            15 => Some(Self::LoginDisabled),
-            16 => Some(Self::TerminalOwnership),
-            17 => Some(Self::Environment),
-            18 => Some(Self::Memory),
-            _ => None,
-        }
-    }
-}
+pub use lasper_guest_protocol::GuestFailureStage as WorkerStage;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WorkerFailure {
@@ -60,6 +13,29 @@ pub struct WorkerFailure {
 impl WorkerFailure {
     pub const fn new(stage: WorkerStage, errno: i32) -> Self {
         Self { stage, errno }
+    }
+
+    pub const fn class(self) -> crate::failure::FailureClass {
+        use crate::failure::FailureClass;
+        match self.stage {
+            WorkerStage::Exec => FailureClass::Exec,
+            WorkerStage::Account
+            | WorkerStage::GroupDatabase
+            | WorkerStage::HomeDirectory
+            | WorkerStage::LoginShell
+            | WorkerStage::LoginDisabled
+            | WorkerStage::Environment => FailureClass::Configuration,
+            WorkerStage::SupplementaryGroups
+            | WorkerStage::GroupIdentity
+            | WorkerStage::UserIdentity
+            | WorkerStage::TerminalOwnership => FailureClass::Permission,
+            WorkerStage::StandardIo | WorkerStage::Start => FailureClass::Io,
+            WorkerStage::Projection => FailureClass::Unavailable,
+            WorkerStage::Descriptors
+            | WorkerStage::Session
+            | WorkerStage::Signals
+            | WorkerStage::Memory => FailureClass::system(self.errno),
+        }
     }
 }
 
@@ -172,9 +148,11 @@ impl WorkerStatus {
             (u32::MAX, 0, Setup::Creating) => self.setup = Setup::SessionEstablished,
             (0, 0, Setup::SessionEstablished) => self.setup = Setup::Prepared,
             _ => {
-                let stage = WorkerStage::decode(stage)
-                    .filter(|_| errno > 0)
-                    .ok_or(GuardianError::InvalidStatus)?;
+                let stage =
+                    WorkerStage::try_from(stage).map_err(|_| GuardianError::InvalidStatus)?;
+                if !(1..=4095).contains(&errno) {
+                    return Err(GuardianError::InvalidStatus);
+                }
                 self.failure = Some(WorkerFailure::new(stage, errno));
             }
         }

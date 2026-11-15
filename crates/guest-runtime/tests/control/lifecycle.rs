@@ -212,6 +212,7 @@ fn send_late_commands(client: &mut Client) {
                 None,
                 None,
                 None,
+                None,
             )
             .unwrap(),
         );

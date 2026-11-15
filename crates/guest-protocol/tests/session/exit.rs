@@ -1,8 +1,9 @@
 use lasper_guest_protocol::{
     CapturedOutput, CleanupStatus, ControlFrameHeader, ControlLimits, ExecutionKind,
-    ExecutionStatus, ExitFrame, ExitReason, ExitReport, ExitStatus, MessageKind, OutputStream,
-    PayloadCodecError, PreparationId, SessionFrameError, SessionPayloadError,
-    CONTROL_FRAME_HEADER_BYTES, MAX_CAPTURED_OUTPUT_BYTES, MIN_HELPER_CONTROL_FRAME_BYTES,
+    ExecutionStatus, ExitFrame, ExitReason, ExitReport, ExitStatus, GuestFailure,
+    GuestFailureStage, MessageKind, OutputStream, PayloadCodecError, PreparationId,
+    SessionFrameError, SessionPayloadError, CONTROL_FRAME_HEADER_BYTES, MAX_CAPTURED_OUTPUT_BYTES,
+    MIN_HELPER_CONTROL_FRAME_BYTES,
 };
 
 use super::support::{preparation, request, resized};
@@ -128,6 +129,10 @@ fn capture_budget_keeps_exit_facts_within_the_negotiated_frame() {
             CleanupStatus::Pending { errno: Some(4095) },
             ExitReason::ExecFailed,
         )
+        .unwrap()
+        .with_failure(Some(
+            GuestFailure::new(GuestFailureStage::Exec, 4095).unwrap(),
+        ))
         .unwrap();
         let frame = ExitFrame::new(&request, preparation(), report, Some(output)).unwrap();
         let mut payload = vec![0; maximum as usize - CONTROL_FRAME_HEADER_BYTES];
@@ -330,4 +335,91 @@ fn decode_rejects_output_that_exceeds_the_combined_capture_limit() {
             PayloadCodecError::PayloadTooLarge
         )))
     ));
+}
+
+#[test]
+fn worker_failure_details_round_trip_and_cannot_replace_the_primary_reason() {
+    let request = request(ExecutionKind::Interactive);
+    let failure = GuestFailure::new(GuestFailureStage::Exec, 2).unwrap();
+    let report = ExitReport::new(
+        ExecutionStatus::Failed { errno: 2 },
+        Some(ExitStatus::Exited(126)),
+        CleanupStatus::Complete,
+        ExitReason::ExecFailed,
+    )
+    .unwrap()
+    .with_failure(Some(failure))
+    .unwrap();
+    let frame = ExitFrame::new(&request, preparation(), report, None).unwrap();
+    let mut bytes = [0; 2048];
+    let (header, length) = frame.encode_parts(&mut bytes).unwrap();
+    assert_eq!(
+        ExitFrame::decode_for(&request, preparation(), header, &bytes[..length], 0)
+            .unwrap()
+            .report(),
+        report
+    );
+    let text = std::str::from_utf8(&bytes[..length]).unwrap();
+    for invalid in [
+        text.replace("\"stage\":\"exec\"", "\"stage\":\"account\""),
+        text.replace(
+            "\"stage\":\"exec\",\"errno\":2",
+            "\"stage\":\"exec\",\"errno\":13",
+        ),
+        text.replace("\"exec_failed\"", "\"cancelled\""),
+        text.replace("\"errno\":2", "\"errno\":4096"),
+    ] {
+        assert_ne!(invalid, text);
+        assert!(
+            ExitFrame::decode_for(
+                &request,
+                preparation(),
+                resized(header, invalid.len()),
+                invalid.as_bytes(),
+                0
+            )
+            .is_err(),
+            "accepted {invalid}"
+        );
+    }
+    for errno in [-1, 0, 4096] {
+        assert!(GuestFailure::new(GuestFailureStage::Account, errno).is_err());
+    }
+}
+
+#[test]
+fn ordinary_exit_preserves_known_status_without_requiring_exec_confirmation() {
+    assert_eq!(
+        report(CleanupStatus::Complete).command_exit(),
+        Some(ExitStatus::Exited(0))
+    );
+    assert_eq!(report(CleanupStatus::InProgress).command_exit(), None);
+    for reason in [
+        ExitReason::Cancelled,
+        ExitReason::ExecutionTimedOut,
+        ExitReason::ClockFailed,
+    ] {
+        assert_eq!(
+            ExitReport::new(
+                ExecutionStatus::Started,
+                Some(ExitStatus::Exited(0)),
+                CleanupStatus::Complete,
+                reason
+            )
+            .unwrap()
+            .command_exit(),
+            None
+        );
+    }
+    assert_eq!(
+        ExitReport::new(
+            ExecutionStatus::Unknown,
+            Some(ExitStatus::Exited(0)),
+            CleanupStatus::Complete,
+            ExitReason::WorkerExited
+        )
+        .unwrap()
+        .command_exit(),
+        Some(ExitStatus::Exited(0))
+    );
 }

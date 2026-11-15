@@ -97,6 +97,7 @@ fn start_frame() -> StartFrame {
         None,
         None,
         Some(TerminalSize::new(80, 24).unwrap()),
+        None,
     )
     .unwrap();
     StartFrame::new(11, start)

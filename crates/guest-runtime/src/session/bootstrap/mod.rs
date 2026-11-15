@@ -74,7 +74,7 @@ impl GuardianBootstrap {
                     Diagnostic,
                     "lasper guest runtime: guardian bootstrap failed: {error:?}"
                 );
-                70
+                error.class().exit_code()
             }
         };
         linux::exit(code)

@@ -131,7 +131,7 @@ fn stop_during_setup(signal: i32, point: SetupPoint) {
     guardian.release();
     trace(PTRACE_DETACH, pid, 0, 0);
 
-    assert_eq!(guardian.wait().code(), Some(70));
+    assert_eq!(guardian.wait().code(), Some(69));
     let mut diagnostic = String::new();
     guardian
         .child

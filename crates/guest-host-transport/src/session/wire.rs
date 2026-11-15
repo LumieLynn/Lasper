@@ -2,10 +2,25 @@ use super::BrokerSessionError;
 use crate::{BrokerConnection, ReceivedControlFrame};
 use lasper_guest_protocol::{
     ControlFrameHeader, ErrorFrame, MessageKind, PayloadCodecError, PreparationId,
-    PrepareRequestFrame,
+    PrepareRequestFrame, MAX_EXECUTION_TIMEOUT_MS,
 };
 use std::fmt;
-use tokio::time::{timeout_at, Instant};
+use tokio::time::{timeout_at, Duration, Instant};
+
+pub(super) fn execution_timeout_ms(duration: Duration) -> Result<u64, BrokerSessionError> {
+    if duration.is_zero() {
+        return Err(BrokerSessionError::InvalidRequest(
+            "execution timeout must be positive".into(),
+        ));
+    }
+    let milliseconds = duration.as_nanos().div_ceil(1_000_000);
+    if milliseconds > u128::from(MAX_EXECUTION_TIMEOUT_MS) {
+        return Err(BrokerSessionError::InvalidRequest(format!(
+            "execution timeout exceeds the protocol limit of {MAX_EXECUTION_TIMEOUT_MS} milliseconds"
+        )));
+    }
+    Ok(milliseconds as u64)
+}
 
 pub(super) fn encoding(error: impl fmt::Debug) -> BrokerSessionError {
     BrokerSessionError::InvalidRequest(format!("{error:?}"))
@@ -81,4 +96,42 @@ pub(super) fn rejection(
         )?));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn execution_budgets_round_up_without_wrapping() {
+        for (duration, expected) in [
+            (Duration::from_nanos(1), 1),
+            (Duration::from_millis(1), 1),
+            (Duration::from_nanos(1_000_001), 2),
+            (Duration::from_secs(120), 120_000),
+            (
+                Duration::from_millis(MAX_EXECUTION_TIMEOUT_MS) - Duration::from_nanos(1),
+                MAX_EXECUTION_TIMEOUT_MS,
+            ),
+            (
+                Duration::from_millis(MAX_EXECUTION_TIMEOUT_MS),
+                MAX_EXECUTION_TIMEOUT_MS,
+            ),
+        ] {
+            assert_eq!(execution_timeout_ms(duration).unwrap(), expected);
+        }
+        for duration in [
+            Duration::ZERO,
+            Duration::from_millis(MAX_EXECUTION_TIMEOUT_MS) + Duration::from_nanos(1),
+            Duration::from_millis(MAX_EXECUTION_TIMEOUT_MS + 1),
+            Duration::from_millis(u64::MAX),
+            Duration::from_millis(u64::MAX) + Duration::from_nanos(1),
+            Duration::MAX,
+        ] {
+            assert!(matches!(
+                execution_timeout_ms(duration),
+                Err(BrokerSessionError::InvalidRequest(_))
+            ));
+        }
+    }
 }

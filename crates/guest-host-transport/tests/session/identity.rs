@@ -5,7 +5,7 @@ use crate::control::{receive_guest_frame, send_guest_frame};
 use crate::session_clock::{drive_io, snapshot};
 use crate::worker::TestWorker;
 use lasper_guest_host_transport::{
-    BrokerSession, BrokerSessionError, SessionPhase, SessionStartOptions,
+    BrokerSession, BrokerSessionError, SessionPhase, SessionStartOptions, StartOutcome,
 };
 use lasper_guest_protocol::{
     ExitReason, PreparationControl, PreparationControlKind, StartAcceptedFrame, StartFrame,
@@ -121,9 +121,12 @@ async fn start_while_keep_is_pending(cancel: bool) {
         assert_eq!(session.snapshot().phase(), SessionPhase::Prepared);
     } else {
         acknowledge.send(()).unwrap();
-        assert!(drive_io(&mut start).await.unwrap().is_none());
+        assert!(matches!(
+            drive_io(&mut start).await.unwrap(),
+            StartOutcome::Accepted { terminal: None }
+        ));
         drop(start);
-        assert_eq!(session.snapshot().phase(), SessionPhase::Started);
+        assert_eq!(session.snapshot().phase(), SessionPhase::StartAccepted);
     }
     assert!(session.snapshot().error().is_none());
     drive_io(session.close()).await.unwrap();

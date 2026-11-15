@@ -1,7 +1,7 @@
 use lasper_guest_protocol::{
     BrokerId, CommandArgv, ExecutionKind, GuestIdentityReply, GuestProcess, PreparationId,
     PrepareRequest, PrepareRequestFrame, ProjectionRequests, StartFrame, StartRequest,
-    TerminalEnvironment, TerminalSize, MAX_IDENTITY_MESSAGE_BYTES,
+    TerminalEnvironment, TerminalSize, MAX_EXECUTION_TIMEOUT_MS, MAX_IDENTITY_MESSAGE_BYTES,
 };
 use lasper_guest_runtime::session::*;
 use std::io::Read;
@@ -75,6 +75,10 @@ fn request(execution: ExecutionKind, argv: &[&'static str]) -> PrepareRequestFra
 }
 
 fn start(request: &PrepareRequestFrame<'_>) -> StartFrame {
+    start_with_timeout(request, None)
+}
+
+fn start_with_timeout(request: &PrepareRequestFrame<'_>, timeout_ms: Option<u64>) -> StartFrame {
     StartFrame::new(
         11,
         StartRequest::new(
@@ -83,6 +87,7 @@ fn start(request: &PrepareRequestFrame<'_>) -> StartFrame {
             None,
             None,
             request.request().initial_size(),
+            timeout_ms,
         )
         .unwrap(),
     )
@@ -296,6 +301,7 @@ fn terminal_scenario(context: &mut GuardianContext) {
         None,
         None,
         Some(TerminalSize::new(101, 37).unwrap()),
+        None,
     )
     .unwrap();
     worker.start(now_ms(), StartFrame::new(11, start)).unwrap();
@@ -670,9 +676,7 @@ fn lease_and_disconnect_scenario(context: &mut GuardianContext, connection: Sess
         observation.exec == Some(ExecOutcome::Started)
     });
     assert_eq!(worker.phase(), SessionPhase::Running);
-    assert!(worker
-        .next_deadline_ms()
-        .is_some_and(|deadline| deadline > now_ms()));
+    assert_eq!(worker.next_deadline_ms(), None);
     worker.connection_closed(now_ms(), connection);
     assert_eq!(worker.phase(), SessionPhase::Closing);
     finish(&mut worker, &request);
@@ -685,6 +689,124 @@ fn lease_and_disconnect_scenario(context: &mut GuardianContext, connection: Sess
     assert_eq!(worker.poll(now_ms()).unwrap().cleanup_reason, Some(reason));
 }
 
+fn unlimited_execution_scenario(context: &mut GuardianContext, execution: ExecutionKind) {
+    let request = request(execution, &["/bin/sleep", "30"]);
+    let mut worker = context
+        .spawn(&request, PREPARATION, now_ms(), entry)
+        .unwrap();
+    wait_for(&mut worker, |observation| observation.prepared);
+    let _ready = fixture::receive_ready(&mut worker, context.connection(), now_ms());
+    let accepted_at = now_ms();
+    worker.start(accepted_at, start(&request)).unwrap();
+    assert_eq!(worker.next_deadline_ms(), None);
+    wait_for(&mut worker, |observation| {
+        observation.exec == Some(ExecOutcome::Started)
+    });
+
+    let observation = worker.poll(advance_to(accepted_at + 120_000)).unwrap();
+    assert_eq!(observation.phase, SessionPhase::Running);
+    assert_eq!(observation.cleanup_reason, None);
+    assert_eq!(observation.worker.exit, None);
+    assert_eq!(worker.next_deadline_ms(), None);
+    assert_eq!(
+        finish(&mut worker, &request).cleanup,
+        CleanupProgress::Complete
+    );
+}
+
+fn execution_timeout_scenario(context: &mut GuardianContext, execution: ExecutionKind) {
+    let request = request(
+        execution,
+        &[
+            "/bin/sh",
+            "-c",
+            "trap '' HUP TERM; setsid --fork /bin/sh -c 'printf \"%s\" \"$$\" > /home/alice/timeout-child; exec /bin/sleep 30'; exec /bin/sleep 30",
+        ],
+    );
+    let mut worker = context
+        .spawn(&request, PREPARATION, now_ms(), entry)
+        .unwrap();
+    wait_for(&mut worker, |observation| observation.prepared);
+    let _ready = fixture::receive_ready(&mut worker, context.connection(), now_ms());
+    let start = start_with_timeout(&request, Some(1_000));
+    let accepted_at = advance_to(now_ms() + 10_000);
+    assert_eq!(
+        worker.poll(accepted_at).unwrap().phase,
+        SessionPhase::AwaitingStart
+    );
+    worker.start(accepted_at, start).unwrap();
+    assert_eq!(worker.next_deadline_ms(), Some(accepted_at + 1_000));
+    wait_for(&mut worker, |observation| {
+        observation.exec == Some(ExecOutcome::Started)
+    });
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let descendant = loop {
+        if let Ok(contents) =
+            std::fs::read_to_string(fixture::get().path("home/alice/timeout-child"))
+        {
+            if let Ok(pid) = contents.parse::<i32>() {
+                break pid;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "worker did not start its descendant"
+        );
+        std::thread::sleep(Duration::from_millis(2));
+    };
+    assert!(descendant > 0);
+    assert_ne!(unsafe { getpgid(descendant) }, worker.pid());
+    assert_eq!(
+        worker.poll(advance_to(accepted_at + 999)).unwrap().phase,
+        SessionPhase::Running
+    );
+    let observation = worker.poll(advance_to(accepted_at + 1_000)).unwrap();
+    assert_eq!(
+        observation.cleanup_reason,
+        Some(CleanupReason::ExecutionTimedOut)
+    );
+    assert!(matches!(
+        observation.phase,
+        SessionPhase::Closing | SessionPhase::CleanupPending
+    ));
+    let finished = finish(&mut worker, &request);
+    assert_eq!(finished.cleanup, CleanupProgress::Complete);
+    assert_eq!(
+        worker.poll(now_ms()).unwrap().cleanup_reason,
+        Some(CleanupReason::ExecutionTimedOut)
+    );
+    assert_eq!(unsafe { kill(descendant, 0) }, -1);
+    assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(3));
+    assert_eq!(unsafe { waitpid(-1, std::ptr::null_mut(), 1) }, -1);
+    assert_eq!(std::io::Error::last_os_error().raw_os_error(), Some(10));
+}
+
+fn maximum_execution_timeout_scenario(context: &mut GuardianContext, execution: ExecutionKind) {
+    let request = request(execution, &["/bin/sleep", "30"]);
+    let mut worker = context
+        .spawn(&request, PREPARATION, now_ms(), entry)
+        .unwrap();
+    wait_for(&mut worker, |observation| observation.prepared);
+    let _ready = fixture::receive_ready(&mut worker, context.connection(), now_ms());
+    let accepted_at = advance_to(now_ms() + 10_000);
+    worker
+        .start(
+            accepted_at,
+            start_with_timeout(&request, Some(MAX_EXECUTION_TIMEOUT_MS)),
+        )
+        .unwrap();
+    let deadline = accepted_at + MAX_EXECUTION_TIMEOUT_MS;
+    assert_eq!(worker.next_deadline_ms(), Some(deadline));
+    wait_for(&mut worker, |observation| {
+        observation.exec == Some(ExecOutcome::Started)
+    });
+    let observation = worker.poll(advance_to(accepted_at + 120_000)).unwrap();
+    assert_eq!(observation.phase, SessionPhase::Running);
+    assert_eq!(observation.cleanup_reason, None);
+    assert_eq!(worker.next_deadline_ms(), Some(deadline));
+    finish(&mut worker, &request);
+}
+
 fn wrong_start_scenario(context: &mut GuardianContext) {
     let request = request(ExecutionKind::Bounded, &["/bin/true"]);
     let mut worker = context
@@ -692,7 +814,15 @@ fn wrong_start_scenario(context: &mut GuardianContext) {
         .unwrap();
     wait_for(&mut worker, |observation| observation.prepared);
     let _ready = fixture::receive_ready(&mut worker, context.connection(), now_ms());
-    let wrong = StartRequest::new(&request, PreparationId::new([3; 16]), None, None, None).unwrap();
+    let wrong = StartRequest::new(
+        &request,
+        PreparationId::new([3; 16]),
+        None,
+        None,
+        None,
+        None,
+    )
+    .unwrap();
     assert!(matches!(
         worker.start(now_ms(), StartFrame::new(11, wrong)),
         Err(GuardianError::InvalidStart(
@@ -744,6 +874,28 @@ pub(super) const SCENARIOS: &[(&str, super::ScenarioFn)] = &[
         bounded_start_scenario,
     ),
     ("PTY ownership and Start dimensions", terminal_scenario),
+    ("bounded execution is unlimited by default", |context| {
+        unlimited_execution_scenario(context, ExecutionKind::Bounded)
+    }),
+    ("interactive execution is unlimited by default", |context| {
+        unlimited_execution_scenario(context, ExecutionKind::Interactive)
+    }),
+    (
+        "bounded execution timeout starts at Start and reaps descendants",
+        |context| execution_timeout_scenario(context, ExecutionKind::Bounded),
+    ),
+    (
+        "interactive execution timeout starts at Start and reaps descendants",
+        |context| execution_timeout_scenario(context, ExecutionKind::Interactive),
+    ),
+    (
+        "bounded execution accepts the protocol's maximum timeout",
+        |context| maximum_execution_timeout_scenario(context, ExecutionKind::Bounded),
+    ),
+    (
+        "interactive execution accepts the protocol's maximum timeout",
+        |context| maximum_execution_timeout_scenario(context, ExecutionKind::Interactive),
+    ),
     ("guest exec failure", exec_failure_scenario),
     ("guest account failure", account_failure_scenario),
     (

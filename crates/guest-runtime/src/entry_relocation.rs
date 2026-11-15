@@ -1,5 +1,6 @@
 use super::syscall::syscall3;
 use super::uapi::{memory::PROT_READ, nr};
+use lasper_guest_runtime::failure::FailureClass;
 
 #[repr(C)]
 pub(super) struct Dynamic {
@@ -51,7 +52,7 @@ pub(super) unsafe extern "C" fn relocate(
         return;
     }
     if entry_size != core::mem::size_of::<Rela>() || !bytes.is_multiple_of(entry_size) {
-        super::exit_group(127);
+        super::exit_group(FailureClass::Artifact as i32);
     }
     let mut offset = 0;
     while offset < bytes {
@@ -61,7 +62,7 @@ pub(super) unsafe extern "C" fn relocate(
         #[cfg(target_arch = "aarch64")]
         const RELATIVE: usize = 1027;
         if unsafe { (*relocation).info } != RELATIVE {
-            super::exit_group(127);
+            super::exit_group(FailureClass::Artifact as i32);
         }
         let destination = base.wrapping_add(unsafe { (*relocation).offset }) as *mut usize;
         unsafe { destination.write(base.wrapping_add_signed((*relocation).addend)) };
@@ -103,7 +104,7 @@ struct ProgramHeader {
 unsafe fn protect_relro(base: usize, page_size: usize) {
     let header = base as *const ElfHeader;
     if unsafe { (*header).program_bytes as usize } != core::mem::size_of::<ProgramHeader>() {
-        super::exit_group(127);
+        super::exit_group(FailureClass::Artifact as i32);
     }
     let table =
         base.wrapping_add(unsafe { (*header).program_offset as usize }) as *const ProgramHeader;
@@ -112,20 +113,20 @@ unsafe fn protect_relro(base: usize, page_size: usize) {
         if program.kind == 0x6474_e552 && program.memory_bytes != 0 {
             let address = match base.checked_add(program.address as usize) {
                 Some(address) => address,
-                None => super::exit_group(127),
+                None => super::exit_group(FailureClass::Artifact as i32),
             };
             let Some(end) = address.checked_add(program.memory_bytes as usize) else {
-                super::exit_group(127);
+                super::exit_group(FailureClass::Artifact as i32);
             };
             // Rounding an unaligned end down would leave RELRO bytes writable.
             // This check is needed even when artifact verification was skipped.
             if !end.is_multiple_of(page_size) {
-                super::exit_group(127);
+                super::exit_group(FailureClass::Artifact as i32);
             }
             let start = address & !(page_size - 1);
             let result = unsafe { syscall3(nr::MPROTECT, start, end - start, PROT_READ) };
             if result < 0 {
-                super::exit_group(127);
+                super::exit_group(FailureClass::Artifact as i32);
             }
         }
     }
@@ -153,7 +154,7 @@ pub(super) unsafe fn page_size(stack: *const usize) -> usize {
         }
         cursor = unsafe { cursor.add(2) };
     }
-    super::exit_group(127)
+    super::exit_group(FailureClass::Artifact as i32)
 }
 
 const _: () = {

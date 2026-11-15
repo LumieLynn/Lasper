@@ -186,10 +186,6 @@ impl<'a> GuardianWorker<'a> {
         })
     }
 
-    pub fn bounded(&self) -> bool {
-        self.request.request().execution() == ExecutionKind::Bounded
-    }
-
     pub const fn pid(&self) -> i32 {
         self.pid
     }
@@ -330,6 +326,7 @@ impl<'a> GuardianWorker<'a> {
             start.wayland_display(),
             start.x11_display(),
             start.terminal_size(),
+            start.execution_timeout_ms(),
         )
         .map_err(GuardianError::InvalidStart)?;
         Ok(())

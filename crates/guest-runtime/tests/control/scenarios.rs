@@ -59,8 +59,45 @@ fn output_pressure(privileged: bool) {
         output.stdout().len() + output.stderr().len(),
         MAX_CAPTURED_OUTPUT_BYTES
     );
+    assert_eq!(output.stdout().len(), MAX_CAPTURED_OUTPUT_BYTES / 2);
+    assert_eq!(output.stderr().len(), MAX_CAPTURED_OUTPUT_BYTES / 2);
     assert!(output.stdout().truncated() && output.stderr().truncated());
     assert!(output.stdout().complete() && output.stderr().complete());
+    client.wait();
+}
+
+fn late_stderr(privileged: bool) {
+    let mut client = Client::prepared(
+        "late-stderr",
+        privileged,
+        ExecutionKind::Bounded,
+        &[
+            "/bin/sh",
+            "-c",
+            "printf '%200000s' x; printf 'late error' >&2; exit 7",
+        ],
+    );
+    client.start();
+    let frame = client.finish();
+    let exit = ExitFrame::decode_for(
+        &client.request,
+        client.ready.response().preparation_id(),
+        frame.header,
+        &frame.payload,
+        0,
+    )
+    .unwrap();
+    let output = exit.output().unwrap();
+    let mut bytes = [0; 10];
+    assert_eq!(output.stderr().write_into(&mut bytes).unwrap(), bytes.len());
+    assert_eq!(&bytes, b"late error");
+    assert!(!output.stderr().truncated());
+    assert!(output.stdout().truncated());
+    assert_eq!(
+        output.stdout().len(),
+        MAX_CAPTURED_OUTPUT_BYTES - bytes.len()
+    );
+    assert_eq!(exit.report().command_exit(), Some(ExitStatus::Exited(7)));
     client.wait();
 }
 
@@ -101,6 +138,30 @@ fn control_and_cancel(privileged: bool) {
     client.wait();
 }
 
+fn execution_timeout(privileged: bool, execution: ExecutionKind) {
+    let mut client = Client::prepared(
+        "execution-timeout",
+        privileged,
+        execution,
+        &["/bin/sleep", "30"],
+    );
+    client.start_with_timeout(Some(200));
+    let frame = client.finish();
+    let exit = ExitFrame::decode_for(
+        &client.request,
+        client.ready.response().preparation_id(),
+        frame.header,
+        &frame.payload,
+        frame.descriptors.len(),
+    )
+    .unwrap();
+    assert_eq!(exit.report().reason(), ExitReason::ExecutionTimedOut);
+    assert_eq!(exit.report().cleanup(), CleanupStatus::Complete);
+    assert!(exit.report().exit().is_some());
+    assert_eq!(exit.report().command_exit(), None);
+    client.wait();
+}
+
 fn bad_start(privileged: bool) {
     let mut client = Client::prepared(
         "bad-start",
@@ -113,6 +174,7 @@ fn bad_start(privileged: bool) {
         StartRequest::new(
             &client.request,
             PreparationId::new([9; 16]),
+            None,
             None,
             None,
             None,
@@ -167,6 +229,11 @@ fn exec_failure(privileged: bool) {
         ExecutionStatus::Failed { errno: 2 }
     );
     assert_eq!(exit.report().reason(), ExitReason::ExecFailed);
+    assert_eq!(
+        exit.report().failure().unwrap().stage(),
+        GuestFailureStage::Exec
+    );
+    assert_eq!(exit.report().failure().unwrap().errno(), 2);
     client.wait();
 }
 
@@ -265,6 +332,7 @@ fn account_failure(privileged: bool) {
     )
     .unwrap();
     assert_eq!(error.errno(), Some(2));
+    assert_eq!(error.stage(), Some(GuestFailureStage::Account));
     assert!(guardian.wait().success());
     std::fs::remove_dir_all(
         std::env::temp_dir().join(format!("lasper-account-test-{}", guardian.child.id())),
@@ -274,12 +342,24 @@ fn account_failure(privileged: bool) {
 
 pub const SCENARIOS: &[super::Scenario] = &[
     (
+        "bounded execution reports its explicit timeout",
+        |privileged| execution_timeout(privileged, ExecutionKind::Bounded),
+    ),
+    (
+        "interactive execution reports its explicit timeout",
+        |privileged| execution_timeout(privileged, ExecutionKind::Interactive),
+    ),
+    (
         "bounded command retains binary output and wait status",
         bounded,
     ),
     (
         "output pipes keep draining beyond the capture budget",
         output_pressure,
+    ),
+    (
+        "late stderr retains space after stdout floods the capture",
+        late_stderr,
     ),
     (
         "lease, Recheck and Cancel use the assigned preparation",

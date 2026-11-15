@@ -87,8 +87,8 @@ fn request() -> Vec<u8> {
     bytes
 }
 
-fn rejected(guardian: &mut GuardianProcess, reason: &str) {
-    assert_eq!(guardian.wait().code(), Some(70));
+fn rejected(guardian: &mut GuardianProcess, reason: &str, code: i32) {
+    assert_eq!(guardian.wait().code(), Some(code));
     let mut diagnostic = String::new();
     guardian
         .child
@@ -108,7 +108,7 @@ fn incomplete_hello(length: usize) {
     let mut guardian = spawn("hello-incomplete");
     guardian.release();
     guardian.control.write_all(&request()[..length]).unwrap();
-    rejected(&mut guardian, "HelloExpired");
+    rejected(&mut guardian, "HelloExpired", 75);
     assert_eq!(guardian.control.read(&mut [0]).unwrap(), 0);
 }
 
@@ -126,7 +126,7 @@ fn original_deadline() {
     guardian.control.write_all(&request()[..3]).unwrap();
     std::thread::sleep(Duration::from_millis(100));
     guardian.control.write_all(&request()[3..8]).unwrap();
-    rejected(&mut guardian, "HelloExpired");
+    rejected(&mut guardian, "HelloExpired", 75);
     assert!(started.elapsed() < Duration::from_millis(900));
 }
 
@@ -134,7 +134,7 @@ fn blocked_response() {
     let mut guardian = spawn("hello-backpressure");
     guardian.release();
     guardian.control.write_all(&request()).unwrap();
-    rejected(&mut guardian, "HelloExpired");
+    rejected(&mut guardian, "HelloExpired", 75);
     let mut bytes = Vec::new();
     guardian.control.read_to_end(&mut bytes).unwrap();
     assert!(!bytes.is_empty());
@@ -149,7 +149,7 @@ fn broker_lost() {
         .write_all(&request()[..CONTROL_FRAME_HEADER_BYTES + 1])
         .unwrap();
     guardian.broker.take();
-    assert_eq!(guardian.wait().code(), Some(70));
+    assert_eq!(guardian.wait().code(), Some(69));
     let mut diagnostic = String::new();
     guardian
         .child
@@ -181,7 +181,7 @@ fn supervisor_stop() {
         std::thread::sleep(Duration::from_millis(1));
     }
     assert_eq!(unsafe { kill(guardian.child.id() as i32, 15) }, 0);
-    rejected(&mut guardian, "SupervisorStopped(15)");
+    rejected(&mut guardian, "SupervisorStopped(15)", 69);
 }
 
 fn invalid_payload() {
@@ -190,7 +190,7 @@ fn invalid_payload() {
     let header = ControlFrameHeader::new(MessageKind::HelloRequest, 1, 1, 0).unwrap();
     guardian.control.write_all(&header.encode()).unwrap();
     guardian.control.write_all(b"{").unwrap();
-    rejected(&mut guardian, "HelloPayload(InvalidJson)");
+    rejected(&mut guardian, "HelloPayload(InvalidJson)", 65);
 }
 
 fn hello_only() {

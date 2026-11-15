@@ -88,7 +88,7 @@ fn allocation_failure(context: &mut GuardianContext) {
                 state.worker.failure,
                 Some(WorkerFailure::new(WorkerStage::Memory, 12))
             );
-            assert_eq!(state.worker.exit, Some(WorkerExit::Exited(126)));
+            assert_eq!(state.worker.exit, Some(WorkerExit::Exited(71)));
             return;
         }
         assert!(clock.elapsed() < Duration::from_secs(4), "{state:?}");
@@ -127,7 +127,7 @@ fn maximum_argv(context: &mut GuardianContext) {
         assert_eq!(state.worker.error, None, "{state:?}");
         if !started && state.phase == SessionPhase::Prepared {
             let _ready = fixture::receive_ready(&mut worker, context.connection(), now);
-            let start = StartRequest::new(&request, PREPARATION, None, None, None).unwrap();
+            let start = StartRequest::new(&request, PREPARATION, None, None, None, None).unwrap();
             worker.start(now, StartFrame::new(11, start)).unwrap();
             started = true;
         }

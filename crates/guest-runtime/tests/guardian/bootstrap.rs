@@ -242,29 +242,29 @@ fn prunes_inherited_descriptors() {
     std::fs::remove_file(path).unwrap();
 }
 
-fn rejected_startup(name: &str, action: impl FnOnce(&mut GuardianProcess)) {
+fn rejected_startup(name: &str, code: i32, action: impl FnOnce(&mut GuardianProcess)) {
     let mut command = command(name);
     if name == "expired" {
         command.args(["--accepted-at-ms", "0"]);
     }
     let mut guardian = GuardianProcess::spawn(command).unwrap();
     action(&mut guardian);
-    assert_eq!(guardian.wait().code(), Some(70));
+    assert_eq!(guardian.wait().code(), Some(code));
     assert_eq!(guardian.control.read(&mut [0]).unwrap(), 0);
 }
 
 fn broker_eof_before_go() {
-    rejected_startup("gate", |guardian| {
+    rejected_startup("gate", 69, |guardian| {
         guardian.broker.take();
     });
 }
 fn invalid_go() {
-    rejected_startup("gate", |guardian| {
+    rejected_startup("gate", 65, |guardian| {
         guardian.broker.as_mut().unwrap().write_all(&[99]).unwrap();
     });
 }
 fn expired_startup() {
-    rejected_startup("expired", |_| {});
+    rejected_startup("expired", 75, |_| {});
 }
 
 fn supervisor_loss(name: &str) {

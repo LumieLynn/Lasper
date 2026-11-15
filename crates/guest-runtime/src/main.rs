@@ -16,6 +16,7 @@ use uapi::{errno::EINTR, nr};
 use core::arch::{asm, global_asm};
 use core::ffi::CStr;
 use core::panic::PanicInfo;
+use lasper_guest_runtime::failure::FailureClass;
 use lasper_guest_runtime::paths;
 
 #[cfg(not(target_os = "linux"))]
@@ -64,7 +65,7 @@ global_asm!(
 
 #[panic_handler]
 fn panic(_: &PanicInfo<'_>) -> ! {
-    exit_group(127)
+    exit_group(FailureClass::Internal.exit_code())
 }
 
 /// Dispatches the invocation supplied on the Linux process entry stack.
@@ -93,7 +94,7 @@ unsafe extern "C" fn runtime_entry(initial_stack: *const usize) -> ! {
                 2,
                 b"lasper guest runtime: automatic init wrapper requires PID 1\n",
             );
-            exit_group(64);
+            exit_group(FailureClass::Usage.exit_code());
         }
         let init = paths::ORIGINAL_INIT.as_ptr();
         // BusyBox chooses its init applet from argv[0].
@@ -107,7 +108,11 @@ unsafe extern "C" fn runtime_entry(initial_stack: *const usize) -> ! {
     }
     if argc >= 2 && unsafe { c_string_equals((*argv.add(1)).cast(), cli::WRAP_COMMAND) } {
         if argc == 3 && unsafe { is_help((*argv.add(2)).cast()) } {
-            exit_group(if write_all(1, cli::WRAP_HELP) { 0 } else { 74 });
+            exit_group(if write_all(1, cli::WRAP_HELP) {
+                0
+            } else {
+                FailureClass::Io.exit_code()
+            });
         }
         if argc >= 4 && unsafe { c_string_equals((*argv.add(2)).cast(), b"--") } {
             let payload = unsafe { argv.add(3) };
@@ -119,7 +124,7 @@ unsafe extern "C" fn runtime_entry(initial_stack: *const usize) -> ! {
             unsafe { entry_stack::run(&invocation, page_size) };
         }
         let _ = write_all(2, cli::WRAP_ERROR);
-        exit_group(64);
+        exit_group(FailureClass::Usage.exit_code());
     }
     if argc == 3 {
         let argument = unsafe { *initial_stack.add(2) as *const u8 };
@@ -141,18 +146,18 @@ unsafe extern "C" fn runtime_entry(initial_stack: *const usize) -> ! {
             if write_all(1, &identity) {
                 exit_group(0);
             }
-            exit_group(74);
+            exit_group(FailureClass::Io.exit_code());
         }
         if unsafe { is_help(argument) } {
             if write_all(1, cli::HELP) {
                 exit_group(0);
             }
-            exit_group(74);
+            exit_group(FailureClass::Io.exit_code());
         }
     }
 
     let _ = write_all(2, cli::ERROR);
-    exit_group(64)
+    exit_group(FailureClass::Usage.exit_code())
 }
 
 /// # Safety

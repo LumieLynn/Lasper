@@ -1,4 +1,5 @@
 mod args;
+mod outcome;
 mod paths;
 mod target;
 mod terminal;
@@ -6,10 +7,11 @@ mod terminal;
 use anyhow::{bail, Context, Result};
 use lasper_guest_host_transport::{
     BrokerConnection, BrokerSession, MachineTarget, SessionExit, SessionPhase, SessionStartOptions,
+    StartOutcome,
 };
 use lasper_guest_protocol::{
-    CleanupStatus, CommandArgv, ControlLimits, ExecutionKind, ExecutionStatus, ExitStatus,
-    GuestProcess, PrepareRequest, ProjectionRequests, TerminalEnvironment,
+    CommandArgv, ControlLimits, ExecutionKind, GuestProcess, PrepareRequest, ProjectionRequests,
+    TerminalEnvironment,
 };
 use std::{
     io::{self, Write},
@@ -85,14 +87,22 @@ async fn run(args: args::Args) -> Result<u8> {
     let mut session =
         BrokerSession::prepare(connection, request, Instant::now() + Duration::from_secs(5))
             .await?;
-    let master = session
+    let start = session
         .start(SessionStartOptions {
             terminal_size: size,
+            execution_timeout: args.execution_timeout,
             ..Default::default()
         })
         .await?;
     let mut stop = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let execution = async {
+        let master = match start {
+            StartOutcome::Accepted { terminal } => terminal,
+            StartOutcome::Reported(_) => return finish(&mut session).await,
+            StartOutcome::Unknown { cause } => {
+                bail!("guest Start outcome is unknown; the command may have run: {cause}")
+            }
+        };
         if let Some(terminal) = terminal {
             let relay = terminal.relay(master.context("interactive start did not return a PTY")?);
             tokio::pin!(relay);
@@ -138,16 +148,7 @@ async fn run(args: args::Args) -> Result<u8> {
             }
         }
     }
-    let report = exit.report();
-    if report.execution() != ExecutionStatus::Started || report.cleanup() != CleanupStatus::Complete
-    {
-        bail!("guest execution did not complete normally: {report:?}");
-    }
-    match report.exit() {
-        Some(ExitStatus::Exited(code)) => Ok(code),
-        Some(ExitStatus::Signaled(signal)) => Ok(128u8.saturating_add(signal)),
-        None => bail!("guest exit status missing: {report:?}"),
-    }
+    outcome::exit_status(exit.report())
 }
 
 async fn finish(session: &mut BrokerSession) -> Result<Arc<SessionExit>> {

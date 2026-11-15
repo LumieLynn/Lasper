@@ -1,8 +1,8 @@
 use lasper_guest_protocol::{
     BrokerId, ControlFrameHeader, ControlReplyFrame, ControlReplyStatus, ErrorFrame, ExecutionKind,
-    GuestErrorCode, GuestOperation, MessageKind, PreparationControl, PreparationControlFrame,
-    PreparationControlKind, PreparationId, SessionFrameError, SessionPayloadError,
-    CONTROL_FRAME_HEADER_BYTES, MAX_PREPARED_LEASE_MS,
+    GuestErrorCode, GuestFailureStage, GuestOperation, MessageKind, PreparationControl,
+    PreparationControlFrame, PreparationControlKind, PreparationId, SessionFrameError,
+    SessionPayloadError, CONTROL_FRAME_HEADER_BYTES, MAX_PREPARED_LEASE_MS,
 };
 
 use super::support::{preparation, request, resized};
@@ -245,4 +245,57 @@ fn error_reply_cannot_change_the_operation_or_preparation_being_rejected() {
             SessionPayloadError::InvalidResponse
         ))
     );
+}
+
+#[test]
+fn worker_rejections_preserve_and_validate_the_failed_stage() {
+    let request = request(ExecutionKind::Bounded);
+    let request_header =
+        ControlFrameHeader::new(MessageKind::PrepareRequest, request.request_id(), 0, 0).unwrap();
+    let reply = ErrorFrame::new(
+        request.request_id(),
+        request.broker_id(),
+        None,
+        GuestOperation::Prepare,
+        GuestErrorCode::System,
+        Some(13),
+    )
+    .unwrap()
+    .with_stage(Some(GuestFailureStage::HomeDirectory))
+    .unwrap();
+    let mut bytes = [0; 1024];
+    let (header, length) = reply.encode_parts(&mut bytes).unwrap();
+    let decoded =
+        ErrorFrame::decode_for(request_header, &request, None, header, &bytes[..length], 0)
+            .unwrap();
+    assert_eq!(decoded, reply);
+    assert_eq!(decoded.stage(), Some(GuestFailureStage::HomeDirectory));
+    assert_eq!(decoded.errno(), Some(13));
+    let text = std::str::from_utf8(&bytes[..length]).unwrap();
+    for invalid in [
+        text.replace("\"system\"", "\"expired\""),
+        text.replace("\"home_directory\"", "\"not_a_stage\""),
+        text.replace("\"errno\":13", "\"errno\":0"),
+    ] {
+        assert!(ErrorFrame::decode_for(
+            request_header,
+            &request,
+            None,
+            resized(header, invalid.len()),
+            invalid.as_bytes(),
+            0
+        )
+        .is_err());
+    }
+    assert!(ErrorFrame::new(
+        request.request_id(),
+        request.broker_id(),
+        None,
+        GuestOperation::Prepare,
+        GuestErrorCode::Expired,
+        None
+    )
+    .unwrap()
+    .with_stage(Some(GuestFailureStage::Account))
+    .is_err());
 }

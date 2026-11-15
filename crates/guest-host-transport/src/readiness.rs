@@ -1,8 +1,9 @@
 use crate::process::ProcessHandle;
+use crate::UnixControlStream;
 use lasper_guest_protocol::{
     BrokerId, ControlLimits, EnforcedControlLimits, FeatureSet, HelloNegotiationError,
-    HelloRequest, HelloResponse, PrepareReady, PrepareRequest, PrepareRequestFrame,
-    ProtocolVersion, MIN_HELPER_CONTROL_FRAME_BYTES,
+    HelloRequest, PrepareReady, PrepareRequest, PrepareRequestFrame,
+    MIN_HELPER_CONTROL_FRAME_BYTES,
 };
 use std::fmt;
 use std::io;
@@ -38,18 +39,22 @@ impl WorkerHello {
         self.request
     }
 
-    pub fn negotiate(
+    /// Reads the completed Hello from this stream, which must remain usable.
+    /// Checks this request and the worker-specific minimum frame capacity.
+    pub fn complete(
         self,
-        protocol_version: ProtocolVersion,
-        response: HelloResponse,
+        stream: &UnixControlStream,
     ) -> Result<WorkerReadiness, WorkerReadinessError> {
-        let limits = self
-            .request
-            .negotiate(protocol_version, response)
-            .map_err(WorkerReadinessError::Negotiation)?;
+        let hello = stream
+            .negotiated_hello()
+            .ok_or(WorkerReadinessError::HelloUnavailable)?;
+        if hello.request() != self.request {
+            return Err(WorkerReadinessError::MismatchedHello);
+        }
+        let limits = hello.limits();
         require_frame_capacity(limits.get().max_control_frame_bytes())?;
         Ok(WorkerReadiness {
-            broker: response.broker_id(),
+            broker: hello.response().broker_id(),
             limits,
         })
     }
@@ -93,6 +98,8 @@ pub enum WorkerReadinessError {
     PidfdUnavailable(io::Error),
     HostInspectionUnavailable(io::Error),
     Negotiation(HelloNegotiationError),
+    HelloUnavailable,
+    MismatchedHello,
     DescriptorLimit { required: u16, available: u16 },
     FrameLimit { available: u32 },
 }
@@ -106,6 +113,8 @@ impl fmt::Display for WorkerReadinessError {
                 if !available.contains(FeatureSet::WORKER_PIDFD) && required.contains(FeatureSet::WORKER_PIDFD) =>
                 formatter.write_str("helper does not support worker pidfd assignment"),
             Self::Negotiation(error) => write!(formatter, "helper Hello negotiation failed: {error:?}"),
+            Self::HelloUnavailable => formatter.write_str("worker readiness requires a usable control stream with a completed Hello"),
+            Self::MismatchedHello => formatter.write_str("completed Hello does not match this worker request"),
             Self::DescriptorLimit { required, available } => write!(formatter, "helper preparation requires {required} descriptors, negotiated limit is {available}"),
             Self::FrameLimit { available } => write!(formatter, "helper session needs at least {MIN_HELPER_CONTROL_FRAME_BYTES} control-frame bytes; available {available}"),
         }

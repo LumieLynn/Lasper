@@ -9,6 +9,7 @@ use lasper_guest_protocol::{Architecture, RuntimeIdentity};
 pub mod broker;
 #[doc(hidden)]
 pub mod diagnostic;
+pub mod failure;
 pub mod identity;
 mod linux;
 pub use linux::signals::SupervisorSignal;

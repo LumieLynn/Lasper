@@ -59,7 +59,7 @@ impl WorkerChannels {
             .send(&self.status)
             .is_err()
         {
-            linux::exit(126);
+            linux::exit(crate::failure::FailureClass::Io.exit_code());
         }
         // SAFETY: Only this child owns the worker endpoint after descriptor pruning.
         let identity =
@@ -274,12 +274,12 @@ fn decode_start(
     } else {
         None
     };
-    StartRequest::new(request, preparation, wayland, x11, size).map_err(|_| invalid)
+    StartRequest::new(request, preparation, wayland, x11, size, None).map_err(|_| invalid)
 }
 
 fn fail(status: &Descriptor, failure: WorkerFailure) -> ! {
     let _ = StatusMessage::Failed(failure).send(status);
-    linux::exit(126)
+    linux::exit(failure.class().exit_code())
 }
 
 #[cfg(test)]

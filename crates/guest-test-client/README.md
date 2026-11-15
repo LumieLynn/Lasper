@@ -128,7 +128,15 @@ You should see both output lines followed by `client exit=7`. This confirms that
 
 The `--` separator after `exec` separates client options from the guest command. The program must be specified by an absolute path inside the guest. The default user is root; use `--user` to select another existing guest account. The client does not create users or install programs.
 
-Ordinary `exec` runs a bounded command for at most 60 seconds and returns the captured output after it exits. Output size is limited, and the client prints a warning if the capture is truncated or incomplete. This mode is therefore unsuitable for following continuous logs. Command-line argument errors return 2. Connection or session errors in the client print a diagnostic to stderr and return 125.
+Commands have no execution time limit by default. Use `exec --timeout SECONDS` to set a positive whole-second budget, including with `--tty`. The client rejects values above the protocol's maximum execution budget before connecting. The guest measures this budget from acceptance of Start; preparation and the wait before Start do not count. For example, the following command has three minutes to run:
+
+```sh
+sudo "$CLIENT" exec --machine lasper-test --timeout 180 -- /bin/sleep 120
+```
+
+Ordinary `exec` returns captured output after the command exits. Capture is limited to 64 KiB in total, independently of the execution timeout. Each stream is guaranteed half of the available budget and can borrow space its peer has not used; later stderr can reclaim its share even after stdout has filled the buffer. The client warns when output is truncated or incomplete. This mode is unsuitable for following continuous logs.
+
+For an ordinary worker exit with complete cleanup, the client returns its exit code or `128 + signal`. A command that finishes before the guardian can confirm exec still retains its known exit status. Session failures, including the execution deadline, return 125 with a diagnostic even if the worker subsequently exits with status 0. If Start acceptance cannot be determined, the diagnostic states that the command may have run; the client does not retry it. Guest setup and exec failures retain their failed stage and errno in the diagnostic. Command-line argument errors return 2.
 
 ### Opening an interactive shell
 

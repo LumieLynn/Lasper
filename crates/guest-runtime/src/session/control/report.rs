@@ -4,32 +4,44 @@ use super::super::{
 };
 use lasper_guest_protocol::{
     CleanupStatus, ExecutionStatus, ExitReason, ExitReport, ExitStatus, GuestErrorCode,
+    GuestFailure, GuestFailureStage,
 };
 
-pub(super) fn prepare_error(
-    reason: CleanupReason,
-    worker: WorkerObservation,
-) -> (GuestErrorCode, Option<i32>) {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct PrepareError {
+    pub code: GuestErrorCode,
+    pub errno: Option<i32>,
+    pub stage: Option<GuestFailureStage>,
+}
+
+pub(super) fn prepare_error(reason: CleanupReason, worker: WorkerObservation) -> PrepareError {
     // Cleanup may subsequently record a worker failure. Keep the reason that
     // ended preparation instead of reporting that secondary failure as its cause.
-    match reason {
+    let (code, errno, stage) = match reason {
         CleanupReason::PreparationExpired | CleanupReason::LeaseExpired => {
-            return (GuestErrorCode::Expired, None);
+            (GuestErrorCode::Expired, None, None)
         }
         CleanupReason::WorkerExitedBeforeStart => {
-            return (GuestErrorCode::WorkerExitedBeforeStart, None);
+            (GuestErrorCode::WorkerExitedBeforeStart, None, None)
         }
-        _ => {}
-    }
-    let errno = match (worker.failure, worker.error) {
-        (Some(failure), _) => Some(failure.errno),
-        (_, Some(GuardianError::System { errno, .. })) => Some(errno),
-        _ => None,
+        _ => match (worker.failure, worker.error) {
+            (Some(failure), _) if reason == CleanupReason::WorkerPreparationFailed => (
+                GuestErrorCode::System,
+                Some(failure.errno),
+                Some(failure.stage),
+            ),
+            (_, Some(GuardianError::System { errno, .. }))
+                if matches!(
+                    reason,
+                    CleanupReason::WorkerPreparationFailed | CleanupReason::WorkerObservationFailed
+                ) =>
+            {
+                (GuestErrorCode::System, Some(errno), None)
+            }
+            _ => (GuestErrorCode::Unavailable, None, None),
+        },
     };
-    match errno {
-        Some(errno) => (GuestErrorCode::System, Some(errno)),
-        None => (GuestErrorCode::Unavailable, None),
-    }
+    PrepareError { code, errno, stage }
 }
 
 pub(super) fn report(
@@ -72,9 +84,21 @@ pub(super) fn report(
         CleanupReason::SupervisorStopped => ExitReason::SupervisorStopped,
         CleanupReason::ExecutionTimedOut => ExitReason::ExecutionTimedOut,
     };
-    ExitReport::new(execution, exit, cleanup, reason)
-        .map(Some)
-        .map_err(|_| GuardianError::ReplyEncoding)
+    let report = ExitReport::new(execution, exit, cleanup, reason)
+        .map_err(|_| GuardianError::ReplyEncoding)?;
+    // Optional failure details must not suppress the primary exit facts.
+    let failure = if matches!(
+        reason,
+        ExitReason::WorkerPreparationFailed | ExitReason::ExecFailed
+    ) {
+        observation
+            .worker
+            .failure
+            .and_then(|failure| GuestFailure::new(failure.stage, failure.errno).ok())
+    } else {
+        None
+    };
+    Ok(Some(report.with_failure(failure).unwrap_or(report)))
 }
 
 #[cfg(test)]

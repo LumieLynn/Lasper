@@ -2,7 +2,9 @@ use super::control::{unexpected_reply, ReplyValue, RequestPurpose};
 use super::operation::Operation;
 use super::worker::Worker;
 use super::{renewal, Owner};
-use crate::session::{BrokerSessionError, SessionExit, SessionPhase, OPERATION_TIMEOUT};
+use crate::session::{
+    BrokerSessionError, SessionExit, SessionPhase, StartOutcome, OPERATION_TIMEOUT,
+};
 use crate::ReceivedControlFrame;
 use lasper_guest_protocol::{ControlReplyStatus, ExitFrame, MessageKind};
 use std::sync::Arc;
@@ -69,9 +71,9 @@ impl Owner<'_> {
                 else {
                     return Err(unexpected_reply());
                 };
-                self.set_phase(SessionPhase::Started);
+                self.set_phase(SessionPhase::StartAccepted);
                 let terminal = self.worker.take_terminal();
-                if reply.send(Ok(terminal)).is_err() {
+                if reply.send(Ok(StartOutcome::Accepted { terminal })).is_err() {
                     self.abandon_start()?;
                 } else {
                     self.operation = Some(Operation::Delivering {
@@ -116,12 +118,14 @@ impl Owner<'_> {
             state.exit = Some(Arc::clone(&exit));
         });
         if let Some(operation) = self.operation.take() {
-            let error = if matches!(&operation, Operation::Starting { .. }) {
-                BrokerSessionError::StartInterrupted(Arc::clone(&exit))
-            } else {
-                BrokerSessionError::InvalidState(phase)
-            };
-            operation.reject(error);
+            match operation {
+                Operation::Starting { reply, .. } => {
+                    let _ = reply.send(Ok(StartOutcome::Reported(Arc::clone(&exit))));
+                }
+                operation => {
+                    operation.reject(BrokerSessionError::InvalidState(phase));
+                }
+            }
         }
         if let Some(pending) = self.pending.take() {
             if let RequestPurpose::Cleanup(Some(reply)) = pending.purpose {

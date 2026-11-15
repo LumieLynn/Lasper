@@ -1,7 +1,8 @@
 use lasper_guest_protocol::{
     ControlFrameError, ControlFrameHeader, ControlFrameHeaderError, ControlSessionError,
-    ControlSessionState, EnforcedControlLimits, CONTROL_FRAME_DESCRIPTOR_ANCHOR_BYTES,
-    CONTROL_FRAME_HEADER_BYTES, MAX_CONTROL_DESCRIPTORS,
+    ControlSessionState, EnforcedControlLimits, HelloRequest, HelloResponse, MessageKind,
+    CONTROL_FRAME_DESCRIPTOR_ANCHOR_BYTES, CONTROL_FRAME_HEADER_BYTES, HELLO_PAYLOAD_BUFFER_BYTES,
+    MAX_CONTROL_DESCRIPTORS,
 };
 use std::io;
 use std::mem::{size_of, zeroed};
@@ -10,7 +11,9 @@ use tokio::net::UnixStream;
 
 use crate::SCM_PIDFD;
 
+mod handshake;
 mod progress;
+pub use handshake::{HandshakeError, NegotiatedHello};
 use progress::ControlIo;
 pub(crate) use progress::ControlIoEvent;
 
@@ -36,6 +39,7 @@ pub struct UnixControlStream {
     stream: UnixStream,
     poisoned: bool,
     session: ControlSessionState,
+    negotiated: Option<NegotiatedHello>,
     io: ControlIo,
 }
 
@@ -45,19 +49,66 @@ impl UnixControlStream {
             stream,
             poisoned: false,
             session: ControlSessionState::host(),
+            negotiated: None,
             io: ControlIo::default(),
         }
     }
 
-    /// Starts enforcing the limits negotiated from this connection's Hello pair.
-    ///
-    /// Pass the result of negotiating the `HelloRequest` and `HelloResponse`
-    /// exchanged on this stream. The transport verifies the handshake phase,
-    /// but cannot associate this value with that specific exchange.
-    pub fn complete_hello(&mut self, limits: EnforcedControlLimits) -> io::Result<()> {
+    /// Exchanges Hello, retains its result on this stream and returns a snapshot.
+    /// The caller owns the deadline; cancellation during I/O closes the stream.
+    /// This does not verify the peer's machine membership or helper readiness.
+    pub async fn handshake(
+        &mut self,
+        request_id: u64,
+        request: HelloRequest,
+    ) -> Result<NegotiatedHello, HandshakeError> {
+        let mut payload = [0; HELLO_PAYLOAD_BUFFER_BYTES];
+        let length = request.encode_payload(&mut payload).map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid Hello request: {error:?}"),
+            )
+        })?;
+        let header =
+            ControlFrameHeader::new(MessageKind::HelloRequest, request_id, length as u32, 0)
+                .map_err(|error| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("invalid Hello header: {error:?}"),
+                    )
+                })?;
+        self.send_frame(header, &payload[..length], &[]).await?;
+        let frame = self.receive_frame().await?;
+        let result = (|| {
+            let response = HelloResponse::decode_payload(frame.payload())
+                .map_err(|error| invalid_data(format!("invalid Hello response: {error:?}")))?;
+            let limits = request
+                .negotiate(frame.header().protocol_version(), response)
+                .map_err(HandshakeError::Negotiation)?;
+            self.complete_hello(limits)?;
+            let negotiated = NegotiatedHello::new(request, response, limits);
+            self.negotiated = Some(negotiated);
+            Ok(negotiated)
+        })();
+        if result.is_err() {
+            self.poisoned = true;
+            shutdown_stream(&self.stream);
+        }
+        result
+    }
+
+    fn complete_hello(&mut self, limits: EnforcedControlLimits) -> io::Result<()> {
         self.session
             .complete_hello(limits)
             .map_err(invalid_outbound_session)
+    }
+
+    pub(crate) fn negotiated_hello(&self) -> Option<&NegotiatedHello> {
+        if self.can_continue() {
+            self.negotiated.as_ref()
+        } else {
+            None
+        }
     }
 
     /// A partial frame does not make this false while its progress is retained.

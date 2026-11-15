@@ -39,10 +39,11 @@ pub use prepare::{
 };
 pub use session::{
     CapturedOutput, CleanupStatus, ControlReplyFrame, ControlReplyStatus, ErrorFrame,
-    ExecutionStatus, ExitFrame, ExitReason, ExitReport, ExitStatus, GuestErrorCode, GuestOperation,
-    OutputStream, PreparationControl, PreparationControlFrame, PreparationControlKind,
-    SessionFrameError, SessionPayloadError, StartAcceptedFrame, StartFrame, StartRequest,
-    MAX_CAPTURED_OUTPUT_BYTES, MIN_HELPER_CONTROL_FRAME_BYTES,
+    ExecutionStatus, ExitFrame, ExitReason, ExitReport, ExitStatus, GuestErrorCode, GuestFailure,
+    GuestFailureStage, GuestOperation, OutputStream, PreparationControl, PreparationControlFrame,
+    PreparationControlKind, SessionFrameError, SessionPayloadError, StartAcceptedFrame, StartFrame,
+    StartRequest, MAX_CAPTURED_OUTPUT_BYTES, MAX_EXECUTION_TIMEOUT_MS,
+    MIN_HELPER_CONTROL_FRAME_BYTES,
 };
 pub use version::{ProtocolVersion, ProtocolVersionMismatch};
 

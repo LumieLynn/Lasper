@@ -4,11 +4,13 @@ use super::fixture::{
 use crate::control::{receive_guest_frame, send_guest_frame};
 use crate::session_clock::{advance_with_queued_frame, drive_io, snapshot};
 use crate::worker::TestWorker;
-use lasper_guest_host_transport::{BrokerSessionError, SessionPhase, SessionStartOptions};
+use lasper_guest_host_transport::{
+    BrokerSessionError, SessionPhase, SessionStartOptions, StartError, StartOutcome,
+};
 use lasper_guest_protocol::{
     CleanupStatus, ErrorFrame, ExecutionStatus, ExitReason, ExitReport, ExitStatus, GuestErrorCode,
-    GuestOperation, OutputStream, PreparationControl, PreparationControlFrame,
-    PreparationControlKind, StartAcceptedFrame, StartFrame,
+    GuestFailure, GuestFailureStage, GuestOperation, OutputStream, PreparationControl,
+    PreparationControlFrame, PreparationControlKind, StartAcceptedFrame, StartFrame,
 };
 use std::time::Duration;
 
@@ -88,12 +90,12 @@ async fn a_starting_write_failure_retains_the_queued_final_exit() {
     .await;
     release.send(()).unwrap();
     queued.recv_timeout(Duration::from_secs(3)).unwrap();
-    let error = start.await.unwrap_err();
+    let outcome = start.await.unwrap();
     assert!(
-        matches!(error, BrokerSessionError::StartOutcomeUnknown(ref cause)
-        if matches!(cause.as_ref(), BrokerSessionError::Io(error)
+        matches!(outcome, StartOutcome::Unknown { ref cause }
+        if matches!(cause, BrokerSessionError::Io(error)
             if error.raw_os_error() == Some(libc::EPIPE))),
-        "{error}"
+        "{outcome:?}"
     );
     let failed = snapshot(&mut state, |state| state.phase() == SessionPhase::Failed).await;
     assert!(failed.exit().unwrap().report().is_final());
@@ -150,8 +152,11 @@ async fn a_started_peer_rejection_does_not_lose_the_final_exit_on_close() {
     });
     let mut session = server.prepare().await;
     let mut state = session.subscribe();
-    session.start(SessionStartOptions::default()).await.unwrap();
-    assert_eq!(session.snapshot().phase(), SessionPhase::Started);
+    assert!(matches!(
+        session.start(SessionStartOptions::default()).await.unwrap(),
+        StartOutcome::Accepted { .. }
+    ));
+    assert_eq!(session.snapshot().phase(), SessionPhase::StartAccepted);
     release.send(()).unwrap();
     queued.recv_timeout(Duration::from_secs(3)).unwrap();
     assert!(session.close().await.is_ok());
@@ -200,6 +205,45 @@ async fn an_invalid_start_reply_does_not_hide_the_queued_execution_report() {
 #[tokio::test]
 async fn a_rejected_start_preserves_its_error_and_the_queued_final_exit() {
     failed_start_reply(true).await;
+}
+
+#[tokio::test]
+async fn an_exit_before_start_ack_retains_the_exec_failure_details() {
+    let failure = GuestFailure::new(GuestFailureStage::Exec, 2).unwrap();
+    let server = Server::spawn(move |guest, request| {
+        let _worker = ready(&guest, &request, 45_000);
+        reply(&guest, command(&guest, &request), 45_000);
+        let mut bytes = [0; 4096];
+        let frame = receive_guest_frame(&guest, &mut bytes).unwrap();
+        assert_eq!(
+            frame.header().kind(),
+            lasper_guest_protocol::MessageKind::Start
+        );
+        drop(frame);
+        let report = ExitReport::new(
+            ExecutionStatus::Failed { errno: 2 },
+            Some(ExitStatus::Exited(126)),
+            CleanupStatus::Complete,
+            ExitReason::ExecFailed,
+        )
+        .unwrap()
+        .with_failure(Some(failure))
+        .unwrap();
+        exit_report(
+            &guest,
+            &request,
+            report,
+            OutputStream::new(b"", false, true).unwrap(),
+        );
+    });
+    let mut session = server.prepare().await;
+    let outcome = session.start(SessionStartOptions::default()).await.unwrap();
+    let StartOutcome::Reported(exit) = outcome else {
+        panic!("expected an execution report, got {outcome:?}");
+    };
+    assert_eq!(exit.report().failure(), Some(failure));
+    assert!(exit.report().command_exit().is_none());
+    server.finish().await;
 }
 
 async fn failed_start_reply(rejected: bool) {
@@ -263,16 +307,21 @@ async fn failed_start_reply(rejected: bool) {
     .await;
     release.send(()).unwrap();
     queued.recv_timeout(Duration::from_secs(3)).unwrap();
-    let error = start.await.unwrap_err();
+    let result = start.await;
     if rejected {
         assert!(
-            matches!(error, BrokerSessionError::Rejected(ref frame) if frame.code() == GuestErrorCode::Expired),
-            "{error}"
+            matches!(result, Err(StartError::Rejected(ref frame)) if frame.code() == GuestErrorCode::Expired),
+            "{result:?}"
         );
     } else {
         assert!(
-            matches!(error, BrokerSessionError::StartOutcomeUnknown(ref cause) if matches!(cause.as_ref(), BrokerSessionError::Protocol(_))),
-            "{error}"
+            matches!(
+                result,
+                Ok(StartOutcome::Unknown {
+                    cause: BrokerSessionError::Protocol(_)
+                })
+            ),
+            "{result:?}"
         );
     }
     let failed = snapshot(&mut state, |state| state.phase() == SessionPhase::Failed).await;

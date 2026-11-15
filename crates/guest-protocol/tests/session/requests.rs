@@ -3,7 +3,7 @@ use lasper_guest_protocol::{
     PreparationControl, PreparationControlFrame, PreparationControlKind, PreparationId,
     PrepareRequest, PrepareRequestFrame, ProjectionRequests, SessionFrameError,
     SessionPayloadError, StartAcceptedFrame, StartFrame, StartRequest, TerminalEnvironment,
-    TerminalSize, WaylandProjectionRequest, X11ProjectionRequest,
+    TerminalSize, WaylandProjectionRequest, X11ProjectionRequest, MAX_EXECUTION_TIMEOUT_MS,
 };
 
 fn interactive_request() -> PrepareRequestFrame<'static> {
@@ -52,6 +52,7 @@ fn start_round_trips_only_the_requested_projection_environment() {
         Some("/run/user/1000/wayland-0"),
         Some(2),
         Some(TerminalSize::new(120, 40).unwrap()),
+        None,
     )
     .unwrap();
     let mut payload = [0; 512];
@@ -77,6 +78,7 @@ fn start_decode_unescapes_a_wayland_path_before_matching_the_prepare() {
         Some(path),
         None,
         Some(TerminalSize::new(80, 24).unwrap()),
+        None,
     )
     .unwrap();
     let mut payload = [0; 512];
@@ -99,6 +101,7 @@ fn start_rejects_a_projection_not_bound_by_prepare() {
             Some("/run/user/1000/wayland-1"),
             None,
             Some(TerminalSize::new(80, 24).unwrap()),
+            None,
         ),
         Err(SessionPayloadError::UnrequestedProjection),
     );
@@ -109,6 +112,7 @@ fn start_rejects_a_projection_not_bound_by_prepare() {
             None,
             Some(3),
             Some(TerminalSize::new(80, 24).unwrap()),
+            None,
         ),
         Err(SessionPayloadError::UnrequestedProjection),
     );
@@ -123,6 +127,7 @@ fn start_decode_rejects_wrong_broker_and_preparation_tokens() {
         None,
         None,
         Some(TerminalSize::new(80, 24).unwrap()),
+        None,
     )
     .unwrap();
     let mut payload = [0; 512];
@@ -147,7 +152,7 @@ fn start_decode_rejects_wrong_broker_and_preparation_tokens() {
 fn start_terminal_shape_matches_execution_kind() {
     let request = interactive_request();
     assert_eq!(
-        StartRequest::new(&request, preparation_id(), None, None, None),
+        StartRequest::new(&request, preparation_id(), None, None, None, None),
         Err(SessionPayloadError::InvalidTerminalSize),
     );
 
@@ -171,10 +176,84 @@ fn start_terminal_shape_matches_execution_kind() {
             None,
             None,
             Some(TerminalSize::new(80, 24).unwrap()),
+            None,
         ),
         Err(SessionPayloadError::InvalidTerminalSize),
     );
-    assert!(StartRequest::new(&bounded, preparation_id(), None, None, None).is_ok());
+    assert!(StartRequest::new(&bounded, preparation_id(), None, None, None, None).is_ok());
+}
+
+#[test]
+fn execution_timeout_round_trips_independently_of_terminal_mode() {
+    for execution in [ExecutionKind::Bounded, ExecutionKind::Interactive] {
+        let request = super::support::request(execution);
+        for timeout in [None, Some(1), Some(120_000), Some(MAX_EXECUTION_TIMEOUT_MS)] {
+            let start = StartRequest::new(
+                &request,
+                preparation_id(),
+                None,
+                None,
+                request.request().initial_size(),
+                timeout,
+            )
+            .unwrap();
+            let mut bytes = [0; 512];
+            let length = start.encode_payload(&mut bytes).unwrap();
+            let decoded =
+                StartRequest::decode_for(&request, preparation_id(), &bytes[..length]).unwrap();
+            assert_eq!(decoded.execution_timeout_ms(), timeout);
+            assert_eq!(decoded, start);
+            assert_eq!(
+                std::str::from_utf8(&bytes[..length])
+                    .unwrap()
+                    .contains("execution_timeout_ms"),
+                timeout.is_some()
+            );
+        }
+    }
+}
+
+#[test]
+fn execution_timeout_must_be_within_the_protocol_range() {
+    for execution in [ExecutionKind::Bounded, ExecutionKind::Interactive] {
+        let request = super::support::request(execution);
+        let start = StartRequest::new(
+            &request,
+            preparation_id(),
+            None,
+            None,
+            request.request().initial_size(),
+            None,
+        )
+        .unwrap();
+        let mut bytes = [0; 512];
+        let length = start.encode_payload(&mut bytes).unwrap();
+        let prefix = std::str::from_utf8(&bytes[..length - 1]).unwrap();
+        for timeout in [0, MAX_EXECUTION_TIMEOUT_MS + 1, u64::MAX] {
+            assert_eq!(
+                StartRequest::new(
+                    &request,
+                    preparation_id(),
+                    None,
+                    None,
+                    request.request().initial_size(),
+                    Some(timeout),
+                ),
+                Err(SessionPayloadError::InvalidExecutionTimeout)
+            );
+            let invalid = format!("{prefix},\"execution_timeout_ms\":{timeout}}}");
+            assert_eq!(
+                StartRequest::decode_for(&request, preparation_id(), invalid.as_bytes()),
+                Err(SessionPayloadError::InvalidExecutionTimeout)
+            );
+        }
+        for value in ["-1", "1.5", "18446744073709551616"] {
+            let invalid = format!("{prefix},\"execution_timeout_ms\":{value}}}");
+            assert!(
+                StartRequest::decode_for(&request, preparation_id(), invalid.as_bytes()).is_err()
+            );
+        }
+    }
 }
 
 #[test]
@@ -283,6 +362,7 @@ fn start_frame_round_trips_and_rejects_other_message_kinds() {
         Some("/run/user/1000/wayland-0"),
         Some(2),
         Some(TerminalSize::new(100, 30).unwrap()),
+        None,
     )
     .unwrap();
     let frame = StartFrame::new(31, start);

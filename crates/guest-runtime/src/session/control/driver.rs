@@ -332,9 +332,13 @@ impl ControlLoop<'_, '_> {
         if self.prepare_rejected {
             return Ok(());
         }
-        let (code, errno) = match (reason, self.failure) {
+        let failure = match (reason, self.failure) {
             (CleanupReason::ClockFailed, Some(GuardianError::System { errno, .. })) => {
-                (GuestErrorCode::System, Some(errno))
+                super::report::PrepareError {
+                    code: GuestErrorCode::System,
+                    errno: Some(errno),
+                    stage: None,
+                }
             }
             _ => super::report::prepare_error(reason, observation.worker),
         };
@@ -343,9 +347,10 @@ impl ControlLoop<'_, '_> {
             self.request.broker_id(),
             None,
             GuestOperation::Prepare,
-            code,
-            errno,
+            failure.code,
+            failure.errno,
         )
+        .and_then(|error| error.with_stage(failure.stage))
         .map_err(|_| GuardianError::ReplyEncoding)?;
         let payload = Payload::encode(4096, |bytes| {
             error

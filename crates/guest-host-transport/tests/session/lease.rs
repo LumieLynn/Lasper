@@ -46,12 +46,12 @@ async fn cancelled_identity(start: bool) {
     let mut session = server.prepare().await;
     let mut operation = Box::pin(async {
         if start {
-            session
-                .start(SessionStartOptions::default())
-                .await
-                .map(|_| ())
+            assert!(matches!(
+                session.start(SessionStartOptions::default()).await.unwrap(),
+                lasper_guest_host_transport::StartOutcome::Accepted { .. }
+            ));
         } else {
-            session.recheck().await.map(|_| ())
+            session.recheck().await.unwrap();
         }
     });
     timeout(Duration::from_secs(3), async {

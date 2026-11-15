@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use super::frame::{
     check_reply, codec_error, encode_frame, SessionFrameError, SessionPayloadError,
 };
+use super::GuestFailureStage;
 use crate::messages::decode_json_payload;
 use crate::{BrokerId, ControlFrameHeader, MessageKind, PreparationId, PrepareRequestFrame};
 
@@ -44,6 +45,8 @@ struct WireError {
     operation: GuestOperation,
     code: GuestErrorCode,
     errno: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stage: Option<GuestFailureStage>,
 }
 
 impl ErrorFrame {
@@ -73,8 +76,20 @@ impl ErrorFrame {
                 operation,
                 code,
                 errno,
+                stage: None,
             },
         })
+    }
+
+    pub fn with_stage(
+        mut self,
+        stage: Option<GuestFailureStage>,
+    ) -> Result<Self, SessionPayloadError> {
+        if stage.is_some() && self.wire.code != GuestErrorCode::System {
+            return Err(SessionPayloadError::InvalidResponse);
+        }
+        self.wire.stage = stage;
+        Ok(self)
     }
 
     pub const fn request_id(&self) -> u64 {
@@ -88,6 +103,9 @@ impl ErrorFrame {
     }
     pub const fn errno(&self) -> Option<i32> {
         self.wire.errno
+    }
+    pub const fn stage(&self) -> Option<GuestFailureStage> {
+        self.wire.stage
     }
     pub const fn preparation_id(&self) -> Option<PreparationId> {
         self.wire.preparation_id
@@ -144,6 +162,7 @@ impl ErrorFrame {
             wire.code,
             wire.errno,
         )
+        .and_then(|error| error.with_stage(wire.stage))
         .map_err(SessionFrameError::Payload)
     }
 }

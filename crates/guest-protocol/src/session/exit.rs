@@ -5,6 +5,7 @@ use super::frame::{
     check_reply, codec_error, encode_frame, validate_token, SessionFrameError, SessionPayloadError,
 };
 use super::output::{CapturedOutput, EncodedOutput, OutputStream};
+use super::{GuestFailure, GuestFailureStage};
 use crate::messages::decode_json_payload_escaped;
 use crate::{
     BrokerId, ControlFrameHeader, ExecutionKind, MessageKind, PreparationId, PrepareRequestFrame,
@@ -63,6 +64,7 @@ pub struct ExitReport {
     exit: Option<ExitStatus>,
     cleanup: CleanupStatus,
     reason: ExitReason,
+    failure: Option<GuestFailure>,
 }
 
 impl ExitReport {
@@ -89,7 +91,51 @@ impl ExitReport {
             exit,
             cleanup,
             reason,
+            failure: None,
         })
+    }
+
+    /// Attaches the worker failure that caused cleanup, never a later cleanup error.
+    pub fn with_failure(
+        mut self,
+        failure: Option<GuestFailure>,
+    ) -> Result<Self, SessionPayloadError> {
+        if let Some(failure) = failure {
+            failure.validate()?;
+            let valid = match self.reason {
+                ExitReason::WorkerPreparationFailed => failure.stage() != GuestFailureStage::Exec,
+                ExitReason::ExecFailed => {
+                    failure.stage() == GuestFailureStage::Exec
+                        && self.execution
+                            == ExecutionStatus::Failed {
+                                errno: failure.errno(),
+                            }
+                }
+                _ => false,
+            };
+            if !valid {
+                return Err(SessionPayloadError::InvalidResponse);
+            }
+        }
+        self.failure = failure;
+        Ok(self)
+    }
+
+    pub const fn failure(&self) -> Option<GuestFailure> {
+        self.failure
+    }
+
+    /// Returns an ordinary worker exit after cleanup. Fast exits can precede
+    /// exec confirmation, so this does not require observing Started.
+    pub const fn command_exit(&self) -> Option<ExitStatus> {
+        match (self.reason, self.execution, self.cleanup) {
+            (
+                ExitReason::WorkerExited,
+                ExecutionStatus::Started | ExecutionStatus::Unknown,
+                CleanupStatus::Complete,
+            ) => self.exit,
+            _ => None,
+        }
     }
 
     pub const fn execution(&self) -> ExecutionStatus {
@@ -127,6 +173,7 @@ struct WireExit<'a> {
     exit: Option<ExitStatus>,
     cleanup: CleanupStatus,
     reason: ExitReason,
+    failure: Option<GuestFailure>,
     #[serde(borrow)]
     output: Option<WireOutput<'a>>,
 }
@@ -157,6 +204,8 @@ struct EncodedExit<'a> {
     exit: Option<ExitStatus>,
     cleanup: CleanupStatus,
     reason: ExitReason,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    failure: Option<GuestFailure>,
     output: Option<EncodedStreams<'a>>,
 }
 
@@ -230,6 +279,7 @@ impl<'a> ExitFrame<'a> {
                 exit: self.report.exit,
                 cleanup: self.report.cleanup,
                 reason: self.report.reason,
+                failure: self.report.failure,
                 output,
             },
             payload,
@@ -255,6 +305,7 @@ impl<'a> ExitFrame<'a> {
         validate_token(request, preparation_id, wire.broker_id, wire.preparation_id)
             .map_err(SessionFrameError::Payload)?;
         let report = ExitReport::new(wire.execution, wire.exit, wire.cleanup, wire.reason)
+            .and_then(|report| report.with_failure(wire.failure))
             .map_err(SessionFrameError::Payload)?;
         let output = wire
             .output

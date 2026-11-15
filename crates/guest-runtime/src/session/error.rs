@@ -38,6 +38,54 @@ pub enum GuardianError {
     Lifecycle(SessionLifecycleError),
 }
 
+impl GuardianError {
+    pub fn class(self) -> crate::failure::FailureClass {
+        use super::PrepareStorageError;
+        use crate::failure::FailureClass;
+        use crate::transport::TransportError;
+        match self {
+            Self::System { errno, .. }
+            | Self::PrepareStorage(PrepareStorageError::System(errno)) => {
+                FailureClass::system(errno)
+            }
+            Self::StartupExpired
+            | Self::HelloExpired
+            | Self::PrepareExpired
+            | Self::ControlExpired => FailureClass::TimedOut,
+            Self::Readiness(_) | Self::BrokerDisconnected | Self::SupervisorStopped(_) => {
+                FailureClass::Unavailable
+            }
+            Self::Control(TransportError::Syscall(errno)) => FailureClass::system(errno),
+            Self::Control(
+                TransportError::UnexpectedEof
+                | TransportError::WriteZero
+                | TransportError::Poisoned,
+            ) => FailureClass::Io,
+            Self::Control(TransportError::ReceiveInProgress | TransportError::SendInProgress)
+            | Self::InvalidBootstrapDescriptors
+            | Self::ReplyEncoding
+            | Self::ReplyPending
+            | Self::SessionAlreadyCreated
+            | Self::ExistingChildren
+            | Self::NotPrepared
+            | Self::ReadyAlreadyTaken
+            | Self::AlreadyStarted
+            | Self::Lifecycle(_) => FailureClass::Internal,
+            Self::StartupNotReleased
+            | Self::PrepareFrame(_)
+            | Self::SessionFrame(_)
+            | Self::PrepareStorage(_)
+            | Self::Hello(_)
+            | Self::HelloPayload(_)
+            | Self::Control(_)
+            | Self::UnexpectedBrokerData
+            | Self::MismatchedBroker { .. }
+            | Self::InvalidStart(_)
+            | Self::InvalidStatus => FailureClass::Protocol,
+        }
+    }
+}
+
 pub(super) trait SystemResultExt<T> {
     fn context(self, operation: &'static str) -> Result<T, GuardianError>;
 }

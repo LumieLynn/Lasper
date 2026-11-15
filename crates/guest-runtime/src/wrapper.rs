@@ -6,6 +6,7 @@ use core::ffi::{c_char, CStr};
 
 use crate::broker::{self, BrokerError, BrokerResult, Startup};
 use crate::diagnostic::Diagnostic;
+use crate::failure::FailureClass;
 use crate::linux::uapi::{
     errno::{EACCES, EEXIST, EINTR, EINVAL, EIO, ENAMETOOLONG, ENOENT, ETIMEDOUT},
     file::{O_CLOEXEC, O_DIRECTORY, O_NOFOLLOW, PATH_MAX, S_IFDIR, S_IFMT},
@@ -40,19 +41,25 @@ pub unsafe fn run(
 ) -> Result<core::convert::Infallible, BrokerError> {
     if !executable.to_bytes().starts_with(b"/") {
         return Err(BrokerError {
+            class: FailureClass::Usage,
             operation: "wrapper requires an absolute payload executable",
             errno: EINVAL,
         });
     }
-    let original = filesystem::stat_path(executable).at("stat wrapper payload")?;
+    let original =
+        filesystem::stat_path(executable).at_class(FailureClass::Exec, "stat wrapper payload")?;
     let this = filesystem::stat_path(paths::PROC_SELF_EXE).at("stat wrapper executable")?;
     if original.device() == this.device() && original.inode == this.inode {
         return Err(BrokerError {
+            class: FailureClass::Usage,
             operation: "wrapper payload resolves to wrapper itself",
             errno: EINVAL,
         });
     }
-    prepare_directory(directory).at("prepare private broker directory")?;
+    prepare_directory(directory).at_class(
+        FailureClass::Configuration,
+        "prepare private broker directory",
+    )?;
     let ready = Pipe::new().at("create broker Ready channel")?;
     let (status_writer, status_reader) =
         linux::seqpacket_pair().at("create payload exec-status channel")?;
@@ -93,11 +100,11 @@ pub unsafe fn run(
             use core::fmt::Write;
             let _ = writeln!(
                 Diagnostic,
-                "lasper guest broker: {} (errno {})",
-                error.operation, error.errno
+                "lasper guest broker: {:?}: {} (errno {})",
+                error.class, error.operation, error.errno
             );
         }
-        linux::exit(if result.is_ok() { 0 } else { 70 });
+        linux::exit(result.map_or_else(|error| error.class.exit_code(), |()| 0));
     }
     let child = Child {
         pid,
@@ -124,6 +131,7 @@ pub unsafe fn run(
     let mut exited = [PollFd::new(child.fd.raw())];
     let _ = linux::poll(&mut exited, Some(STARTUP_TIMEOUT_MS));
     Err(BrokerError {
+        class: FailureClass::Exec,
         operation: "exec wrapper payload",
         errno,
     })

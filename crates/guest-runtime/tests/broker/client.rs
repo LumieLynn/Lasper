@@ -80,7 +80,15 @@ pub fn ready(
 pub fn start(stream: &UnixStream, request: &PrepareRequestFrame<'_>, ready: &PrepareReadyFrame) {
     let start = StartFrame::new(
         11,
-        StartRequest::new(request, ready.response().preparation_id(), None, None, None).unwrap(),
+        StartRequest::new(
+            request,
+            ready.response().preparation_id(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap(),
     );
     let mut payload = [0; 4096];
     let (header, length) = start.encode_parts(&mut payload).unwrap();

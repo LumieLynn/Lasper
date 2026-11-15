@@ -12,8 +12,12 @@ use crate::{
     PrepareRequestFrame, TerminalSize,
 };
 
-/// Environment changes accepted when a prepared worker is released.
-/// Values can only repeat projections selected by the original Prepare.
+/// Reserve half the timestamp range for the guest's current monotonic time
+/// when adding an explicit execution budget to form an absolute deadline.
+pub const MAX_EXECUTION_TIMEOUT_MS: u64 = u64::MAX / 2;
+
+/// Options accepted when a prepared worker is released. Display values can
+/// only repeat projections selected by the original Prepare.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct StartRequest {
     broker_id: BrokerId,
@@ -24,6 +28,8 @@ pub struct StartRequest {
     x11_display: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     terminal_size: Option<TerminalSize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution_timeout_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -34,6 +40,7 @@ struct WireStartRequest {
     wayland_display: Option<String<MAX_PROJECTION_PATH_BYTES>>,
     x11_display: Option<u16>,
     terminal_size: Option<TerminalSize>,
+    execution_timeout_ms: Option<u64>,
 }
 
 impl StartRequest {
@@ -43,6 +50,7 @@ impl StartRequest {
         wayland_display: Option<&str>,
         x11_display: Option<u16>,
         terminal_size: Option<TerminalSize>,
+        execution_timeout_ms: Option<u64>,
     ) -> Result<Self, SessionPayloadError> {
         let wayland_display = wayland_display
             .map(|value| bounded_path(value).map_err(SessionPayloadError::Payload))
@@ -53,6 +61,7 @@ impl StartRequest {
             wayland_display,
             x11_display,
             terminal_size,
+            execution_timeout_ms,
         };
         start.validate_for(request)?;
         Ok(start)
@@ -78,6 +87,13 @@ impl StartRequest {
         self.terminal_size
     }
 
+    /// An execution budget from 1 through [`MAX_EXECUTION_TIMEOUT_MS`], measured
+    /// in milliseconds by the guest's monotonic clock from acceptance of Start.
+    /// None leaves execution unlimited, for both interactive and bounded sessions.
+    pub const fn execution_timeout_ms(&self) -> Option<u64> {
+        self.execution_timeout_ms
+    }
+
     pub fn encode_payload(&self, output: &mut [u8]) -> Result<usize, PayloadCodecError> {
         encode_json_payload(self, output)
     }
@@ -99,12 +115,19 @@ impl StartRequest {
             wayland_display: wire.wayland_display,
             x11_display: wire.x11_display,
             terminal_size: wire.terminal_size,
+            execution_timeout_ms: wire.execution_timeout_ms,
         };
         start.validate_for(request)?;
         Ok(start)
     }
 
     fn validate_for(&self, request: &PrepareRequestFrame<'_>) -> Result<(), SessionPayloadError> {
+        if self
+            .execution_timeout_ms
+            .is_some_and(|timeout| !(1..=MAX_EXECUTION_TIMEOUT_MS).contains(&timeout))
+        {
+            return Err(SessionPayloadError::InvalidExecutionTimeout);
+        }
         let projections = request.request().projections();
         if let Some(display) = self.wayland_display() {
             validate_absolute_path(display).map_err(SessionPayloadError::Payload)?;

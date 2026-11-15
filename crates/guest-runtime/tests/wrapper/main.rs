@@ -297,7 +297,13 @@ fn scenario(binary: &str, case: &str, privileged: bool) {
         assert!(Instant::now() < deadline, "wrapper did not finish");
         std::thread::sleep(Duration::from_millis(5));
     };
-    assert_eq!(status.code(), Some(if succeeds { 0 } else { 70 }));
+    let expected = match case {
+        "exec-failure" => 126,
+        "recursive-payload" => 64,
+        _ if succeeds => 0,
+        _ => 78,
+    };
+    assert_eq!(status.code(), Some(expected));
     match case {
         "unsafe-directory" => assert_eq!(
             fs::metadata(root.join("var/opt/lasper")).unwrap().mode() & 0o7777,

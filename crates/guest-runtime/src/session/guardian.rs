@@ -327,6 +327,17 @@ impl<'a, 'control> SessionGuardian<'a, 'control> {
     ) -> Result<StartAcceptedFrame, GuardianError> {
         self.poll(now_ms)?;
         self.worker.validate_start(frame.request())?;
+        let execution_deadline_ms = frame
+            .request()
+            .execution_timeout_ms()
+            .map(|timeout| {
+                now_ms
+                    .checked_add(timeout)
+                    .ok_or(GuardianError::InvalidStart(
+                        lasper_guest_protocol::SessionPayloadError::InvalidExecutionTimeout,
+                    ))
+            })
+            .transpose()?;
         let request_id = frame.request_id();
         let token = PreparationControl::new(
             frame.request().broker_id(),
@@ -351,9 +362,7 @@ impl<'a, 'control> SessionGuardian<'a, 'control> {
             self.perform(action, now_ms);
             return Err(error);
         }
-        if self.worker.bounded() {
-            self.execution_deadline_ms = Some(now_ms.saturating_add(60_000));
-        }
+        self.execution_deadline_ms = execution_deadline_ms;
         Ok(StartAcceptedFrame::new(request_id, token))
     }
 

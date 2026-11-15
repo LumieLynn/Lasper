@@ -2,6 +2,7 @@ use core::arch::global_asm;
 use core::ffi::{c_char, CStr};
 use core::fmt::Write;
 use lasper_guest_runtime::diagnostic::Diagnostic;
+use lasper_guest_runtime::failure::FailureClass;
 
 use super::syscall::{syscall2, syscall3, syscall6};
 use super::uapi::{
@@ -95,14 +96,22 @@ pub(super) unsafe fn run(invocation: &Invocation, page_size: usize) -> ! {
         )
     };
     if mapping < 0 {
-        fail("allocate broker stack", -mapping as i32);
+        fail(
+            FailureClass::System,
+            "allocate broker stack",
+            -mapping as i32,
+        );
     }
     let stack = mapping as usize + page_size;
     // The bottom page remains inaccessible to guard against stack overflow.
     let result = unsafe { syscall3(nr::MPROTECT, stack, usable, PROT_READ | PROT_WRITE) };
     if result < 0 {
         unsafe { syscall2(nr::MUNMAP, mapping as usize, length) };
-        fail("make broker stack writable", -result as i32);
+        fail(
+            FailureClass::System,
+            "make broker stack writable",
+            -result as i32,
+        );
     }
     // SAFETY: mmap provides a separate stack with the required space and alignment.
     // The invocation and its borrowed storage remain on their original mappings.
@@ -134,14 +143,14 @@ unsafe extern "C" fn broker_entry(invocation: *const Invocation) -> ! {
     };
     match result {
         Ok(()) => super::exit_group(0),
-        Err(error) => fail(error.operation, error.errno),
+        Err(error) => fail(error.class, error.operation, error.errno),
     }
 }
 
-fn fail(operation: &str, errno: i32) -> ! {
+fn fail(class: FailureClass, operation: &str, errno: i32) -> ! {
     let _ = writeln!(
         Diagnostic,
-        "lasper guest runtime: {operation} (errno {errno})"
+        "lasper guest runtime: {class:?}: {operation} (errno {errno})"
     );
-    super::exit_group(70)
+    super::exit_group(class.exit_code())
 }

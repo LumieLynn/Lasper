@@ -53,6 +53,10 @@ impl Client {
     }
 
     pub fn start(&mut self) {
+        self.start_with_timeout(None);
+    }
+
+    pub fn start_with_timeout(&mut self, timeout_ms: Option<u64>) {
         let command = StartFrame::new(
             self.next_id,
             StartRequest::new(
@@ -61,6 +65,7 @@ impl Client {
                 None,
                 None,
                 self.request.request().initial_size(),
+                timeout_ms,
             )
             .unwrap(),
         );

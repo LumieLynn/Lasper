@@ -4,9 +4,7 @@ mod endpoint;
 mod peer;
 mod socket;
 
-use lasper_guest_protocol::{
-    ControlFrameHeader, ControlLimits, HelloResponse, MessageKind, HELLO_PAYLOAD_BUFFER_BYTES,
-};
+use lasper_guest_protocol::ControlLimits;
 use lasper_rootfs_path::RootfsAccess;
 use std::fmt;
 use std::fs::File;
@@ -16,7 +14,10 @@ use tokio::net::UnixStream;
 use tokio::time::{sleep_until, timeout_at, Duration, Instant};
 
 use crate::process::ProcessHandle;
-use crate::{MachineTarget, UnixControlStream, WorkerHello, WorkerReadiness, WorkerReadinessError};
+use crate::{
+    HandshakeError, MachineTarget, UnixControlStream, WorkerHello, WorkerReadiness,
+    WorkerReadinessError,
+};
 
 const CONNECT_HELLO_TIMEOUT: Duration = Duration::from_secs(1);
 const HELLO_REQUEST_ID: u64 = 1;
@@ -151,48 +152,18 @@ async fn exchange_hello(
     control: &mut UnixControlStream,
     hello: WorkerHello,
 ) -> Result<WorkerReadiness, BrokerConnectError> {
-    let mut payload = [0; HELLO_PAYLOAD_BUFFER_BYTES];
-    let length = hello
-        .request()
-        .encode_payload(&mut payload)
-        .map_err(hello_payload)?;
-    let header = ControlFrameHeader::new(
-        MessageKind::HelloRequest,
-        HELLO_REQUEST_ID,
-        length as u32,
-        0,
-    )
-    .map_err(hello_payload)?;
     control
-        .send_frame(header, &payload[..length], &[])
+        .handshake(HELLO_REQUEST_ID, hello.request())
         .await
-        .map_err(BrokerConnectError::Hello)?;
-    let frame = control
-        .receive_frame()
-        .await
-        .map_err(BrokerConnectError::Hello)?;
-    if frame.header().kind() != MessageKind::HelloResponse
-        || frame.header().request_id() != HELLO_REQUEST_ID
-    {
-        return Err(hello_payload(
-            "broker response does not match this Hello request",
-        ));
-    }
-    let response = HelloResponse::decode_payload(frame.payload()).map_err(hello_payload)?;
-    let readiness = hello
-        .negotiate(frame.header().protocol_version(), response)
-        .map_err(BrokerConnectError::Readiness)?;
-    control
-        .complete_hello(readiness.limits())
-        .map_err(BrokerConnectError::Hello)?;
-    Ok(readiness)
-}
-
-fn hello_payload(error: impl fmt::Debug) -> BrokerConnectError {
-    BrokerConnectError::Hello(io::Error::new(
-        io::ErrorKind::InvalidData,
-        format!("invalid broker Hello: {error:?}"),
-    ))
+        .map_err(|error| match error {
+            HandshakeError::Transport(error) => BrokerConnectError::Hello(error),
+            HandshakeError::Negotiation(error) => {
+                BrokerConnectError::Readiness(WorkerReadinessError::Negotiation(error))
+            }
+        })?;
+    hello
+        .complete(control)
+        .map_err(BrokerConnectError::Readiness)
 }
 
 #[derive(Debug)]

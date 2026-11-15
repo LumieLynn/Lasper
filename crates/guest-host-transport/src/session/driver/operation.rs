@@ -1,13 +1,15 @@
 use super::control::{unexpected_reply, CleanupRequest, ExpectedReply, Outbound, RequestPurpose};
 use super::Owner;
-use crate::session::{wire, BrokerSessionError, Reply, SessionPhase, OPERATION_TIMEOUT};
+use crate::session::{
+    wire, BrokerSessionError, Reply, SessionPhase, StartError, StartOutcome, StartReply,
+    OPERATION_TIMEOUT,
+};
 use crate::WorkerObservation;
 use lasper_guest_protocol::{
     ControlFrameHeader, MessageKind, PreparationControlKind, PreparationId, ProjectionObservations,
 };
 use std::future::pending;
 use std::io;
-use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 use tokio::time::Instant;
@@ -15,7 +17,7 @@ use tokio::time::Instant;
 pub(super) struct StartPlan {
     pub payload: Box<[u8]>,
     pub evidence: ProjectionObservations,
-    pub reply: Reply<Option<OwnedFd>>,
+    pub reply: StartReply,
     pub delivered: oneshot::Receiver<()>,
 }
 
@@ -38,7 +40,7 @@ pub(super) enum Operation {
         deadline: Instant,
     },
     Starting {
-        reply: Reply<Option<OwnedFd>>,
+        reply: StartReply,
         delivered: oneshot::Receiver<()>,
         deadline: Instant,
     },
@@ -88,15 +90,6 @@ impl Operation {
     }
 
     pub fn reject(self, error: BrokerSessionError) -> BrokerSessionError {
-        let error = if matches!(&self, Self::Starting { .. })
-            && !matches!(
-                &error,
-                BrokerSessionError::Rejected(_) | BrokerSessionError::StartInterrupted(_)
-            ) {
-            BrokerSessionError::StartOutcomeUnknown(Arc::new(error))
-        } else {
-            error
-        };
         match self {
             Self::Prepare { reply, .. } => {
                 let _ = reply.send(Err(error.clone()));
@@ -112,10 +105,18 @@ impl Operation {
                 ..
             }
             | Self::ReadyToStart { start, .. } => {
-                let _ = start.reply.send(Err(error.clone()));
+                let _ = start
+                    .reply
+                    .send(Err(StartError::NotSubmitted(error.clone())));
             }
             Self::Starting { reply, .. } => {
-                let _ = reply.send(Err(error.clone()));
+                let outcome = match &error {
+                    BrokerSessionError::Rejected(frame) => Err(StartError::Rejected(*frame)),
+                    _ => Ok(StartOutcome::Unknown {
+                        cause: error.clone(),
+                    }),
+                };
+                let _ = reply.send(outcome);
             }
             Self::Delivering { .. } => {}
         }
@@ -164,7 +165,9 @@ impl Owner<'_> {
                     return Ok(());
                 }
                 if observed.reply().projections() != start.evidence {
-                    let _ = start.reply.send(Err(BrokerSessionError::ProjectionChanged));
+                    let _ = start.reply.send(Err(StartError::NotSubmitted(
+                        BrokerSessionError::ProjectionChanged,
+                    )));
                 } else {
                     self.operation = Some(Operation::ReadyToStart { start, deadline });
                 }
@@ -204,7 +207,9 @@ impl Owner<'_> {
         let header = match header {
             Ok(header) => header,
             Err(error) => {
-                let _ = start.reply.send(Err(error.clone()));
+                let _ = start
+                    .reply
+                    .send(Err(StartError::NotSubmitted(error.clone())));
                 return Err(error);
             }
         };
@@ -225,7 +230,7 @@ impl Owner<'_> {
         ) {
             // Queueing failed before the Start submission boundary.
             if let Some(Operation::Starting { reply, .. }) = self.operation.take() {
-                let _ = reply.send(Err(error.clone()));
+                let _ = reply.send(Err(StartError::NotSubmitted(error.clone())));
             }
             return Err(error);
         }

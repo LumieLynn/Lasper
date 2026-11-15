@@ -4,7 +4,7 @@ mod support;
 mod target;
 
 use lasper_guest_host_transport::{
-    PreparedWorker, WorkerHello, WorkerReadiness, WorkerReadinessError,
+    HandshakeError, PreparedWorker, WorkerHello, WorkerReadiness, WorkerReadinessError,
 };
 // The shared fixture's gated rechecks are used by tests/session/lease.rs.
 #[allow(dead_code)]
@@ -19,7 +19,7 @@ use lasper_guest_protocol::{
 use lasper_guest_runtime::readiness::{GuestHelloError, GuestWorkerReadiness};
 use lasper_guest_runtime::transport::GuestControlStream;
 use std::fs::File;
-use std::io;
+use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use support::handshake::{establish_guest, establish_host, raw_stream_pair};
 use worker::TestWorker;
@@ -131,7 +131,7 @@ fn assert_identity_peer_closed(peer: &OwnedFd) {
     }
 }
 
-fn readiness() -> WorkerReadiness {
+async fn readiness() -> WorkerReadiness {
     let hello = WorkerHello::new(ControlLimits::CURRENT).unwrap();
     let accepted = GuestWorkerReadiness::check()
         .unwrap()
@@ -142,16 +142,65 @@ fn readiness() -> WorkerReadiness {
             ControlLimits::CURRENT,
         )
         .unwrap();
-    hello
-        .negotiate(
-            lasper_guest_protocol::ProtocolVersion::CURRENT,
-            accepted.response(),
-        )
+    readiness_from_response(hello, accepted.response())
+        .await
         .unwrap()
 }
 
-#[test]
-fn helper_hello_rejects_limits_that_cannot_hold_session_results() {
+async fn readiness_from_response(
+    hello: WorkerHello,
+    response: HelloResponse,
+) -> Result<WorkerReadiness, WorkerReadinessError> {
+    let (mut host, mut peer) = raw_stream_pair();
+    let mut payload = [0; lasper_guest_protocol::HELLO_PAYLOAD_BUFFER_BYTES];
+    let length = response.encode_payload(&mut payload).unwrap();
+    let header = ControlFrameHeader::new(MessageKind::HelloResponse, 1, length as u32, 0).unwrap();
+    peer.write_all(&header.encode()).unwrap();
+    peer.write_all(&payload[..length]).unwrap();
+    match host.handshake(1, hello.request()).await {
+        Ok(_) => {}
+        Err(HandshakeError::Negotiation(error)) => {
+            return Err(WorkerReadinessError::Negotiation(error));
+        }
+        Err(error) => panic!("exchange fixture Hello: {error}"),
+    };
+    hello.complete(&host)
+}
+
+#[tokio::test]
+async fn worker_readiness_requires_its_own_hello_request() {
+    for other in [
+        HelloRequest::new(FeatureSet::EMPTY, ControlLimits::CURRENT).unwrap(),
+        HelloRequest::new(
+            FeatureSet::WORKER_PIDFD,
+            ControlLimits::new(lasper_guest_protocol::MIN_HELPER_CONTROL_FRAME_BYTES, 2).unwrap(),
+        )
+        .unwrap(),
+    ] {
+        let hello = WorkerHello::new(ControlLimits::CURRENT).unwrap();
+        let (mut host, mut peer) = raw_stream_pair();
+        let response = HelloResponse::new(
+            FeatureSet::WORKER_PIDFD,
+            BrokerId::new([0x5a; 16]),
+            ControlLimits::CURRENT,
+        )
+        .unwrap();
+        let mut payload = [0; lasper_guest_protocol::HELLO_PAYLOAD_BUFFER_BYTES];
+        let length = response.encode_payload(&mut payload).unwrap();
+        let header =
+            ControlFrameHeader::new(MessageKind::HelloResponse, 1, length as u32, 0).unwrap();
+        peer.write_all(&header.encode()).unwrap();
+        peer.write_all(&payload[..length]).unwrap();
+        host.handshake(1, other).await.unwrap();
+        assert!(matches!(
+            hello.complete(&host),
+            Err(WorkerReadinessError::MismatchedHello)
+        ));
+    }
+}
+
+#[tokio::test]
+async fn helper_hello_rejects_limits_that_cannot_hold_session_results() {
     let minimum = lasper_guest_protocol::MIN_HELPER_CONTROL_FRAME_BYTES;
     assert!(matches!(
         WorkerHello::new(ControlLimits::new(minimum - 1, 3).unwrap()),
@@ -177,7 +226,7 @@ fn helper_hello_rejects_limits_that_cannot_hold_session_results() {
     )
     .unwrap();
     assert!(matches!(
-        host.negotiate(lasper_guest_protocol::ProtocolVersion::CURRENT, response),
+        readiness_from_response(host, response).await,
         Err(WorkerReadinessError::FrameLimit { .. })
     ));
 }
@@ -244,23 +293,8 @@ async fn prepare_ready_transfers_the_assigned_worker_for_both_execution_kinds() 
             )
             .unwrap();
         });
-        let mut payload = [0; 256];
-        let length = hello.request().encode_payload(&mut payload).unwrap();
-        host.send_frame(
-            ControlFrameHeader::new(MessageKind::HelloRequest, 1, length as u32, 0).unwrap(),
-            &payload[..length],
-            &[],
-        )
-        .await
-        .unwrap();
-        let response = host.receive_frame().await.unwrap();
-        let readiness = hello
-            .negotiate(
-                response.header().protocol_version(),
-                HelloResponse::decode_payload(response.payload()).unwrap(),
-            )
-            .unwrap();
-        host.complete_hello(readiness.limits()).unwrap();
+        host.handshake(1, hello.request()).await.unwrap();
+        let readiness = hello.complete(&host).unwrap();
         let mut bytes = [0; 4096];
         let length = request.encode_into(&mut bytes).unwrap();
         host.send_frame(
@@ -377,7 +411,7 @@ async fn invalid_preparation_resources_close_the_received_identity_endpoint() {
         guest_task.await.unwrap();
         let error = match PreparedWorker::from_frame(
             target::current_target().await,
-            &readiness(),
+            &readiness().await,
             std::sync::Arc::new(request.clone()),
             response,
         ) {
@@ -420,7 +454,7 @@ async fn deliver_ready(
 
 #[tokio::test]
 async fn another_workers_pty_cannot_be_combined_with_valid_identity_resources() {
-    let readiness = readiness();
+    let readiness = readiness().await;
     let request = readiness
         .prepare(
             17,
@@ -457,7 +491,7 @@ async fn another_workers_pty_cannot_be_combined_with_valid_identity_resources() 
 
 #[tokio::test]
 async fn terminal_assignment_is_rechecked_before_accepting_another_observation() {
-    let readiness = readiness();
+    let readiness = readiness().await;
     let request = readiness
         .prepare(
             17,
@@ -497,22 +531,23 @@ async fn terminal_assignment_is_rechecked_before_accepting_another_observation()
     assert!(!prepared.can_continue());
 }
 
-#[test]
-fn hello_rejects_missing_worker_pidfd_before_any_prepare() {
+#[tokio::test]
+async fn hello_rejects_missing_worker_pidfd_before_any_prepare() {
     let hello = WorkerHello::new(ControlLimits::CURRENT).unwrap();
     assert!(hello
         .request()
         .required_features()
         .contains(FeatureSet::WORKER_PIDFD));
-    let result = hello.negotiate(
-        lasper_guest_protocol::ProtocolVersion::CURRENT,
+    let result = readiness_from_response(
+        hello,
         HelloResponse::new(
             FeatureSet::EMPTY,
             BrokerId::new([0x5a; 16]),
             ControlLimits::CURRENT,
         )
         .unwrap(),
-    );
+    )
+    .await;
     let error = match result {
         Ok(_) => panic!("accepted a broker without worker pidfd support"),
         Err(error) => error,
@@ -571,20 +606,19 @@ async fn guest_rejects_legacy_host_during_hello_without_a_prepare_ready() {
     }
 }
 
-#[test]
-fn insufficient_descriptor_limit_is_rejected_before_sending_prepare() {
-    let readiness = WorkerHello::new(ControlLimits::CURRENT)
-        .unwrap()
-        .negotiate(
-            lasper_guest_protocol::ProtocolVersion::CURRENT,
-            HelloResponse::new(
-                FeatureSet::WORKER_PIDFD,
-                BrokerId::new([0x5a; 16]),
-                ControlLimits::new(lasper_guest_protocol::MAX_CONTROL_FRAME_BYTES, 2).unwrap(),
-            )
-            .unwrap(),
+#[tokio::test]
+async fn insufficient_descriptor_limit_is_rejected_before_sending_prepare() {
+    let readiness = readiness_from_response(
+        WorkerHello::new(ControlLimits::CURRENT).unwrap(),
+        HelloResponse::new(
+            FeatureSet::WORKER_PIDFD,
+            BrokerId::new([0x5a; 16]),
+            ControlLimits::new(lasper_guest_protocol::MAX_CONTROL_FRAME_BYTES, 2).unwrap(),
         )
-        .unwrap();
+        .unwrap(),
+    )
+    .await
+    .unwrap();
     let request = preparation_request(ExecutionKind::Interactive);
     assert!(matches!(
         readiness.prepare(17, request.request().clone()),
@@ -599,7 +633,7 @@ fn insufficient_descriptor_limit_is_rejected_before_sending_prepare() {
 
 #[tokio::test]
 async fn target_leader_exit_invalidates_preparation_without_rebinding_to_a_replacement() {
-    let readiness = readiness();
+    let readiness = readiness().await;
     let request = preparation_request(ExecutionKind::Bounded);
     let ready = request
         .ready_frame(
@@ -673,7 +707,7 @@ async fn target_exit_while_waiting_for_identity_rejects_the_otherwise_valid_repl
     use std::sync::mpsc;
     use std::time::Duration;
 
-    let readiness = readiness();
+    let readiness = readiness().await;
     let request = preparation_request(ExecutionKind::Bounded);
     let ready = request
         .ready_frame(
@@ -745,7 +779,7 @@ async fn exited_target_rejects_ready_and_closes_received_resources() {
     if run_isolated("exited_target_rejects_ready_and_closes_received_resources") {
         return;
     }
-    let readiness = readiness();
+    let readiness = readiness().await;
     let request = preparation_request(ExecutionKind::Bounded);
     let ready = request
         .ready_frame(

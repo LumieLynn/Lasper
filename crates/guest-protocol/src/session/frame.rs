@@ -13,6 +13,7 @@ pub enum SessionPayloadError {
     PreparationMismatch,
     UnrequestedProjection,
     InvalidTerminalSize,
+    InvalidExecutionTimeout,
     InvalidResponse,
 }
 

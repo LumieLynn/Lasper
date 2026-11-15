@@ -4,152 +4,15 @@ on:
   push:
     branches: [main, dev]
   pull_request:
-    branches: [main]
+    branches: [main, dev]
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  fmt:
-    name: rustfmt
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: rustup show
-      - run: cargo fmt --all -- --check
-
-  clippy:
-    name: clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: rustup show
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --all-targets --all-features --locked -- -D warnings
-      - run: cargo clippy -p lasper-rootfs-path --all-targets --locked -- -D warnings
-      - run: cargo clippy -p lasper-guest-host-transport --all-targets --locked -- -D warnings
-      - run: cargo clippy -p lasper-guest-protocol --all-targets --locked -- -D warnings
-      - run: cargo clippy -p lasper-guest-runtime --all-targets --locked -- -D warnings
-      - run: cargo clippy -p lasper-guest-test-client --all-targets --locked -- -D warnings
-      - run: cargo clippy -p lasper-local-accounts --all-targets --locked -- -D warnings
-
-  test:
-    name: test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: rustup show
-      - uses: Swatinem/rust-cache@v2
-      - run: cargo test --all-targets --locked
-      - run: cargo test -p lasper-rootfs-path --all-targets --locked
-      - run: cargo test -p lasper-guest-host-transport --all-targets --locked
-      - run: cargo test -p lasper-guest-protocol --all-targets --locked
-      - run: cargo test -p lasper-guest-runtime --all-targets --locked
-      - run: cargo test -p lasper-guest-test-client --all-targets --locked
-      - run: cargo test -p lasper-local-accounts --all-targets --locked
-
-  guest-runtime:
-    name: guest runtime (${{ matrix.target }})
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-            build-alias: build-guest-runtime-x86-64
-          - target: aarch64-unknown-linux-musl
-            os: ubuntu-22.04-arm
-            build-alias: build-guest-runtime-aarch64
-    steps:
-      - uses: actions/checkout@v4
-      - run: rustup show
-      - run: rustup target add ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: guest-runtime-${{ matrix.target }}
-
-      - name: Run guest tests on runner architecture
-        run: >-
-          cargo test
-          -p lasper-guest-protocol
-          -p lasper-rootfs-path
-          -p lasper-guest-host-transport
-          -p lasper-guest-runtime
-          -p lasper-local-accounts
-          --all-targets --locked
-
-      - name: Verify worker identity across user namespaces
-        shell: bash
-        run: |
-          if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
-            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
-          fi
-          cargo test -p lasper-guest-host-transport --lib child_user_namespace_maps_packet_and_proc_credentials --locked -- --ignored
-          cargo test -p lasper-guest-host-transport --test broker --locked -- --ignored
-
-      - name: Verify guest sessions and account switching
-        run: |
-          cargo test -p lasper-guest-runtime --test session --locked -- --ignored
-          cargo test -p lasper-guest-runtime --test session --locked -- --sudo
-
-      - name: Verify guest control loop and cleanup
-        run: |
-          cargo test -p lasper-guest-runtime --test control --locked -- --ignored
-          cargo test -p lasper-guest-runtime --test control --locked -- --sudo
-
-      - name: Check guest runtime binary
-        run: >-
-          cargo clippy
-          --package lasper-guest-runtime
-          --profile guest-runtime
-          --target ${{ matrix.target }}
-          --bin lasper-guest-runtime
-          --features runtime-bin
-          --locked
-          -- -D warnings
-
-      - name: Build guest runtime
-        run: cargo ${{ matrix.build-alias }}
-
-      - name: Verify guest runtime
-        shell: bash
-        run: .github/scripts/verify-guest-runtime.sh ${{ matrix.target }} --run
-
-      - name: Verify guest ELF entry and artifact checks
-        run: >-
-          cargo test -p lasper-guest-runtime --test entry --locked
-          -- --binary target/${{ matrix.target }}/guest-runtime/lasper-guest-runtime
-
-      - name: Verify broker concurrency and standalone execution
-        run: |
-          cargo test -p lasper-guest-runtime --test broker --locked -- --ignored --binary target/${{ matrix.target }}/guest-runtime/lasper-guest-runtime
-          cargo test -p lasper-guest-runtime --test broker --locked -- --sudo
-
-      - name: Verify wrapper handoff and PID 1 entry
-        run: |
-          cargo test -p lasper-guest-runtime --test wrapper --locked -- --binary target/${{ matrix.target }}/guest-runtime/lasper-guest-runtime
-          cargo test -p lasper-guest-runtime --test wrapper --locked -- --sudo --pid1 --binary target/${{ matrix.target }}/guest-runtime/lasper-guest-runtime
-
-  audit:
-    name: dependency audit
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - run: rustup show
-      - uses: Swatinem/rust-cache@v2
-      - name: Install cargo-audit
-        run: cargo install cargo-audit --locked --version 0.22.2
-      - name: Audit dependencies
-        run: cargo audit
-
-      - name: Install cargo-about
-        run: cargo install cargo-about --locked --version 0.9.2 --features cli
-
-      - name: Check dependency licenses
-        run: |
-          cargo about generate --locked --fail about.hbs --output-file /tmp/lasper-dependency-notices.md
-          cmp THIRD_PARTY_NOTICES.md /tmp/lasper-dependency-notices.md
+  verify:
+    name: verify workspace and guest runtime
+    uses: ./.github/workflows/checks.yml
 
   build:
     name: build (${{ matrix.target }})
@@ -216,7 +79,7 @@ jobs:
   development-release:
     name: tag successful dev snapshot
     if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
-    needs: [fmt, clippy, test, guest-runtime, audit, build]
+    needs: [verify, build]
     permissions:
       actions: write
       contents: write

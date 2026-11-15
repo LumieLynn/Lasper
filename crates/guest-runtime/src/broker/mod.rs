@@ -2,6 +2,7 @@ mod listener;
 mod registry;
 
 use crate::diagnostic::Diagnostic;
+use crate::failure::FailureClass;
 use core::ffi::CStr;
 use core::fmt::Write;
 use lasper_guest_protocol::BrokerId;
@@ -24,17 +25,31 @@ use registry::Registry;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct BrokerError {
+    pub class: FailureClass,
     pub operation: &'static str,
     pub errno: i32,
 }
 
 pub(crate) trait BrokerResult<T> {
     fn at(self, operation: &'static str) -> Result<T, BrokerError>;
+    fn at_class(self, class: FailureClass, operation: &'static str) -> Result<T, BrokerError>;
 }
 
 impl<T> BrokerResult<T> for Result<T, i32> {
     fn at(self, operation: &'static str) -> Result<T, BrokerError> {
-        self.map_err(|errno| BrokerError { operation, errno })
+        self.map_err(|errno| BrokerError {
+            class: FailureClass::system(errno),
+            operation,
+            errno,
+        })
+    }
+
+    fn at_class(self, class: FailureClass, operation: &'static str) -> Result<T, BrokerError> {
+        self.map_err(|errno| BrokerError {
+            class,
+            operation,
+            errno,
+        })
     }
 }
 
@@ -93,12 +108,14 @@ unsafe fn run_inner(directory: &CStr, startup: Option<Startup>) -> Result<(), Br
     .at("check broker child ownership")?;
     if existing {
         return Err(BrokerError {
+            class: FailureClass::Internal,
             operation: "broker already has children",
             errno: ECHILD,
         });
     }
     linux::set_subreaper().at("set broker subreaper")?;
     GuestWorkerReadiness::check().map_err(|error| BrokerError {
+        class: FailureClass::Unavailable,
         operation: "check broker pidfd support",
         errno: match error {
             crate::readiness::GuestReadinessError::WorkerPidfdUnavailable { errno } => errno,
@@ -152,6 +169,7 @@ impl Startup {
                 deadline.saturating_sub(linux::monotonic_ms().at("read handoff clock")?);
             if remaining == 0 {
                 return Err(BrokerError {
+                    class: FailureClass::TimedOut,
                     operation: "wait payload exec",
                     errno: ETIMEDOUT,
                 });
@@ -166,6 +184,7 @@ impl Startup {
                 Err(EINTR) => continue,
                 Err(errno) => {
                     return Err(BrokerError {
+                        class: FailureClass::System,
                         operation: "poll payload handoff",
                         errno,
                     })
@@ -173,6 +192,7 @@ impl Startup {
             }
             if events[1].ready() || events[2].ready() {
                 return Err(BrokerError {
+                    class: FailureClass::Unavailable,
                     operation: "wrapper stopped before handoff",
                     errno: EIO,
                 });
@@ -186,6 +206,7 @@ impl Startup {
                 if count != 0 {
                     let errno = i32::from_ne_bytes(error);
                     return Err(BrokerError {
+                        class: FailureClass::Exec,
                         operation: "payload exec failed",
                         errno: if count == 4 && (1..=4095).contains(&errno) {
                             errno
@@ -200,6 +221,7 @@ impl Startup {
                 linux::poll(&mut parent, Some(0)).at("check payload lifetime")?;
                 if parent[0].ready() {
                     return Err(BrokerError {
+                        class: FailureClass::Unavailable,
                         operation: "payload exited during handoff",
                         errno: EIO,
                     });
@@ -249,6 +271,7 @@ impl Broker {
                     Ok(None) => {}
                     Err(errno) => {
                         self.failure.get_or_insert(BrokerError {
+                            class: FailureClass::System,
                             operation: "wait broker children",
                             errno,
                         });
@@ -271,6 +294,7 @@ impl Broker {
             if let Err(errno) = linux::poll(&mut events, retry) {
                 if errno != EINTR {
                     self.failure.get_or_insert(BrokerError {
+                        class: FailureClass::System,
                         operation: "poll broker",
                         errno,
                     });
@@ -299,6 +323,7 @@ impl Broker {
                 Ok(None) => break,
                 Err(errno) => {
                     self.failure.get_or_insert(BrokerError {
+                        class: FailureClass::System,
                         operation: "read broker signal",
                         errno,
                     });
@@ -319,6 +344,7 @@ impl Broker {
                 Err(EAGAIN) => break,
                 Err(errno) => {
                     return Err(BrokerError {
+                        class: FailureClass::Io,
                         operation: "accept broker connection",
                         errno,
                     })
@@ -376,6 +402,7 @@ impl Broker {
                 Ok(None) | Err(ECHILD) => break,
                 Err(errno) => {
                     return Err(BrokerError {
+                        class: FailureClass::System,
                         operation: "reap broker child",
                         errno,
                     })
@@ -414,6 +441,7 @@ impl Broker {
         self.listener.take();
         if let Err(errno) = self.registry.stop() {
             self.failure.get_or_insert(BrokerError {
+                class: FailureClass::System,
                 operation: "resume guardians for shutdown",
                 errno,
             });
@@ -434,7 +462,7 @@ fn session_entry(context: GuardianContext) -> i32 {
                 Diagnostic,
                 "lasper guest runtime: guardian session failed: {error:?}"
             );
-            70
+            error.class().exit_code()
         }
     }
 }
