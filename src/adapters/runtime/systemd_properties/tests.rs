@@ -52,6 +52,14 @@ fn systemd_scalar_and_bitmap_values_match_show_output() {
         ("UID", Value::U32(u32::MAX), "[not set]"),
         ("CPUWeight", Value::U64(0), "idle"),
         ("IOWeight", Value::U64(0), "0"),
+        ("CPUShares", Value::U64(u64::MAX), "[not set]"),
+        ("StartupCPUShares", Value::U64(u64::MAX), "[not set]"),
+        ("BlockIOWeight", Value::U64(u64::MAX), "[not set]"),
+        ("StartupBlockIOWeight", Value::U64(u64::MAX), "[not set]"),
+        ("CPUShares", Value::U64(1024), "1024"),
+        ("StartupCPUShares", Value::U64(2048), "2048"),
+        ("BlockIOWeight", Value::U64(500), "500"),
+        ("StartupBlockIOWeight", Value::U64(1000), "1000"),
         ("MemoryCurrent", Value::U64(u64::MAX), "[not set]"),
         ("MemoryMax", Value::U64(u64::MAX), "infinity"),
         ("EffectiveTasksMax", Value::U64(u64::MAX), "infinity"),
@@ -113,6 +121,28 @@ fn type_driven_rules_do_not_reinterpret_strings_or_unknown_structures() {
         values: vec![],
     });
     assert_eq!(render::render("EffectiveCPUs", &empty), "");
+}
+
+#[test]
+fn root_image_options_preserve_empty_and_populated_partition_lists() {
+    let mut options = PropertyArray {
+        element_signature: "(ss)".into(),
+        values: vec![],
+    };
+    assert_eq!(
+        render::render("RootImageOptions", &PropertyValue::Array(options.clone())),
+        ""
+    );
+    for (partition, flags) in [("root", "ro"), ("usr", "nodev,nosuid")] {
+        options.values.push(PropertyValue::Structure(vec![
+            PropertyValue::String(partition.into()),
+            PropertyValue::String(flags.into()),
+        ]));
+    }
+    assert_eq!(
+        render::render("RootImageOptions", &PropertyValue::Array(options)),
+        "root:ro usr:nodev,nosuid"
+    );
 }
 
 #[test]
@@ -366,6 +396,7 @@ async fn live_systemd_properties_match_systemctl() {
         append_tool_property(&mut tools, name.clone(), value.clone());
     }
     let mut compared = 0;
+    let mut unprintable = 0;
     let mut differences = Vec::new();
     for group in &snapshot.groups {
         for (name, entry) in &group.properties {
@@ -381,6 +412,12 @@ async fn live_systemd_properties_match_systemctl() {
                     group.name
                 ));
             }
+            // Older systemctl versions cannot print some typed properties.
+            // Keep checking their group; rendering is covered by fixtures.
+            if expected == "[unprintable]" {
+                unprintable += 1;
+                continue;
+            }
             compared += 1;
             if &entry.display != expected {
                 differences.push(format!(
@@ -395,5 +432,7 @@ async fn live_systemd_properties_match_systemctl() {
         "only {compared} shared properties were queried"
     );
     assert!(differences.is_empty(), "{}", differences.join("\n"));
-    println!("compared {compared} stable systemd properties");
+    println!(
+        "compared {compared} stable systemd properties; systemctl could not print {unprintable}"
+    );
 }

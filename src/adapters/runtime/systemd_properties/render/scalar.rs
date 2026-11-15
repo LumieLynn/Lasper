@@ -64,6 +64,10 @@ fn unsigned64(name: &str, number: u64, value: &PropertyValue) -> String {
             name,
             "CPUWeight"
                 | "StartupCPUWeight"
+                | "CPUShares"
+                | "StartupCPUShares"
+                | "BlockIOWeight"
+                | "StartupBlockIOWeight"
                 | "IOWeight"
                 | "StartupIOWeight"
                 | "MemoryCurrent"

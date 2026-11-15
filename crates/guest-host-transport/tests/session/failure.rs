@@ -12,7 +12,25 @@ use lasper_guest_protocol::{
     GuestFailure, GuestFailureStage, GuestOperation, OutputStream, PreparationControl,
     PreparationControlFrame, PreparationControlKind, StartAcceptedFrame, StartFrame,
 };
+use std::future::Future;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Wake, Waker};
 use std::time::Duration;
+
+struct WakeOnce<F>(Mutex<Option<F>>);
+
+impl<F: FnOnce() + Send> Wake for WakeOnce<F> {
+    fn wake(self: Arc<Self>) {
+        self.wake_by_ref();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        let action = self.0.lock().unwrap().take();
+        if let Some(action) = action {
+            action();
+        }
+    }
+}
 
 #[tokio::test]
 async fn a_prepared_write_failure_retains_the_queued_final_exit() {
@@ -54,20 +72,15 @@ async fn a_prepared_write_failure_retains_the_queued_final_exit() {
 
 #[tokio::test]
 async fn a_starting_write_failure_retains_the_queued_final_exit() {
-    let (checking, checked) = tokio::sync::oneshot::channel();
     let (release, released) = std::sync::mpsc::channel();
     let (sent, queued) = std::sync::mpsc::channel();
     let (finish, finished) = std::sync::mpsc::channel();
     let server = Server::spawn(move |guest, request| {
-        let mut worker = TestWorker::pausing_on_recheck(request.request().clone(), PREPARATION);
-        super::fixture::publish_ready(&guest, &request, 45_000, &mut worker);
+        let _worker = ready(&guest, &request, 45_000);
         let recheck = command(&guest, &request);
         assert_eq!(recheck.kind(), PreparationControlKind::Recheck);
         reply(&guest, recheck, 45_000);
-        worker.wait_for_recheck();
-        checking.send(()).unwrap();
         released.recv_timeout(Duration::from_secs(3)).unwrap();
-        worker.release_recheck();
         final_exit(&guest, &request, ExitReason::WorkerExitedBeforeStart);
         // SAFETY: only the guest's receiving half is closed; its reply and
         // Exit remain queued for the host while the Start write fails.
@@ -80,17 +93,21 @@ async fn a_starting_write_failure_retains_the_queued_final_exit() {
     });
     let mut session = server.prepare().await;
     let mut state = session.subscribe();
-    let mut start = Box::pin(session.start(SessionStartOptions::default()));
-    drive_io(async {
-        tokio::select! {
-            result = &mut start => panic!("Recheck has no reply yet: {result:?}"),
-            result = checked => result.unwrap(),
-        }
-    })
-    .await;
-    release.send(()).unwrap();
-    queued.recv_timeout(Duration::from_secs(3)).unwrap();
-    let outcome = start.await.unwrap();
+    let mut notifications = session.subscribe();
+    notifications.borrow_and_update();
+    let mut changed = std::pin::pin!(notifications.changed());
+    // The Starting notification runs this waker before the driver can flush
+    // Start. Queue Exit and refuse writes at that boundary, not while identity
+    // verification is still pending.
+    let waker = Waker::from(Arc::new(WakeOnce(Mutex::new(Some(move || {
+        release.send(()).unwrap();
+        queued.recv_timeout(Duration::from_secs(3)).unwrap();
+    })))));
+    assert!(changed
+        .as_mut()
+        .poll(&mut Context::from_waker(&waker))
+        .is_pending());
+    let outcome = session.start(SessionStartOptions::default()).await.unwrap();
     assert!(
         matches!(outcome, StartOutcome::Unknown { ref cause }
         if matches!(cause, BrokerSessionError::Io(error)
@@ -100,6 +117,51 @@ async fn a_starting_write_failure_retains_the_queued_final_exit() {
     let failed = snapshot(&mut state, |state| state.phase() == SessionPhase::Failed).await;
     assert!(failed.exit().unwrap().report().is_final());
     finish.send(()).unwrap();
+    server.finish().await;
+}
+
+#[tokio::test]
+async fn an_exit_during_start_identity_verification_prevents_submission() {
+    let (checking, checked) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let server = Server::spawn(move |guest, request| {
+        let mut worker = TestWorker::pausing_on_recheck(request.request().clone(), PREPARATION);
+        super::fixture::publish_ready(&guest, &request, 45_000, &mut worker);
+        let recheck = command(&guest, &request);
+        assert_eq!(recheck.kind(), PreparationControlKind::Recheck);
+        reply(&guest, recheck, 45_000);
+        worker.wait_for_recheck();
+        checking.send(()).unwrap();
+        released.recv_timeout(Duration::from_secs(3)).unwrap();
+        // Keep the identity reply blocked until the host handles Exit.
+        final_exit(&guest, &request, ExitReason::WorkerExitedBeforeStart);
+        assert!(matches!(
+            receive_guest_frame(&guest, &mut [0; 4096]),
+            Err(lasper_guest_runtime::transport::TransportError::UnexpectedEof)
+        ));
+    });
+    let mut session = server.prepare().await;
+    let mut start = Box::pin(session.start(SessionStartOptions::default()));
+    drive_io(async {
+        tokio::select! {
+            result = &mut start => panic!("identity reply is still blocked: {result:?}"),
+            result = checked => result.unwrap(),
+        }
+    })
+    .await;
+    release.send(()).unwrap();
+    assert!(matches!(
+        drive_io(start).await,
+        Err(StartError::NotSubmitted(BrokerSessionError::InvalidState(
+            SessionPhase::Closed
+        )))
+    ));
+    let state = session.snapshot();
+    assert_eq!(state.phase(), SessionPhase::Closed);
+    assert!(state.error().is_none());
+    let report = state.exit().unwrap().report();
+    assert_eq!(report.reason(), ExitReason::WorkerExitedBeforeStart);
+    assert!(report.is_final());
     server.finish().await;
 }
 
