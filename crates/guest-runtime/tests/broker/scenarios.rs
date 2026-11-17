@@ -428,7 +428,8 @@ pub fn standalone(binary: &str) {
     assert!(executable
         .iter()
         .any(|line| line.split_whitespace().nth(1) == Some("r-xp")));
-    assert_relro_read_only(binary, &executable);
+    let mappings: Vec<_> = maps.lines().collect();
+    assert_relro_read_only(binary, &executable, &mappings);
     let mut stream = broker.connect();
     let id = client::hello(&mut stream);
     let request = client::request(&stream, id);
@@ -469,7 +470,7 @@ fn standalone_environment(broker: &Broker) {
     drop(descriptors);
 }
 
-fn assert_relro_read_only(binary: &str, maps: &[&str]) {
+fn assert_relro_read_only(binary: &str, executable: &[&str], maps: &[&str]) {
     let elf = fs::read(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../..")
@@ -485,7 +486,7 @@ fn assert_relro_read_only(binary: &str, maps: &[&str]) {
         .map(|index| offset + index * size)
         .find(|&at| u32_at(at) == 0x6474_e552)
         .expect("ELF has GNU_RELRO");
-    let base = maps
+    let base = executable
         .iter()
         .find_map(|line| {
             let mut fields = line.split_whitespace();
