@@ -1,8 +1,8 @@
 use crate::session::{wire, BrokerSessionError, Reply};
 use crate::ReceivedControlFrame;
 use lasper_guest_protocol::{
-    ControlFrameHeader, ControlReplyFrame, ControlReplyStatus, PreparationControlFrame,
-    PreparationId, PrepareRequestFrame, StartAcceptedFrame,
+    ControlFrameHeader, ControlReplyStatus, NegotiatedProtocol, PreparationControlFrame,
+    PreparationId, PrepareRequestFrame,
 };
 use std::io;
 use tokio::time::Instant;
@@ -27,6 +27,19 @@ pub(super) enum ReplyValue {
 }
 
 impl ExpectedReply {
+    pub fn operation(self) -> lasper_guest_protocol::GuestOperation {
+        use lasper_guest_protocol::{GuestOperation as Op, PreparationControlKind as Kind};
+        match self {
+            Self::Start(_) => Op::Start,
+            Self::Control { command, .. } => match command.kind() {
+                Kind::KeepPrepared => Op::KeepPrepared,
+                Kind::Recheck => Op::Recheck,
+                Kind::Cancel => Op::Cancel,
+                Kind::Close => Op::Close,
+            },
+        }
+    }
+
     pub fn header(self) -> ControlFrameHeader {
         match self {
             Self::Control { header, .. } | Self::Start(header) => header,
@@ -35,23 +48,25 @@ impl ExpectedReply {
 
     pub fn decode(
         self,
+        protocol: &NegotiatedProtocol,
         request: &PrepareRequestFrame<'_>,
         preparation: PreparationId,
         frame: &ReceivedControlFrame,
     ) -> Result<ReplyValue, BrokerSessionError> {
-        wire::rejection(self.header(), request, Some(preparation), frame)?;
+        wire::rejection(protocol, self.header(), request, Some(preparation), frame)?;
         Ok(match self {
             Self::Control { command, .. } => ReplyValue::Control(
-                ControlReplyFrame::decode_for(
-                    &command,
-                    frame.header(),
-                    frame.payload(),
-                    frame.descriptors().len(),
-                )?
-                .status(),
+                protocol
+                    .decode_control_reply(
+                        &command,
+                        frame.header(),
+                        frame.payload(),
+                        frame.descriptors().len(),
+                    )?
+                    .status(),
             ),
             Self::Start(header) => {
-                StartAcceptedFrame::decode_for(
+                protocol.decode_start_accepted(
                     header.request_id(),
                     request,
                     preparation,

@@ -232,9 +232,13 @@ fn execution(privileged: bool) {
     let id = client::hello(&mut first);
     let request = client::request(&first, id);
     let (ready, descriptors) = client::ready(&first, &request);
-    assert_eq!(descriptors.len(), 2);
+    assert_eq!(descriptors.len(), 4);
     client::start(&first, &request, &ready);
     client::finish(&first, &request, &ready);
+    let mut stdout = std::fs::File::from(descriptors[2].try_clone().unwrap());
+    let mut output = Vec::new();
+    stdout.read_to_end(&mut output).unwrap();
+    assert_eq!(output, b"broker-output");
     drop(descriptors);
     drop(first);
     broker.wait_children(0);
@@ -424,13 +428,7 @@ pub fn standalone(binary: &str) {
     assert!(executable
         .iter()
         .any(|line| line.split_whitespace().nth(1) == Some("r-xp")));
-    assert!(
-        !executable.iter().any(|line| line
-            .split_whitespace()
-            .nth(1)
-            .is_some_and(|flags| flags.contains('w'))),
-        "relocated ELF data remained writable: {executable:?}"
-    );
+    assert_relro_read_only(binary, &executable);
     let mut stream = broker.connect();
     let id = client::hello(&mut stream);
     let request = client::request(&stream, id);
@@ -440,7 +438,80 @@ pub fn standalone(binary: &str) {
     drop(descriptors);
     drop(stream);
     broker.wait_children(0);
+    standalone_environment(&broker);
+    broker.wait_children(0);
     assert!(broker.stop().success());
+}
+
+fn standalone_environment(broker: &Broker) {
+    use lasper_guest_protocol::{ProcessEnvironment, MAX_PROCESS_ENVIRONMENT_BYTES};
+    let entries = [("HOME", "/chosen"), ("PAYLOAD", ""), ("TERM", "")];
+    let overhead: usize = entries
+        .iter()
+        .map(|(name, value)| name.len() + value.len() + 2)
+        .sum();
+    let value = "\n".repeat(MAX_PROCESS_ENVIRONMENT_BYTES - overhead);
+    let script = format!(
+        "test \"${{#PAYLOAD}}\" -eq {} && test \"$HOME\" = /chosen && test \"${{TERM+x}}\" = x && test -z \"$TERM\"",
+        value.len()
+    );
+    let mut stream = broker.connect();
+    let id = client::hello(&mut stream);
+    let request = client::request_with_environment(
+        &stream,
+        id,
+        &["/bin/sh", "-c", &script],
+        ProcessEnvironment::new([("HOME", "/chosen"), ("PAYLOAD", &value), ("TERM", "")]).unwrap(),
+    );
+    let (ready, descriptors) = client::ready(&stream, &request);
+    client::start(&stream, &request, &ready);
+    client::finish(&stream, &request, &ready);
+    drop(descriptors);
+}
+
+fn assert_relro_read_only(binary: &str, maps: &[&str]) {
+    let elf = fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(binary),
+    )
+    .unwrap();
+    let u16_at = |at| u16::from_le_bytes(elf[at..at + 2].try_into().unwrap()) as usize;
+    let u32_at = |at| u32::from_le_bytes(elf[at..at + 4].try_into().unwrap());
+    let u64_at = |at| u64::from_le_bytes(elf[at..at + 8].try_into().unwrap()) as usize;
+    let offset = u64_at(32);
+    let size = u16_at(54);
+    let relro = (0..u16_at(56))
+        .map(|index| offset + index * size)
+        .find(|&at| u32_at(at) == 0x6474_e552)
+        .expect("ELF has GNU_RELRO");
+    let base = maps
+        .iter()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            let range = fields.next()?;
+            fields.next()?;
+            (fields.next()? == "00000000")
+                .then(|| usize::from_str_radix(range.split('-').next().unwrap(), 16).unwrap())
+        })
+        .unwrap();
+    let start = base + u64_at(relro + 16);
+    let end = start + u64_at(relro + 40);
+    let mut covered = 0;
+    for line in maps {
+        let mut fields = line.split_whitespace();
+        let (low, high) = fields.next().unwrap().split_once('-').unwrap();
+        let low = usize::from_str_radix(low, 16).unwrap();
+        let high = usize::from_str_radix(high, 16).unwrap();
+        if low < end && high > start {
+            assert!(
+                !fields.next().unwrap().contains('w'),
+                "writable RELRO: {line}"
+            );
+            covered += high.min(end) - low.max(start);
+        }
+    }
+    assert_eq!(covered, end - start, "RELRO is not fully mapped");
 }
 
 pub const SCENARIOS: &[super::Scenario] = &[

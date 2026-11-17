@@ -1,3 +1,8 @@
+//! Keeps encoded replies and export FD copies alive across partial writes.
+//!
+//! Sending a reply may span event-loop turns so worker observation and cleanup
+//! can continue while the control socket is blocked.
+
 use core::task::Poll;
 use lasper_guest_protocol::{
     ControlFrameHeader, EnforcedControlLimits, CONTROL_FRAME_HEADER_BYTES,
@@ -46,10 +51,11 @@ impl Payload {
 
     pub(super) fn ready(
         frame: lasper_guest_protocol::PrepareReadyFrame,
+        protocol: lasper_guest_protocol::NegotiatedProtocol,
     ) -> Result<(ControlFrameHeader, Self), GuardianError> {
         let mut bytes = Mapping::new(512).context("allocate Ready reply")?;
-        let length = frame
-            .encode_into(bytes.as_mut())
+        let length = protocol
+            .encode_ready(frame, bytes.as_mut())
             .map_err(GuardianError::PrepareFrame)?;
         let header = ControlFrameHeader::decode(&bytes.as_ref()[..CONTROL_FRAME_HEADER_BYTES])
             .map_err(|_| GuardianError::ReplyEncoding)?;

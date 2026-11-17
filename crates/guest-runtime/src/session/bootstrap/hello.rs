@@ -1,6 +1,6 @@
 use core::task::Poll;
 use lasper_guest_protocol::{
-    BrokerId, ControlFrameHeader, ControlLimits, EnforcedControlLimits, HelloRequest, MessageKind,
+    BrokerId, ControlFrameHeader, ControlLimits, HelloRequest, MessageKind,
     HELLO_PAYLOAD_BUFFER_BYTES,
 };
 
@@ -18,7 +18,7 @@ use super::supervisor::Supervisor;
 
 pub(super) struct CompletedHello {
     pub(super) request_id: u64,
-    pub(super) limits: EnforcedControlLimits,
+    pub(super) negotiated: lasper_guest_protocol::NegotiatedProtocol,
     pub(super) completed_at_ms: u64,
 }
 
@@ -44,37 +44,63 @@ pub(super) fn exchange(
         let frame = reader.finish().map_err(GuardianError::Control)?;
         let request =
             HelloRequest::decode_payload(frame.payload()).map_err(GuardianError::HelloPayload)?;
-        let accepted = GuestWorkerReadiness::check()
-            .map_err(GuardianError::Readiness)?
-            .accept_hello(
-                frame.header().protocol_version(),
-                request,
-                broker,
-                ControlLimits::CURRENT,
-            )
-            .map_err(GuardianError::Hello)?;
+        let readiness = GuestWorkerReadiness::check().map_err(GuardianError::Readiness)?;
+        let offer = readiness.offer(ControlLimits::CURRENT);
+        let accepted = readiness.accept_hello(
+            frame.header().protocol_version(),
+            request,
+            broker,
+            ControlLimits::CURRENT,
+        );
         let request_id = frame.header().request_id();
         drop(frame);
-
+        let accepted = match accepted {
+            Ok(value) => value,
+            Err(error) => {
+                let crate::readiness::GuestHelloError::Negotiation(reason) = error;
+                let rejected = lasper_guest_protocol::HelloRejected { offer, reason };
+                let length = rejected
+                    .encode_payload(&mut bytes)
+                    .map_err(GuardianError::HelloPayload)?;
+                let header = ControlFrameHeader::new_with_version(
+                    lasper_guest_protocol::ProtocolVersion::BOOTSTRAP,
+                    MessageKind::HelloRejected,
+                    request_id,
+                    length as u32,
+                    0,
+                )
+                .map_err(|e| GuardianError::Control(TransportError::InvalidHeader(e)))?;
+                let mut writer = connection
+                    .begin_send(header, &bytes[..length], &[])
+                    .map_err(GuardianError::Control)?;
+                hello.drive(POLLOUT, || writer.advance())?;
+                return Err(GuardianError::Hello(error));
+            }
+        };
         let length = accepted
             .response()
             .encode_payload(&mut bytes)
             .map_err(GuardianError::HelloPayload)?;
-        let header =
-            ControlFrameHeader::new(MessageKind::HelloResponse, request_id, length as u32, 0)
-                .map_err(|error| GuardianError::Control(TransportError::InvalidHeader(error)))?;
+        let header = ControlFrameHeader::new_with_version(
+            lasper_guest_protocol::ProtocolVersion::BOOTSTRAP,
+            MessageKind::HelloResponse,
+            request_id,
+            length as u32,
+            0,
+        )
+        .map_err(|error| GuardianError::Control(TransportError::InvalidHeader(error)))?;
         let mut writer = connection
             .begin_send(header, &bytes[..length], &[])
             .map_err(GuardianError::Control)?;
         hello.drive(POLLOUT, || writer.advance())?;
         CompletedHello {
             request_id,
-            limits: accepted.limits(),
+            negotiated: accepted.negotiated(),
             completed_at_ms: hello.check()?,
         }
     };
     connection
-        .complete_hello(completed.limits)
+        .complete_protocol(completed.negotiated)
         .map_err(GuardianError::Control)?;
     Ok(completed)
 }

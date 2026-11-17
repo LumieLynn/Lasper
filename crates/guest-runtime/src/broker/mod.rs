@@ -1,5 +1,14 @@
+//! Accepts connections and supervises one guardian child per connection.
+//!
+//! Guardians own the session protocol and their worker trees. The broker keeps
+//! admission slots until wait reports guardian exit, and reaps descendants left
+//! behind by a failed guardian.
+
 mod listener;
 mod registry;
+mod startup;
+
+pub(crate) use startup::{Startup, STARTUP_TIMEOUT_MS};
 
 use crate::diagnostic::Diagnostic;
 use crate::failure::FailureClass;
@@ -10,7 +19,7 @@ use lasper_guest_protocol::BrokerId;
 use crate::linux::children::visit_direct_children;
 use crate::linux::signals::{BlockedSignals, Signals};
 use crate::linux::uapi::{
-    errno::{EAGAIN, ECHILD, EINTR, EIO, ESRCH, ETIMEDOUT},
+    errno::{EAGAIN, ECHILD, EINTR, EIO, ESRCH},
     nr,
     random::GRND_NONBLOCK,
     signal::SIGKILL,
@@ -71,21 +80,6 @@ pub unsafe fn run(directory: &CStr) -> Result<(), BrokerError> {
     unsafe { run_inner(directory, None) }
 }
 
-/// Holds the broker's endpoints for the wrapper startup handshake.
-///
-/// The broker binds its listener and sends Ready before the parent attempts
-/// `execve`. It waits for the exec-status result before accepting sessions.
-pub(crate) struct Startup {
-    /// Write end of the Ready pipe. The broker writes byte 1, then closes it.
-    pub(crate) ready: Descriptor,
-    /// Read end of the status socket. The parent sends a native-endian `i32` errno
-    /// on failure. Successful `execve` closes its sole writer through CLOEXEC.
-    pub(crate) exec_status: Descriptor,
-    /// Pidfd for the parent process, which becomes the payload after `execve`.
-    /// The broker checks it before accepting EOF as success and monitors it for exit.
-    pub(crate) parent: Descriptor,
-}
-
 /// Runs the broker with the wrapper's startup protocol.
 ///
 /// # Safety
@@ -124,13 +118,7 @@ unsafe fn run_inner(directory: &CStr, startup: Option<Startup>) -> Result<(), Br
     let id = broker_id().at("generate broker ID")?;
     let listener = Listener::bind(directory).at("create broker listener")?;
     let [socket, directory, lock] = listener.descriptors();
-    let [ready, exec_status, parent] = startup.as_ref().map_or([-1; 3], |startup| {
-        [
-            startup.ready.raw(),
-            startup.exec_status.raw(),
-            startup.parent.raw(),
-        ]
-    });
+    let [ready, exec_status, parent] = startup.as_ref().map_or([-1; 3], Startup::descriptors);
     let keep = [
         socket,
         directory,
@@ -155,81 +143,6 @@ unsafe fn run_inner(directory: &CStr, startup: Option<Startup>) -> Result<(), Br
         parent,
     }
     .drive()
-}
-
-impl Startup {
-    fn handoff(self, signals: &Signals) -> Result<Descriptor, BrokerError> {
-        self.ready.write_all(&[1]).at("report broker Ready")?;
-        drop(self.ready);
-        let deadline = linux::monotonic_ms()
-            .at("read handoff clock")?
-            .saturating_add(crate::wrapper::STARTUP_TIMEOUT_MS);
-        loop {
-            let remaining =
-                deadline.saturating_sub(linux::monotonic_ms().at("read handoff clock")?);
-            if remaining == 0 {
-                return Err(BrokerError {
-                    class: FailureClass::TimedOut,
-                    operation: "wait payload exec",
-                    errno: ETIMEDOUT,
-                });
-            }
-            let mut events = [
-                PollFd::new(self.exec_status.raw()),
-                PollFd::new(self.parent.raw()),
-                PollFd::new(signals.raw()),
-            ];
-            match linux::poll(&mut events, Some(remaining)) {
-                Ok(()) => {}
-                Err(EINTR) => continue,
-                Err(errno) => {
-                    return Err(BrokerError {
-                        class: FailureClass::System,
-                        operation: "poll payload handoff",
-                        errno,
-                    })
-                }
-            }
-            if events[1].ready() || events[2].ready() {
-                return Err(BrokerError {
-                    class: FailureClass::Unavailable,
-                    operation: "wrapper stopped before handoff",
-                    errno: EIO,
-                });
-            }
-            if events[0].ready() {
-                let mut error = [0; 4];
-                let count = self
-                    .exec_status
-                    .read(&mut error)
-                    .at("read payload exec status")?;
-                if count != 0 {
-                    let errno = i32::from_ne_bytes(error);
-                    return Err(BrokerError {
-                        class: FailureClass::Exec,
-                        operation: "payload exec failed",
-                        errno: if count == 4 && (1..=4095).contains(&errno) {
-                            errno
-                        } else {
-                            EIO
-                        },
-                    });
-                }
-                // Parent death also closes the channel. EOF indicates successful
-                // execve only if the pinned parent process is still alive.
-                let mut parent = [PollFd::new(self.parent.raw())];
-                linux::poll(&mut parent, Some(0)).at("check payload lifetime")?;
-                if parent[0].ready() {
-                    return Err(BrokerError {
-                        class: FailureClass::Unavailable,
-                        operation: "payload exited during handoff",
-                        errno: EIO,
-                    });
-                }
-                return Ok(self.parent);
-            }
-        }
-    }
 }
 
 fn standard_streams() -> Result<(), i32> {

@@ -4,6 +4,8 @@ use crate::session::GUARDIAN_START_BYTE;
 
 pub(super) const CAPACITY: usize = 32;
 
+// Slots track child ownership and admission capacity. A closed connection does
+// not free a slot until wait confirms that its guardian has exited.
 pub(super) struct Registry {
     slots: [Option<Guardian>; CAPACITY],
 }
@@ -79,8 +81,8 @@ impl Reservation<'_> {
             pidfd: None,
             release: None,
         });
-        // Record before pidfd_open: on failure the pipe closes, but this child
-        // still owns its slot until the broker has waited for it.
+        // Record the child before pidfd_open. If assignment fails, pipe EOF
+        // releases the child's startup wait but its slot stays occupied until wait.
         child.pidfd = Some(linux::pidfd(pid)?);
         release.write_all(&[GUARDIAN_START_BYTE])?;
         child.release = Some(release);

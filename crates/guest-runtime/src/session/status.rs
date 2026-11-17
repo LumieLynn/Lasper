@@ -30,7 +30,7 @@ impl WorkerFailure {
             | WorkerStage::UserIdentity
             | WorkerStage::TerminalOwnership => FailureClass::Permission,
             WorkerStage::StandardIo | WorkerStage::Start => FailureClass::Io,
-            WorkerStage::Projection => FailureClass::Unavailable,
+            WorkerStage::Identity => FailureClass::Unavailable,
             WorkerStage::Descriptors
             | WorkerStage::Session
             | WorkerStage::Signals

@@ -7,6 +7,8 @@ mod io;
 mod lease;
 mod lifecycle;
 mod preparation;
+mod public_budgets;
+mod shell;
 mod start;
 
 #[path = "../support/control.rs"]

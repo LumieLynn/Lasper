@@ -1,67 +1,94 @@
+//! Coordinates control requests, worker observations and cleanup on one connection.
+//!
+//! WireSessionState checks protocol ordering. Operation tracks the caller waiting
+//! for a result; pending tracks the request awaiting a guest reply. They are
+//! separate because identity work and lease renewal can overlap. SessionPhase
+//! publishes host observations and does not replace the wire state.
+
 mod commands;
 mod control;
 mod deadlines;
 mod failure;
 mod operation;
+mod preparation;
 mod replies;
 mod worker;
 
 use self::control::{CleanupRequest, ExpectedReply, PendingRequest};
 use self::operation::Operation;
 use self::worker::Worker;
-use super::{
-    wire, BrokerSessionError, Command, Reply, SessionPhase, SessionSnapshot, KEEP_INTERVAL,
-    OPERATION_TIMEOUT,
-};
+use super::{wire, BrokerSessionError, Command, Reply, SessionPhase, SessionSnapshot};
 use crate::stream::ControlIoEvent;
-use crate::{BrokerConnection, PreparedWorker, WorkerObservation};
+use crate::{BrokerConnection, WorkerObservation};
 use lasper_guest_protocol::{
-    ControlFrameHeader, MessageKind, PreparationControl, PreparationControlKind,
-    PrepareRequestFrame,
+    ControlFrameHeader, PreparationControl, PreparationControlKind, PrepareRequestFrame,
 };
 use std::future::pending;
 use std::sync::Arc;
 use tokio::sync::{mpsc, watch};
 use tokio::time::{sleep_until, Instant};
 
+#[allow(clippy::too_many_arguments)] // One driver takes the connection and its reply/state channels.
 pub(super) async fn run(
     mut connection: BrokerConnection,
     header: ControlFrameHeader,
     payload: Box<[u8]>,
     mut commands: mpsc::Receiver<Command>,
     state: watch::Sender<SessionSnapshot>,
-    ready: Reply<(lasper_guest_protocol::PreparationId, WorkerObservation)>,
+    ready: Reply<(
+        lasper_guest_protocol::PreparationId,
+        WorkerObservation,
+        crate::PreparedIo,
+    )>,
     deadline: Instant,
+    timeouts: crate::ClientTimeouts,
 ) {
-    let request = match PrepareRequestFrame::decode_parts(
+    let protocol = connection.hello().protocol();
+    let mut scratch = vec![0; lasper_guest_protocol::MAX_PREPARE_UNESCAPE_BYTES];
+    let decoded = protocol.decode_prepare_frame(
         header,
         &payload,
         0,
         connection.readiness().broker_id(),
-    ) {
+        &mut scratch,
+    );
+    drop(scratch);
+    let request = match decoded {
         Ok(request) => Arc::new(request),
         Err(error) => {
+            state.send_modify(|snapshot| {
+                snapshot.phase = SessionPhase::Finished;
+                snapshot.error = Some(Arc::new(wire::encoding(error)));
+            });
             let _ = ready.send(Err(wire::encoding(error)));
             return;
         }
     };
     let prepared = tokio::select! {
-        prepared = prepare(&mut connection, Arc::clone(&request), header, &payload, deadline) => prepared,
+        prepared = preparation::exchange(&mut connection, Arc::clone(&request), header, &payload, deadline) => prepared,
         _ = commands.recv() => return,
     };
-    let (worker, lease_deadline) = match prepared {
+    let (worker, lease_deadline, wire_state) = match prepared {
         Ok(prepared) => prepared,
         Err(error) => {
+            state.send_modify(|snapshot| {
+                snapshot.phase = SessionPhase::Finished;
+                snapshot.error = Some(Arc::new(error.clone()));
+            });
             let _ = ready.send(Err(error));
             return;
         }
     };
     let preparation = worker.ready().response().preparation_id();
+    let hello = connection.hello();
     let mut owner = Owner {
+        wire_state,
+        hello,
         connection,
+        timeouts,
         request,
         token: PreparationControl::new(worker.ready().response().broker_id(), preparation),
-        worker: Worker::Prepared(worker),
+        worker: Worker::Prepared(Box::new(worker)),
         state,
         next_id: header.request_id(),
         lease_deadline,
@@ -75,7 +102,7 @@ pub(super) async fn run(
         retired: None,
         cleanup: None,
         frame_deadline: None,
-        output_deadline: None,
+        write_deadline: None,
         cleanup_deadline: None,
         detached: false,
     };
@@ -88,36 +115,12 @@ pub(super) async fn run(
     }
 }
 
-async fn prepare<'payload>(
-    connection: &mut BrokerConnection,
-    request: Arc<PrepareRequestFrame<'payload>>,
-    header: ControlFrameHeader,
-    payload: &[u8],
-    deadline: Instant,
-) -> Result<(PreparedWorker<'payload>, Instant), BrokerSessionError> {
-    // The guest's remaining lease may age in transit. Counting from the send
-    // keeps the host's estimate conservative when Ready is delayed.
-    let sent_at = Instant::now();
-    wire::send(connection, header, payload, deadline).await?;
-    let frame = wire::receive(connection, deadline).await?;
-    if frame.header().kind() == MessageKind::Error {
-        wire::rejection(header, &request, None, &frame)?;
-    }
-    let worker = PreparedWorker::from_frame(
-        Arc::clone(connection.target()),
-        connection.readiness(),
-        request,
-        frame,
-    )?;
-    let lease_deadline = sent_at
-        + std::time::Duration::from_millis(u64::from(
-            worker.ready().response().remaining_lease_ms(),
-        ));
-    Ok((worker, lease_deadline))
-}
-
 struct Owner<'payload> {
+    wire_state: lasper_guest_protocol::WireSessionState,
     connection: BrokerConnection,
+    // Retain the selected codec while draining reports from a poisoned stream.
+    hello: crate::NegotiatedHello,
+    timeouts: crate::ClientTimeouts,
     request: Arc<PrepareRequestFrame<'payload>>,
     token: PreparationControl,
     worker: Worker<'payload>,
@@ -129,11 +132,11 @@ struct Owner<'payload> {
     operation: Option<Operation>,
     queued: Option<Command>,
     // Cleanup replaces the outstanding request, whose reply can still arrive.
-    // Validate that reply without applying its state changes.
+    // Retain submission facts from that reply without resuming its operation.
     retired: Option<ExpectedReply>,
     cleanup: Option<CleanupRequest>,
     frame_deadline: Option<Instant>,
-    output_deadline: Option<Instant>,
+    write_deadline: Option<Instant>,
     cleanup_deadline: Option<Instant>,
     detached: bool,
 }
@@ -171,15 +174,22 @@ impl Owner<'_> {
         commands: &mut mpsc::Receiver<Command>,
     ) -> Result<(), BrokerSessionError> {
         loop {
-            if matches!(self.phase(), SessionPhase::Closed | SessionPhase::Failed) {
+            if matches!(self.phase(), SessionPhase::Finished) {
+                self.wire_state.disconnect();
                 return Ok(());
             }
             if commands.is_closed() && !self.detached {
                 self.detached = true;
                 if self.phase() != SessionPhase::Closing {
                     self.begin_cleanup(CleanupRequest {
-                        kind: PreparationControlKind::Close,
-                        deadline: Instant::now() + OPERATION_TIMEOUT,
+                        kind: if self.state.borrow().submission
+                            == crate::StartSubmission::NotSubmitted
+                        {
+                            PreparationControlKind::Cancel
+                        } else {
+                            PreparationControlKind::Close
+                        },
+                        deadline: Instant::now() + self.timeouts.cleanup_observation,
                         reply: None,
                     })?;
                 }
@@ -218,14 +228,17 @@ impl Owner<'_> {
                     match event? {
                         ControlIoEvent::Input(Some(frame)) => self.receive(frame)?,
                         ControlIoEvent::Input(None) => {
-                            self.frame_deadline.get_or_insert_with(|| Instant::now() + OPERATION_TIMEOUT);
+                            self.frame_deadline.get_or_insert_with(|| Instant::now() + self.timeouts.operation);
                         }
-                        ControlIoEvent::Sent => { self.output_deadline = None; }
+                        ControlIoEvent::Sent => {
+                            self.wire_state.request_sent().map_err(wire::sequence)?;
+                            self.write_deadline = None;
+                        }
                         ControlIoEvent::WriteFailed(error) => {
                             if self.phase() != SessionPhase::Closing {
                                 return Err(error.into());
                             }
-                            self.output_deadline = None;
+                            self.write_deadline = None;
                             self.state.send_modify(|state| {
                                 state.error.get_or_insert_with(|| Arc::new(error.into()));
                             });
@@ -259,5 +272,5 @@ async fn wait_until(deadline: Option<Instant>) {
 }
 
 fn renewal(deadline: Instant) -> Instant {
-    Instant::now() + KEEP_INTERVAL.min(deadline.saturating_duration_since(Instant::now()) / 2)
+    Instant::now() + deadline.saturating_duration_since(Instant::now()) / 3
 }

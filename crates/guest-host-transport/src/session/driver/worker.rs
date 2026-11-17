@@ -1,15 +1,15 @@
 use crate::{PreparedWorker, WorkerObservation};
 use std::future::{pending, Future};
 use std::io;
-use std::os::fd::OwnedFd;
 use std::pin::Pin;
 
-type Observation<'a> =
-    Pin<Box<dyn Future<Output = (PreparedWorker<'a>, io::Result<WorkerObservation>)> + Send + 'a>>;
+type Observation<'a> = Pin<
+    Box<dyn Future<Output = (Box<PreparedWorker<'a>>, io::Result<WorkerObservation>)> + Send + 'a>,
+>;
 
 pub(super) enum Worker<'a> {
     Unavailable,
-    Prepared(PreparedWorker<'a>),
+    Prepared(Box<PreparedWorker<'a>>),
     Observing(Observation<'a>),
 }
 
@@ -47,10 +47,10 @@ impl<'a> Worker<'a> {
         }
     }
 
-    pub fn take_terminal(&mut self) -> Option<OwnedFd> {
-        match std::mem::replace(self, Self::Unavailable) {
-            Self::Prepared(worker) => worker.into_terminal(),
-            _ => None,
+    pub fn take_io(&mut self) -> crate::PreparedIo {
+        match self {
+            Self::Prepared(worker) => worker.take_io(),
+            _ => unreachable!("Ready follows identity observation"),
         }
     }
 }

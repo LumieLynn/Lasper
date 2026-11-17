@@ -1,29 +1,27 @@
 //! Prepared workers keep their lease while callers are idle. Dropping the
 //! session requests cleanup; snapshots remain available to observers.
+//!
+//! BrokerSession sends commands to a background driver that owns the connection,
+//! renews the prepared lease and observes cleanup. Dropping the command sender
+//! wakes that driver; snapshot receivers and data descriptors do not retain it.
 
 mod driver;
 mod error;
-mod output;
+mod prepare;
 mod start;
 mod wire;
 
 pub use error::BrokerSessionError;
-pub use output::{CapturedStream, SessionExit, SessionOutput};
+pub(crate) use prepare::EncodedPrepare;
 pub use start::{StartError, StartOutcome};
 
 use crate::{BrokerConnection, WorkerObservation};
-use lasper_guest_protocol::{
-    ControlFrameHeader, PreparationId, PrepareRequest, ProjectionObservations, TerminalSize,
-};
+use lasper_guest_protocol::{PreparationId, PrepareRequest, TerminalSize};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{timeout_at, Duration, Instant};
 
-const PREPARE_TIMEOUT: Duration = Duration::from_secs(5);
-const START_TIMEOUT: Duration = Duration::from_secs(5);
-const OPERATION_TIMEOUT: Duration = Duration::from_secs(15);
-const KEEP_INTERVAL: Duration = Duration::from_secs(10);
-
+/// Host-observed progress. WireSessionState separately validates frame ordering.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionPhase {
     Prepared,
@@ -31,21 +29,19 @@ pub enum SessionPhase {
     /// the worker will not execute.
     Starting,
     /// The guest accepted Start; only Exit can establish whether exec succeeded.
-    StartAccepted,
+    Accepted,
     /// Cleanup is being observed; progress reports do not extend its deadline.
     Closing,
-    Closed,
-    /// A host operation failed. A retained final Exit can still confirm cleanup.
-    Failed,
+    Finished,
 }
 
-/// Each report replaces the previous one rather than appending to an output
-/// history. Clones share the captured bytes, which outlive the session driver.
+/// The latest submission facts, validated guest report and host observation error.
 #[derive(Clone, Debug)]
 pub struct SessionSnapshot {
-    phase: SessionPhase,
-    exit: Option<Arc<SessionExit>>,
-    error: Option<Arc<BrokerSessionError>>,
+    pub phase: SessionPhase,
+    pub submission: StartSubmission,
+    pub report: Option<lasper_guest_protocol::ExitReport>,
+    pub error: Option<Arc<BrokerSessionError>>,
 }
 
 impl SessionSnapshot {
@@ -53,56 +49,66 @@ impl SessionSnapshot {
         self.phase
     }
 
-    /// The latest validated guest report. A report retained during failure is
-    /// diagnostic evidence and does not turn Failed into Closed.
-    pub fn exit(&self) -> Option<&SessionExit> {
-        self.exit.as_deref()
-    }
-
     /// Retains the first host-side failure even if cleanup later completes.
-    /// A Closed session can therefore have both an error and a final Exit.
+    /// A finished session can have both an error and a final Exit.
     pub fn error(&self) -> Option<&BrokerSessionError> {
         self.error.as_deref()
     }
-
-    /// Keeps the report after dropping the snapshot, without copying output.
-    pub fn into_exit(self) -> Option<Arc<SessionExit>> {
-        self.exit
-    }
 }
 
-/// Values allowed to change between Prepare and Start. The account, command
-/// and projection paths remain fixed by the original Prepare request.
-#[derive(Default)]
-pub struct SessionStartOptions {
-    pub wayland_display: Option<String>,
-    pub x11_display: Option<u16>,
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StartSubmission {
+    NotSubmitted,
+    Unconfirmed,
+    Accepted,
+    Rejected,
+}
+
+#[derive(Clone, Debug)]
+pub struct Completion {
+    pub submission: StartSubmission,
+    pub report: Option<lasper_guest_protocol::ExitReport>,
+    pub error: Option<Arc<BrokerSessionError>>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct StartOptions {
     pub terminal_size: Option<TerminalSize>,
-    /// Execution budget from guest acceptance of Start. None means unlimited.
-    /// Positive durations are rounded up to whole milliseconds and must not
-    /// exceed [`lasper_guest_protocol::MAX_EXECUTION_TIMEOUT_MS`].
     pub execution_timeout: Option<Duration>,
 }
 
 /// Dropping the handle requests cleanup but does not wait for it. The host
-/// observes cleanup for at most 15 seconds; the guardian remains responsible
+/// observes cleanup for the configured budget; the guardian remains responsible
 /// for reaping after the host stops waiting.
-///
-/// Cleanup acknowledgements and progress cannot extend this budget. A complete
-/// reply must be processed before the deadline to complete the operation.
-/// Failure leaves Failed, but a nonblocking read of the bytes already queued
-/// can retain Exit alongside the error. It never waits for a missing frame tail
-/// or lets later writes extend this final read. Invalid framing stops the read.
 #[must_use]
 pub struct BrokerSession {
     preparation: PreparationId,
     observation: WorkerObservation,
+    io: Option<crate::PreparedIo>,
     commands: mpsc::Sender<Command>,
     state: watch::Receiver<SessionSnapshot>,
+    timeouts: crate::ClientTimeouts,
 }
 
 type Reply<T> = oneshot::Sender<Result<T, BrokerSessionError>>;
 type StartReply = oneshot::Sender<Result<StartOutcome, StartError>>;
+
+// The task can be aborted before its first poll or while awaiting I/O. Publish
+// the end of observation to every subscriber without claiming guest cleanup.
+struct DriverObservation(watch::Sender<SessionSnapshot>);
+
+impl Drop for DriverObservation {
+    fn drop(&mut self) {
+        self.0.send_modify(|snapshot| {
+            if snapshot.phase != SessionPhase::Finished {
+                snapshot.phase = SessionPhase::Finished;
+                snapshot
+                    .error
+                    .get_or_insert_with(|| Arc::new(BrokerSessionError::DriverStopped));
+            }
+        });
+    }
+}
 
 enum Command {
     Recheck {
@@ -111,8 +117,7 @@ enum Command {
     },
     Start {
         deadline: Instant,
-        options: SessionStartOptions,
-        evidence: ProjectionObservations,
+        options: StartOptions,
         reply: StartReply,
         delivered: oneshot::Receiver<()>,
     },
@@ -177,55 +182,76 @@ impl BrokerSession {
         request: PrepareRequest<'_>,
         deadline: Instant,
     ) -> Result<Self, BrokerSessionError> {
-        let deadline = deadline.min(Instant::now() + PREPARE_TIMEOUT);
+        let timeouts = crate::ClientTimeouts::default();
+        let deadline = deadline.min(Instant::now() + timeouts.prepare);
         if Instant::now() >= deadline {
             return Err(BrokerSessionError::Deadline);
         }
-        let frame = connection
-            .readiness()
-            .prepare(2, request)
-            .map_err(|error| BrokerSessionError::InvalidRequest(error.to_string()))?;
-        let maximum = connection
-            .readiness()
-            .limits()
-            .get()
-            .max_control_frame_bytes() as usize
-            - lasper_guest_protocol::CONTROL_FRAME_HEADER_BYTES;
-        let payload = wire::encode(maximum, |output| frame.request().encode_payload(output))?;
-        let length = payload.len();
-        let header = ControlFrameHeader::new(
-            lasper_guest_protocol::MessageKind::PrepareRequest,
-            frame.request_id(),
-            length as u32,
-            0,
-        )
-        .map_err(wire::encoding)?;
-        if Instant::now() >= deadline {
-            return Err(BrokerSessionError::Deadline);
-        }
-        let (commands, receiver) = mpsc::channel(1);
+        let encoded = EncodedPrepare::encode(&connection, request)?;
+        Self::prepare_encoded(connection, encoded, deadline, timeouts)
+            .await
+            .map_err(|(error, _)| error)
+    }
+
+    pub(crate) async fn prepare_encoded(
+        connection: BrokerConnection,
+        encoded: EncodedPrepare,
+        deadline: Instant,
+        timeouts: crate::ClientTimeouts,
+    ) -> Result<Self, (BrokerSessionError, SessionSnapshot)> {
         let (state, snapshots) = watch::channel(SessionSnapshot {
             phase: SessionPhase::Prepared,
-            exit: None,
+            submission: StartSubmission::NotSubmitted,
+            report: None,
             error: None,
         });
-        let (ready, received) = oneshot::channel();
-        tokio::spawn(driver::run(
-            connection, header, payload, receiver, state, ready, deadline,
-        ));
-        let (preparation, observation) = timeout_at(deadline, received)
-            .await
-            .map_err(|_| BrokerSessionError::Deadline)?
-            .map_err(|_| BrokerSessionError::DriverStopped)??;
-        if Instant::now() >= deadline {
-            return Err(BrokerSessionError::Deadline);
+        let last_snapshot = snapshots.clone();
+        let result = async {
+            let deadline = deadline.min(Instant::now() + timeouts.prepare);
+            if Instant::now() >= deadline {
+                return Err(BrokerSessionError::Deadline);
+            }
+            let EncodedPrepare { header, payload } = encoded;
+            let (commands, receiver) = mpsc::channel(1);
+            let (ready, received) = oneshot::channel();
+            let observation = DriverObservation(state.clone());
+            let driver_timeouts = timeouts.clone();
+            tokio::spawn(async move {
+                let _observation = observation;
+                driver::run(
+                    connection,
+                    header,
+                    payload,
+                    receiver,
+                    state,
+                    ready,
+                    deadline,
+                    driver_timeouts,
+                )
+                .await;
+            });
+            let (preparation, observation, io) = timeout_at(deadline, received)
+                .await
+                .map_err(|_| BrokerSessionError::Deadline)?
+                .map_err(|_| BrokerSessionError::DriverStopped)??;
+            if Instant::now() >= deadline {
+                return Err(BrokerSessionError::Deadline);
+            }
+            Ok(Self {
+                preparation,
+                observation,
+                io: Some(io),
+                commands,
+                state: snapshots,
+                timeouts,
+            })
         }
-        Ok(Self {
-            preparation,
-            observation,
-            commands,
-            state: snapshots,
-        })
+        .await;
+        result.map_err(|error| (error, last_snapshot.borrow().clone()))
+    }
+
+    pub fn take_io(&mut self) -> Option<crate::PreparedIo> {
+        self.io.take()
     }
 
     pub fn preparation_id(&self) -> PreparationId {
@@ -256,13 +282,20 @@ impl BrokerSession {
         Ok(self.snapshot())
     }
 
-    /// The caller must approve any changed display evidence before Start. A
-    /// cancelled recheck leaves the caller's previous observation unchanged.
-    /// Queueing and identity verification share a five-second budget.
+    /// A cancelled recheck leaves the caller's previous observation unchanged.
+    /// Queueing and identity verification share the operation budget.
     pub async fn recheck(&mut self) -> Result<&WorkerObservation, BrokerSessionError> {
+        self.recheck_until(Instant::now() + self.timeouts.operation)
+            .await
+    }
+
+    pub(crate) async fn recheck_until(
+        &mut self,
+        deadline: Instant,
+    ) -> Result<&WorkerObservation, BrokerSessionError> {
         let (reply, received) = oneshot::channel();
         self.send(Command::Recheck {
-            deadline: Instant::now() + START_TIMEOUT,
+            deadline: deadline.min(Instant::now() + self.timeouts.operation),
             reply,
         })
         .await?;
@@ -272,25 +305,29 @@ impl BrokerSession {
         Ok(&self.observation)
     }
 
-    /// Start has a five-second budget, including queueing and identity checks.
-    /// Changed projection evidence leaves the worker prepared for the caller
-    /// to review. Acceptance does not confirm exec success.
+    /// Queueing and identity checks share the operation budget.
+    /// Acceptance does not confirm exec success.
     ///
     /// Before Start is queued for sending, an observed cancellation preserves
     /// preparation. Cancellation racing with that point requests Close, since
     /// the worker may already execute. A lost acknowledgement is reported as
     /// Unknown and is never retried. Err means this attempt was not submitted
     /// or was explicitly rejected. Losing the driver after queueing is Unknown.
-    pub async fn start(
+    pub async fn start(&mut self, options: StartOptions) -> Result<StartOutcome, StartError> {
+        self.start_until(options, Instant::now() + self.timeouts.operation)
+            .await
+    }
+
+    pub(crate) async fn start_until(
         &mut self,
-        options: SessionStartOptions,
+        options: StartOptions,
+        deadline: Instant,
     ) -> Result<StartOutcome, StartError> {
         let (reply, received) = oneshot::channel();
         let (delivered, delivery) = oneshot::channel();
         self.send(Command::Start {
-            deadline: Instant::now() + START_TIMEOUT,
+            deadline: deadline.min(Instant::now() + self.timeouts.operation),
             options,
-            evidence: self.observation.reply().projections(),
             reply,
             delivered: delivery,
         })
@@ -299,10 +336,10 @@ impl BrokerSession {
         start::receive(received, delivered).await
     }
 
-    pub async fn cancel(&mut self) -> Result<(), BrokerSessionError> {
+    pub async fn cancel(&self) -> Result<(), BrokerSessionError> {
         let (reply, received) = oneshot::channel();
         self.send(Command::Cancel {
-            deadline: Instant::now() + OPERATION_TIMEOUT,
+            deadline: Instant::now() + self.timeouts.cleanup_observation,
             reply,
         })
         .await?;
@@ -312,18 +349,39 @@ impl BrokerSession {
     }
 
     /// Ok confirms the cleanup request, not that descendants have been reaped.
-    /// Continue observing snapshots for the final Exit; without it, the
-    /// original cleanup deadline ends observation with Failed and Deadline.
-    pub async fn close(&mut self) -> Result<(), BrokerSessionError> {
+    /// Continue observing snapshots for the final Exit. Without it, the
+    /// cleanup deadline ends observation with Finished and a Deadline error.
+    pub async fn close(&self) -> Result<(), BrokerSessionError> {
         let (reply, received) = oneshot::channel();
         self.send(Command::Close {
-            deadline: Instant::now() + OPERATION_TIMEOUT,
+            deadline: Instant::now() + self.timeouts.cleanup_observation,
             reply,
         })
         .await?;
         received
             .await
             .map_err(|_| BrokerSessionError::DriverStopped)?
+    }
+
+    pub async fn wait(&self) -> Completion {
+        let mut state = self.state.clone();
+        loop {
+            let snapshot = state.borrow().clone();
+            if snapshot.phase == SessionPhase::Finished || state.has_changed().is_err() {
+                return Completion {
+                    submission: snapshot.submission,
+                    report: snapshot.report,
+                    error: snapshot.error.or_else(|| {
+                        snapshot
+                            .report
+                            .filter(|r| r.is_final())
+                            .is_none()
+                            .then(|| Arc::new(BrokerSessionError::DriverStopped))
+                    }),
+                };
+            }
+            let _ = state.changed().await;
+        }
     }
 
     async fn send(&self, command: Command) -> Result<(), BrokerSessionError> {

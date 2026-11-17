@@ -1,18 +1,19 @@
 use serde::{Deserialize, Serialize};
-use serde_json_core::str::EscapedStr;
 
 use super::frame::{
     check_reply, codec_error, encode_frame, validate_token, SessionFrameError, SessionPayloadError,
 };
-use super::output::{CapturedOutput, EncodedOutput, OutputStream};
 use super::{GuestFailure, GuestFailureStage};
-use crate::messages::decode_json_payload_escaped;
-use crate::{
-    BrokerId, ControlFrameHeader, ExecutionKind, MessageKind, PreparationId, PrepareRequestFrame,
-};
+use crate::json::decode_json_payload;
+use crate::{BrokerId, ControlFrameHeader, MessageKind, PreparationId, PrepareRequestFrame};
 
+#[cfg(test)]
+#[path = "../../tests/profile/exit_token.rs"]
+mod fixture;
+
+/// The guardian's observation of exec, independent of the worker's wait status.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExecutionStatus {
     NotStarted,
     Starting,
@@ -28,8 +29,10 @@ pub enum ExitStatus {
     Signaled(u8),
 }
 
+/// Cleanup observed by the guardian. Losing the connection does not establish
+/// either completion or failure.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum CleanupStatus {
     InProgress,
     Pending { errno: Option<i32> },
@@ -56,8 +59,9 @@ pub enum ExitReason {
     ExecutionTimedOut,
 }
 
-/// Exec, wait and cleanup are separate observations: an exited command can
-/// still leave descendants to reap, and an unknown exec can have a known exit.
+/// Exec, wait and cleanup are separate observations. A command may have exited
+/// while descendants still need reaping; its wait status may be known even when
+/// exec was not confirmed.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ExitReport {
     execution: ExecutionStatus,
@@ -155,99 +159,41 @@ impl ExitReport {
     }
 }
 
+/// A status report correlated with the Prepare request, not the latest command.
+/// Bulk output is carried only by the Ready data descriptors.
 #[derive(Clone, Debug)]
-pub struct ExitFrame<'a> {
+pub struct ExitFrame {
     request_id: u64,
     broker_id: BrokerId,
     preparation_id: PreparationId,
     report: ExitReport,
-    output: Option<CapturedOutput<'a>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct WireExit<'a> {
+struct WireExit {
     broker_id: BrokerId,
     preparation_id: PreparationId,
     execution: ExecutionStatus,
     exit: Option<ExitStatus>,
     cleanup: CleanupStatus,
-    reason: ExitReason,
-    failure: Option<GuestFailure>,
-    #[serde(borrow)]
-    output: Option<WireOutput<'a>>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WireOutput<'a> {
-    #[serde(borrow)]
-    stdout: WireStream<'a>,
-    #[serde(borrow)]
-    stderr: WireStream<'a>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct WireStream<'a> {
-    #[serde(borrow)]
-    base64: EscapedStr<'a>,
-    truncated: bool,
-    complete: bool,
-}
-
-#[derive(Serialize)]
-struct EncodedExit<'a> {
-    broker_id: BrokerId,
-    preparation_id: PreparationId,
-    execution: ExecutionStatus,
-    exit: Option<ExitStatus>,
-    cleanup: CleanupStatus,
+    #[serde(deserialize_with = "crate::json::deserialize_string_enum")]
     reason: ExitReason,
     #[serde(skip_serializing_if = "Option::is_none")]
     failure: Option<GuestFailure>,
-    output: Option<EncodedStreams<'a>>,
 }
 
-#[derive(Serialize)]
-struct EncodedStreams<'a> {
-    stdout: EncodedStream<'a>,
-    stderr: EncodedStream<'a>,
-}
-
-#[derive(Serialize)]
-struct EncodedStream<'a> {
-    base64: EncodedOutput<'a>,
-    truncated: bool,
-    complete: bool,
-}
-
-impl<'a> ExitFrame<'a> {
+impl ExitFrame {
     pub fn new(
         request: &PrepareRequestFrame<'_>,
         preparation_id: PreparationId,
         report: ExitReport,
-        output: Option<CapturedOutput<'a>>,
     ) -> Result<Self, SessionPayloadError> {
-        match (request.request().execution(), output) {
-            (ExecutionKind::Interactive, None) | (ExecutionKind::Bounded, Some(_)) => {}
-            _ => return Err(SessionPayloadError::InvalidResponse),
-        }
-        if report.is_final()
-            && output.is_some_and(|output| {
-                [output.stdout(), output.stderr()]
-                    .iter()
-                    .any(|stream| !stream.complete() && !stream.truncated())
-            })
-        {
-            return Err(SessionPayloadError::InvalidResponse);
-        }
         Ok(Self {
             request_id: request.request_id(),
             broker_id: request.broker_id(),
             preparation_id,
             report,
-            output,
         })
     }
 
@@ -257,22 +203,17 @@ impl<'a> ExitFrame<'a> {
     pub const fn report(&self) -> ExitReport {
         self.report
     }
-    pub const fn output(&self) -> Option<&CapturedOutput<'a>> {
-        self.output.as_ref()
-    }
 
-    pub fn encode_parts(
+    pub(crate) fn encode_parts_with_version(
         &self,
+        version: crate::ProtocolVersion,
         payload: &mut [u8],
     ) -> Result<(ControlFrameHeader, usize), SessionFrameError> {
-        let output = self.output.map(|output| EncodedStreams {
-            stdout: encode_stream(*output.stdout()),
-            stderr: encode_stream(*output.stderr()),
-        });
         encode_frame(
+            version,
             MessageKind::Exit,
             self.request_id,
-            &EncodedExit {
+            &WireExit {
                 broker_id: self.broker_id,
                 preparation_id: self.preparation_id,
                 execution: self.report.execution,
@@ -280,17 +221,16 @@ impl<'a> ExitFrame<'a> {
                 cleanup: self.report.cleanup,
                 reason: self.report.reason,
                 failure: self.report.failure,
-                output,
             },
             payload,
         )
     }
 
-    pub fn decode_for(
+    pub(crate) fn decode_for(
         request: &PrepareRequestFrame<'_>,
         preparation_id: PreparationId,
         header: ControlFrameHeader,
-        payload: &'a [u8],
+        payload: &[u8],
         received_descriptors: usize,
     ) -> Result<Self, SessionFrameError> {
         check_reply(
@@ -300,39 +240,23 @@ impl<'a> ExitFrame<'a> {
             payload,
             received_descriptors,
         )?;
-        let wire: WireExit<'a> =
-            decode_json_payload_escaped(payload, &mut []).map_err(codec_error)?;
-        validate_token(request, preparation_id, wire.broker_id, wire.preparation_id)
-            .map_err(SessionFrameError::Payload)?;
+        let wire: WireExit = decode_json_payload(payload).map_err(codec_error)?;
+        if !matches!(wire.execution, ExecutionStatus::Failed { .. }) {
+            crate::json::require_top_level_strings(payload, &["execution"]).map_err(codec_error)?;
+        }
+        if !matches!(wire.cleanup, CleanupStatus::Pending { .. }) {
+            crate::json::require_top_level_strings(payload, &["cleanup"]).map_err(codec_error)?;
+        }
+        validate_token(
+            request.broker_id(),
+            preparation_id,
+            wire.broker_id,
+            wire.preparation_id,
+        )
+        .map_err(SessionFrameError::Payload)?;
         let report = ExitReport::new(wire.execution, wire.exit, wire.cleanup, wire.reason)
             .and_then(|report| report.with_failure(wire.failure))
             .map_err(SessionFrameError::Payload)?;
-        let output = wire
-            .output
-            .map(|output| {
-                CapturedOutput::new(
-                    OutputStream::decoded(
-                        output.stdout.base64,
-                        output.stdout.truncated,
-                        output.stdout.complete,
-                    )?,
-                    OutputStream::decoded(
-                        output.stderr.base64,
-                        output.stderr.truncated,
-                        output.stderr.complete,
-                    )?,
-                )
-            })
-            .transpose()
-            .map_err(codec_error)?;
-        Self::new(request, preparation_id, report, output).map_err(SessionFrameError::Payload)
-    }
-}
-
-fn encode_stream(stream: OutputStream<'_>) -> EncodedStream<'_> {
-    EncodedStream {
-        base64: EncodedOutput(stream),
-        truncated: stream.truncated(),
-        complete: stream.complete(),
+        Self::new(request, preparation_id, report).map_err(SessionFrameError::Payload)
     }
 }

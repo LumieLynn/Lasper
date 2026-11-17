@@ -8,17 +8,24 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
-pub fn exchange(control: &mut UnixStream) {
+pub fn exchange_with_limits(control: &mut UnixStream, limits: ControlLimits) {
     control
         .set_read_timeout(Some(Duration::from_secs(3)))
         .unwrap();
     control
         .set_write_timeout(Some(Duration::from_secs(3)))
         .unwrap();
-    let request = HelloRequest::new(FeatureSet::WORKER_PIDFD, ControlLimits::CURRENT).unwrap();
+    let request = HelloRequest::new(FeatureSet::WORKER_PIDFD, limits).unwrap();
     let mut payload = [0; HELLO_PAYLOAD_BUFFER_BYTES];
     let length = request.encode_payload(&mut payload).unwrap();
-    let header = ControlFrameHeader::new(MessageKind::HelloRequest, 1, length as u32, 0).unwrap();
+    let header = ControlFrameHeader::new_with_version(
+        lasper_guest_protocol::ProtocolVersion { major: 1, minor: 0 },
+        MessageKind::HelloRequest,
+        1,
+        length as u32,
+        0,
+    )
+    .unwrap();
     control.write_all(&header.encode()).unwrap();
     control.write_all(&payload[..length]).unwrap();
     let mut header = [0; CONTROL_FRAME_HEADER_BYTES];
@@ -32,7 +39,7 @@ pub fn exchange(control: &mut UnixStream) {
     let response =
         HelloResponse::decode_payload(&payload[..header.payload_bytes() as usize]).unwrap();
     request
-        .negotiate(header.protocol_version(), response)
+        .negotiate_protocol(header.protocol_version(), response)
         .unwrap();
     assert_eq!(response.broker_id(), BrokerId::new([1; 16]));
 }

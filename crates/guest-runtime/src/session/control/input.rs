@@ -2,7 +2,7 @@ use core::task::Poll;
 use lasper_guest_protocol::ControlFrameHeader;
 
 use super::super::error::SystemResultExt;
-use super::super::ready::IO_TIMEOUT_MS;
+use super::super::reply::IO_TIMEOUT_MS;
 use super::super::GuardianError;
 use crate::memory::Mapping;
 use crate::transport::{

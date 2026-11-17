@@ -1,6 +1,7 @@
 use super::fixture::{request, Server, BROKER};
 use crate::control::{receive_guest_frame, send_guest_frame};
-use lasper_guest_host_transport::{BrokerSession, BrokerSessionError};
+use lasper_guest_host_transport::raw::BrokerSession;
+use lasper_guest_host_transport::BrokerSessionError;
 use lasper_guest_protocol::{ErrorFrame, GuestErrorCode, GuestFailureStage, GuestOperation};
 use lasper_guest_runtime::transport::TransportError;
 use std::time::Duration;
@@ -65,7 +66,9 @@ async fn prepare_rejection_retains_the_guest_error_code() {
         )
         .unwrap();
         let mut bytes = [0; 4096];
-        let (header, length) = error.encode_parts(&mut bytes).unwrap();
+        let (header, length) = super::fixture::protocol()
+            .encode_error(&error, &mut bytes)
+            .unwrap();
         send_guest_frame(&guest, header, &bytes[..length], &[]).unwrap();
     });
     let result = BrokerSession::prepare(
@@ -95,7 +98,9 @@ async fn prepare_rejection_retains_the_worker_stage_and_errno() {
         .with_stage(Some(GuestFailureStage::HomeDirectory))
         .unwrap();
         let mut bytes = [0; 4096];
-        let (header, length) = error.encode_parts(&mut bytes).unwrap();
+        let (header, length) = super::fixture::protocol()
+            .encode_error(&error, &mut bytes)
+            .unwrap();
         send_guest_frame(&guest, header, &bytes[..length], &[]).unwrap();
     });
     let error = BrokerSession::prepare(

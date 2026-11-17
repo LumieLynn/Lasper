@@ -3,6 +3,7 @@
 use core::ffi::CStr;
 
 /// Stores the broker socket and lock outside `/run`, which init may mount over.
+/// A private tmpfs here provides writable runtime storage for ReadOnly guests.
 /// The directory must be owned by guest root and have mode 0700.
 pub const RUNTIME_DIRECTORY: &CStr = c"/var/opt/lasper";
 
@@ -24,5 +25,6 @@ pub(crate) const NULL_DEVICE: &CStr = c"/dev/null";
 pub(crate) const PTY_MULTIPLEXER: &CStr = c"/dev/ptmx";
 pub(crate) const PASSWD: &CStr = c"/etc/passwd";
 pub(crate) const GROUP: &CStr = c"/etc/group";
-/// Command lookup uses guest directories independently of the host's PATH.
+/// A fixed guest PATH keeps shell lookup independent of the broker's launch
+/// environment.
 pub(crate) const EXEC_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";

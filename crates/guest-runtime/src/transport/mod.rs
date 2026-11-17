@@ -5,8 +5,8 @@ mod send;
 
 use core::cell::Cell;
 use lasper_guest_protocol::{
-    ControlFrameError, ControlFrameHeader, ControlFrameHeaderError, ControlSessionError,
-    ControlSessionState, EnforcedControlLimits,
+    ControlConnectionState, ControlFrameError, ControlFrameHeader, ControlFrameHeaderError,
+    ControlSessionError,
 };
 
 use crate::linux::uapi::errno::{EAGAIN, EINTR};
@@ -37,14 +37,14 @@ pub enum TransportError {
 /// A guest control connection driven by the guardian's event loop.
 ///
 /// Each operation retains its byte offset and FDs across Pending. Dropping an
-/// operation after any bytes crossed the socket closes the connection, since
+/// operation after any bytes crossed the socket shuts down the connection, since
 /// the next operation cannot safely start at that partial frame's tail.
 /// One reader and one writer may coexist on the single guardian thread; a
 /// pending operation borrows only this connection, never the worker lifecycle.
 pub struct GuestControlStream {
     fd: i32,
     poisoned: Cell<bool>,
-    session: Cell<ControlSessionState>,
+    session: Cell<ControlConnectionState>,
     receiving: Cell<bool>,
     sending: Cell<bool>,
 }
@@ -60,7 +60,7 @@ impl GuestControlStream {
         Self {
             fd,
             poisoned: Cell::new(false),
-            session: Cell::new(ControlSessionState::guest()),
+            session: Cell::new(ControlConnectionState::guest()),
             receiving: Cell::new(false),
             sending: Cell::new(false),
         }
@@ -70,20 +70,22 @@ impl GuestControlStream {
         self.fd
     }
 
-    /// Install the negotiate result from the Hello pair exchanged on this
-    /// connection. The transport checks the phase, not the origin of limits.
-    pub fn complete_hello(&mut self, limits: EnforcedControlLimits) -> Result<(), TransportError> {
+    /// Installs the negotiated profile, enabled features and limits after Hello.
+    pub fn complete_protocol(
+        &mut self,
+        negotiated: lasper_guest_protocol::NegotiatedProtocol,
+    ) -> Result<(), TransportError> {
         self.ensure_usable()?;
         let mut session = self.session.get();
         session
-            .complete_hello(limits)
+            .complete_protocol(negotiated)
             .map_err(TransportError::Session)?;
         self.session.set(session);
         Ok(())
     }
 
-    /// False after a failed or abandoned partial operation. Pending operations
-    /// can continue only through their existing receiver/sender, never a new one.
+    /// Reports whether the local stream has been poisoned. Peer EOF is detected
+    /// by receive progress. A pending operation retains its slot until dropped.
     pub fn can_continue(&self) -> bool {
         !self.poisoned.get()
     }

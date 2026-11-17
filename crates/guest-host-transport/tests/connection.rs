@@ -1,8 +1,7 @@
-use lasper_guest_host_transport::{
-    BrokerConnectError, BrokerConnection, MachineTarget, WorkerReadinessError,
-};
+use lasper_guest_host_transport::raw::BrokerConnection;
+use lasper_guest_host_transport::{BrokerConnectError, MachineTarget};
 use lasper_guest_protocol::{
-    BrokerId, ControlFrameHeader, ControlLimits, FeatureSet, HelloNegotiationError, HelloRequest,
+    BrokerId, CompatibilityError, ControlFrameHeader, ControlLimits, FeatureSet, HelloRequest,
     HelloResponse, MessageKind, CONTROL_FRAME_HEADER_BYTES, HELLO_PAYLOAD_BUFFER_BYTES,
 };
 use std::future::Future;
@@ -20,6 +19,9 @@ mod ancillary;
 mod listener_fixture;
 #[path = "support/target.rs"]
 mod target;
+
+#[path = "support/invalid_hello.rs"]
+mod invalid_hello;
 
 const BROKER: BrokerId = BrokerId::new([0x45; 16]);
 
@@ -67,11 +69,30 @@ fn hello_response(request_id: u64) -> Vec<u8> {
 }
 
 fn hello_response_with_features(request_id: u64, features: FeatureSet) -> Vec<u8> {
-    let response = HelloResponse::new(features, BROKER, ControlLimits::CURRENT).unwrap();
+    let response = if features.contains(FeatureSet::WORKER_PIDFD) {
+        HelloResponse::accept(
+            HelloRequest::new(FeatureSet::WORKER_PIDFD, ControlLimits::CURRENT).unwrap(),
+            lasper_guest_protocol::HelloOffer {
+                supported_features: features,
+                ..lasper_guest_protocol::HelloOffer::local(ControlLimits::CURRENT)
+            },
+            BROKER,
+        )
+        .unwrap()
+        .0
+    } else {
+        invalid_hello::response(features, BROKER, ControlLimits::CURRENT)
+    };
     let mut bytes = [0; HELLO_PAYLOAD_BUFFER_BYTES];
     let length = response.encode_payload(&mut bytes).unwrap();
-    let header =
-        ControlFrameHeader::new(MessageKind::HelloResponse, request_id, length as u32, 0).unwrap();
+    let header = ControlFrameHeader::new_with_version(
+        lasper_guest_protocol::ProtocolVersion { major: 1, minor: 0 },
+        MessageKind::HelloResponse,
+        request_id,
+        length as u32,
+        0,
+    )
+    .unwrap();
     let mut frame = header.encode().to_vec();
     frame.extend_from_slice(&bytes[..length]);
     frame
@@ -293,8 +314,8 @@ async fn missing_worker_capability_remains_a_readiness_failure() {
     .await;
     assert!(matches!(
         result,
-        Err(BrokerConnectError::Readiness(
-            WorkerReadinessError::Negotiation(HelloNegotiationError::UnsupportedFeatures { .. })
+        Err(BrokerConnectError::Incompatible(
+            CompatibilityError::MissingFeatures { .. }
         ))
     ));
     server.join().unwrap();
@@ -306,9 +327,14 @@ async fn malformed_hello_drops_the_control_connection() {
     let server = std::thread::spawn(move || {
         let (mut stream, _) = listener.accept().unwrap();
         let request = receive_hello(&mut stream);
-        let header =
-            ControlFrameHeader::new(MessageKind::HelloResponse, request.request_id(), 1, 0)
-                .unwrap();
+        let header = ControlFrameHeader::new_with_version(
+            lasper_guest_protocol::ProtocolVersion { major: 1, minor: 0 },
+            MessageKind::HelloResponse,
+            request.request_id(),
+            1,
+            0,
+        )
+        .unwrap();
         stream.write_all(&header.encode()).unwrap();
         stream.write_all(b"{").unwrap();
         let mut byte = [0];
@@ -575,7 +601,8 @@ async fn incompatible_or_oversized_hello_is_rejected_before_reading_its_payload(
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let request = receive_hello(&mut stream);
-            let mut header = ControlFrameHeader::new(
+            let mut header = ControlFrameHeader::new_with_version(
+                lasper_guest_protocol::ProtocolVersion { major: 1, minor: 0 },
                 MessageKind::HelloResponse,
                 request.request_id(),
                 if oversized {
@@ -589,7 +616,8 @@ async fn incompatible_or_oversized_hello_is_rejected_before_reading_its_payload(
             .encode();
             if !oversized {
                 header[14..16].copy_from_slice(
-                    &(lasper_guest_protocol::ProtocolVersion::CURRENT.minor + 1).to_le_bytes(),
+                    &((lasper_guest_protocol::ProtocolVersion { major: 1, minor: 0 }).minor + 1)
+                        .to_le_bytes(),
                 );
             }
             stream.write_all(&header).unwrap();

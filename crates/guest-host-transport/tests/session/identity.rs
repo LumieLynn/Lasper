@@ -4,11 +4,10 @@ use super::fixture::{
 use crate::control::{receive_guest_frame, send_guest_frame};
 use crate::session_clock::{drive_io, snapshot};
 use crate::worker::TestWorker;
-use lasper_guest_host_transport::{
-    BrokerSession, BrokerSessionError, SessionPhase, SessionStartOptions, StartOutcome,
-};
+use lasper_guest_host_transport::raw::BrokerSession;
+use lasper_guest_host_transport::{BrokerSessionError, SessionPhase, StartOptions, StartOutcome};
 use lasper_guest_protocol::{
-    ExitReason, PreparationControl, PreparationControlKind, StartAcceptedFrame, StartFrame,
+    ExitReason, PreparationControl, PreparationControlKind, StartAcceptedFrame,
 };
 use std::time::Duration;
 use tokio::time::{timeout, Instant};
@@ -79,22 +78,25 @@ async fn start_while_keep_is_pending(cancel: bool) {
         } else {
             let mut bytes = [0; 4096];
             let frame = receive_guest_frame(&guest, &mut bytes).unwrap();
-            let start = StartFrame::decode_for(
-                frame.header().request_id(),
-                &request,
-                PREPARATION,
-                frame.header(),
-                frame.payload(),
-                frame.descriptors().len(),
-            )
-            .unwrap();
+            let start = super::fixture::protocol()
+                .decode_start_frame(
+                    frame.header().request_id(),
+                    &request,
+                    PREPARATION,
+                    frame.header(),
+                    frame.payload(),
+                    frame.descriptors().len(),
+                )
+                .unwrap();
             assert!(start.request_id() > keep.request_id());
             let accepted = StartAcceptedFrame::new(
                 start.request_id(),
                 PreparationControl::new(BROKER, PREPARATION),
             );
             drop(frame);
-            let (header, length) = accepted.encode_parts(&mut bytes).unwrap();
+            let (header, length) = super::fixture::protocol()
+                .encode_start_accepted(&accepted, &mut bytes)
+                .unwrap();
             send_guest_frame(&guest, header, &bytes[..length], &[]).unwrap();
         }
         let close = command(&guest, &request);
@@ -104,7 +106,7 @@ async fn start_while_keep_is_pending(cancel: bool) {
     });
     let mut session = server.prepare().await;
     tokio::time::pause();
-    let mut start = Box::pin(session.start(SessionStartOptions::default()));
+    let mut start = Box::pin(session.start(StartOptions::default()));
     drive_io(async {
         tokio::select! {
             result = &mut start => panic!("identity reply is still gated: {result:?}"),
@@ -123,10 +125,10 @@ async fn start_while_keep_is_pending(cancel: bool) {
         acknowledge.send(()).unwrap();
         assert!(matches!(
             drive_io(&mut start).await.unwrap(),
-            StartOutcome::Accepted { terminal: None }
+            StartOutcome::Accepted
         ));
         drop(start);
-        assert_eq!(session.snapshot().phase(), SessionPhase::StartAccepted);
+        assert_eq!(session.snapshot().phase(), SessionPhase::Accepted);
     }
     assert!(session.snapshot().error().is_none());
     drive_io(session.close()).await.unwrap();
@@ -172,12 +174,12 @@ async fn identity_timeout_keeps_cleanup_within_its_own_budget() {
     tokio::time::advance(Duration::from_millis(14_999)).await;
     assert_eq!(session.snapshot().phase(), SessionPhase::Closing);
     tokio::time::advance(Duration::from_millis(2)).await;
-    let final_state = snapshot(&mut state, |state| state.phase() == SessionPhase::Failed).await;
+    let final_state = snapshot(&mut state, |state| state.phase() == SessionPhase::Finished).await;
     assert!(matches!(
         final_state.error(),
         Some(BrokerSessionError::Deadline)
     ));
-    assert!(final_state.exit().is_none());
+    assert!(final_state.report.is_none());
     drive_io(server.finish()).await;
 }
 
@@ -244,10 +246,10 @@ async fn worker_exit_during_identity(later: bool, disconnect: bool) {
     let snapshot = timeout(Duration::from_secs(3), async {
         loop {
             let snapshot = session.snapshot();
-            if snapshot.phase() == SessionPhase::Closed {
+            if snapshot.phase() == SessionPhase::Finished {
                 break snapshot;
             }
-            assert_ne!(snapshot.phase(), SessionPhase::Failed, "{snapshot:?}");
+            assert_ne!(snapshot.phase(), SessionPhase::Finished, "{snapshot:?}");
             session.changed().await.unwrap();
         }
     })
@@ -255,7 +257,7 @@ async fn worker_exit_during_identity(later: bool, disconnect: bool) {
     .unwrap();
     assert!(matches!(snapshot.error(), Some(BrokerSessionError::Io(_))));
     assert_eq!(
-        snapshot.exit().unwrap().report().reason(),
+        snapshot.report.unwrap().reason(),
         ExitReason::WorkerExitedBeforeStart
     );
     server.finish().await;
@@ -283,7 +285,7 @@ async fn initial_identity_observation_receives_cleanup_before_its_deadline() {
     .expect("initial identity hid the guardian's cleanup report");
     assert!(matches!(
         result,
-        Err(BrokerSessionError::InvalidState(SessionPhase::Closed))
+        Err(BrokerSessionError::InvalidState(SessionPhase::Finished))
     ));
     server.finish().await;
 }
@@ -321,7 +323,7 @@ async fn initial_identity_observation_keeps_the_lease_alive() {
     })
     .await;
     tokio::time::advance(Duration::from_millis(501)).await;
-    let mut session = drive_io(prepare).await.unwrap();
+    let session = drive_io(prepare).await.unwrap();
     assert_eq!(session.snapshot().phase(), SessionPhase::Prepared);
     drive_io(session.close()).await.unwrap();
     drive_io(server.finish()).await;
@@ -358,7 +360,7 @@ async fn cancelling_prepare_during_identity_requests_close() {
 }
 
 #[tokio::test]
-async fn dropping_during_identity_requests_close_without_waiting_for_the_reply() {
+async fn dropping_during_identity_requests_cancel_without_waiting_for_the_reply() {
     let (checking, checked) = tokio::sync::oneshot::channel();
     let server = Server::spawn(|guest, request| {
         let mut worker = TestWorker::pausing_on_recheck(request.request().clone(), PREPARATION);
@@ -369,7 +371,7 @@ async fn dropping_during_identity_requests_close_without_waiting_for_the_reply()
         checking.send(()).unwrap();
         assert_eq!(
             command(&guest, &request).kind(),
-            PreparationControlKind::Close
+            PreparationControlKind::Cancel
         );
         final_exit(&guest, &request, ExitReason::ClientClosed);
     });
@@ -386,7 +388,7 @@ async fn dropping_during_identity_requests_close_without_waiting_for_the_reply()
     let mut state = session.subscribe();
     drop(session);
     let snapshot =
-        crate::session_clock::snapshot(&mut state, |state| state.phase() == SessionPhase::Closed)
+        crate::session_clock::snapshot(&mut state, |state| state.phase() == SessionPhase::Finished)
             .await;
     assert!(snapshot.error().is_none());
     server.finish().await;

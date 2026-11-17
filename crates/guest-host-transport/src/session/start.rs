@@ -1,21 +1,20 @@
-use super::{BrokerSessionError, SessionExit};
+use super::BrokerSessionError;
 use lasper_guest_protocol::ErrorFrame;
 use std::fmt;
-use std::os::fd::OwnedFd;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
 /// The observed result of one Start attempt. Acceptance does not confirm exec;
 /// an unknown result must not be retried as a new command.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 #[must_use]
 pub enum StartOutcome {
-    /// The guardian accepted Start. A PTY session also returns its master.
-    Accepted { terminal: Option<OwnedFd> },
+    /// The guardian accepted Start; data descriptors were delivered by Prepare.
+    Accepted,
     /// Exit arrived before the acknowledgement. Cleanup may still be in progress.
-    Reported(Arc<SessionExit>),
+    Reported(lasper_guest_protocol::ExitReport),
     /// Start may have reached the guest. The cause cannot establish non-execution.
-    Unknown { cause: BrokerSessionError },
+    Unknown { cause: Arc<BrokerSessionError> },
 }
 
 pub(super) async fn receive(
@@ -25,10 +24,11 @@ pub(super) async fn receive(
     // The command is already queued. Losing its reply cannot prove non-execution.
     let outcome = received.await.unwrap_or_else(|_| {
         Ok(StartOutcome::Unknown {
-            cause: BrokerSessionError::DriverStopped,
+            cause: Arc::new(BrokerSessionError::DriverStopped),
         })
     })?;
-    // Do not yield between confirming delivery and returning the owned PTY.
+    // Confirm delivery without yielding, so cancellation cannot abandon an
+    // acceptance after the caller has already received it.
     let _ = delivered.send(());
     Ok(outcome)
 }
@@ -60,19 +60,5 @@ impl std::error::Error for StartError {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn losing_the_driver_reply_does_not_claim_start_was_not_submitted() {
-        let (reply, received) = oneshot::channel();
-        let (delivered, _delivery) = oneshot::channel();
-        drop(reply);
-        assert!(matches!(
-            receive(received, delivered).await.unwrap(),
-            StartOutcome::Unknown {
-                cause: BrokerSessionError::DriverStopped
-            }
-        ));
-    }
-}
+#[path = "../../tests/session/start_reply.rs"]
+mod tests;

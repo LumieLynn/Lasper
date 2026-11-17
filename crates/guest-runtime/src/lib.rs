@@ -1,6 +1,13 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+//! Guest-side process supervision without libc or a heap allocator.
+//!
+//! The wrapper preserves the init or payload process across exec. Its broker
+//! forks a guardian for each connection, and that guardian owns worker execution
+//! and descendant cleanup. Large buffers use anonymous mappings so the same
+//! execution path can run on the static ELF's explicitly budgeted stack.
+
 #[cfg(not(target_os = "linux"))]
 compile_error!("the Lasper guest runtime is Linux-only");
 
@@ -15,6 +22,7 @@ mod linux;
 pub use linux::signals::SupervisorSignal;
 mod memory;
 pub mod paths;
+pub mod policy;
 pub mod readiness;
 pub mod session;
 mod socket;
@@ -38,16 +46,5 @@ pub fn identity_frame() -> [u8; lasper_guest_protocol::IDENTITY_FRAME_BYTES] {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn advertised_identity_is_the_shared_protocol_identity() {
-        let frame = identity_frame();
-
-        assert_eq!(
-            lasper_guest_protocol::RuntimeIdentity::decode(&frame),
-            Ok(RUNTIME_IDENTITY)
-        );
-    }
-}
+#[path = "../tests/entry/identity.rs"]
+mod tests;

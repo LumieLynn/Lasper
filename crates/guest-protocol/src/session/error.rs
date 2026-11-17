@@ -4,7 +4,7 @@ use super::frame::{
     check_reply, codec_error, encode_frame, SessionFrameError, SessionPayloadError,
 };
 use super::GuestFailureStage;
-use crate::messages::decode_json_payload;
+use crate::json::decode_json_payload;
 use crate::{BrokerId, ControlFrameHeader, MessageKind, PreparationId, PrepareRequestFrame};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -42,7 +42,9 @@ pub struct ErrorFrame {
 struct WireError {
     broker_id: BrokerId,
     preparation_id: Option<PreparationId>,
+    #[serde(deserialize_with = "crate::json::deserialize_string_enum")]
     operation: GuestOperation,
+    #[serde(deserialize_with = "crate::json::deserialize_string_enum")]
     code: GuestErrorCode,
     errno: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -111,16 +113,23 @@ impl ErrorFrame {
         self.wire.preparation_id
     }
 
-    pub fn encode_parts(
+    pub(crate) fn encode_parts_with_version(
         &self,
+        version: crate::ProtocolVersion,
         payload: &mut [u8],
     ) -> Result<(ControlFrameHeader, usize), SessionFrameError> {
-        encode_frame(MessageKind::Error, self.request_id, &self.wire, payload)
+        encode_frame(
+            version,
+            MessageKind::Error,
+            self.request_id,
+            &self.wire,
+            payload,
+        )
     }
 
     /// Decode against the request envelope that was sent, not a token supplied
     /// by the error itself. Prepare errors may predate assignment of a worker.
-    pub fn decode_for(
+    pub(crate) fn decode_for(
         request_header: ControlFrameHeader,
         request: &PrepareRequestFrame<'_>,
         preparation_id: Option<PreparationId>,
@@ -139,6 +148,9 @@ impl ErrorFrame {
             SessionFrameError::Payload(SessionPayloadError::InvalidResponse),
         )?;
         let wire: WireError = decode_json_payload(payload).map_err(codec_error)?;
+        if wire.stage.is_some() {
+            crate::json::require_top_level_strings(payload, &["stage"]).map_err(codec_error)?;
+        }
         if wire.broker_id != request.broker_id() {
             return Err(SessionFrameError::Payload(
                 SessionPayloadError::BrokerMismatch,

@@ -1,6 +1,7 @@
 #[allow(dead_code)]
 #[path = "../support/accounts.rs"]
 mod accounts;
+mod bindings;
 mod client;
 mod faults;
 mod fixture;
@@ -80,7 +81,7 @@ fn main() {
         .find(|args| args[0] == "--binary")
         .map(|args| args[1].as_str());
     let mut passed = 0;
-    for &(name, scenario) in scenarios::SCENARIOS {
+    for &(name, scenario) in scenarios::SCENARIOS.iter().chain(bindings::SCENARIOS) {
         println!("guest broker: {name}");
         scenario(privileged);
         passed += 1;

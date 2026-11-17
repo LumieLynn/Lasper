@@ -1,11 +1,11 @@
 mod support;
 
-use lasper_guest_host_transport::{
+use lasper_guest_host_transport::raw::{
     HandshakeError, UnixControlStream, WorkerHello, WorkerReadinessError,
 };
 use lasper_guest_protocol::{
-    BrokerId, ControlFrameHeader, ControlLimits, EnforcedControlLimits, FeatureSet,
-    HelloNegotiationError, HelloRequest, HelloResponse, MessageKind, ProtocolVersion,
+    BrokerId, CompatibilityError, ControlFrameHeader, ControlLimits, EnforcedControlLimits,
+    FeatureSet, HelloRequest, HelloResponse, MessageKind, ProtocolVersion,
     CONTROL_FRAME_HEADER_BYTES,
 };
 use lasper_guest_runtime::transport::GuestControlStream;
@@ -19,32 +19,40 @@ use support::control::{receive_guest_frame, send_guest_frame};
 use support::handshake::{establish_guest, establish_host, raw_stream_pair};
 use tokio::net::UnixStream;
 
+#[path = "support/invalid_hello.rs"]
+mod invalid_hello;
+use support::handshake::response_for;
+
 #[path = "support/ancillary.rs"]
 mod ancillary;
 use ancillary::send_with_rights;
 
 fn header(kind: MessageKind, payload: &[u8], descriptor_count: u16) -> ControlFrameHeader {
-    ControlFrameHeader::new(kind, 17, payload.len() as u32, descriptor_count).unwrap()
+    ControlFrameHeader::new_with_version(
+        lasper_guest_protocol::ProtocolVersion { major: 1, minor: 0 },
+        kind,
+        17,
+        payload.len() as u32,
+        descriptor_count,
+    )
+    .unwrap()
 }
 
 fn current_limits() -> EnforcedControlLimits {
-    HelloRequest::new(FeatureSet::EMPTY, ControlLimits::CURRENT)
-        .unwrap()
-        .negotiate(
-            lasper_guest_protocol::ProtocolVersion::CURRENT,
-            HelloResponse::new(
-                FeatureSet::EMPTY,
-                BrokerId::new([0x5a; 16]),
-                ControlLimits::CURRENT,
-            )
-            .unwrap(),
-        )
-        .unwrap()
+    HelloResponse::accept(
+        HelloRequest::new(FeatureSet::EMPTY, ControlLimits::CURRENT).unwrap(),
+        lasper_guest_protocol::HelloOffer::local(ControlLimits::CURRENT),
+        BrokerId::new([0x5a; 16]),
+    )
+    .unwrap()
+    .1
+    .limits()
 }
 
 fn write_hello_response(peer: &mut StdUnixStream) {
-    let response = HelloResponse::new(
-        FeatureSet::EMPTY,
+    let response = response_for(
+        HelloRequest::new(FeatureSet::EMPTY, ControlLimits::CURRENT).unwrap(),
+        FeatureSet::WORKER_PIDFD.union(FeatureSet::EXECUTION_TIMEOUT),
         BrokerId::new([0x5a; 16]),
         ControlLimits::CURRENT,
     )
@@ -55,21 +63,28 @@ fn write_hello_response(peer: &mut StdUnixStream) {
 fn write_hello_frame(peer: &mut StdUnixStream, response: HelloResponse) {
     let mut payload = [0; lasper_guest_protocol::HELLO_PAYLOAD_BUFFER_BYTES];
     let length = response.encode_payload(&mut payload).unwrap();
-    let header = ControlFrameHeader::new(MessageKind::HelloResponse, 17, length as u32, 0).unwrap();
+    let header = ControlFrameHeader::new_with_version(
+        lasper_guest_protocol::ProtocolVersion { major: 1, minor: 0 },
+        MessageKind::HelloResponse,
+        17,
+        length as u32,
+        0,
+    )
+    .unwrap();
     peer.write_all(&header.encode()).unwrap();
     peer.write_all(&payload[..length]).unwrap();
 }
 
 #[tokio::test]
 async fn handshake_enforces_both_offers_from_its_own_exchange() {
-    for (local, remote) in [(512, 1024), (1024, 512)] {
+    for (local, remote) in [(4096, 8192), (8192, 4096)] {
         let (mut host, mut peer) = raw_stream_pair();
         let request =
             HelloRequest::new(FeatureSet::EMPTY, ControlLimits::new(local, 0).unwrap()).unwrap();
-        let response = HelloResponse::new(
-            FeatureSet::EMPTY,
+        let (response, _) = HelloResponse::accept(
+            request,
+            lasper_guest_protocol::HelloOffer::local(ControlLimits::new(remote, 0).unwrap()),
             BrokerId::new([0x5a; 16]),
-            ControlLimits::new(remote, 0).unwrap(),
         )
         .unwrap();
         let mut bytes = [0; lasper_guest_protocol::HELLO_PAYLOAD_BUFFER_BYTES];
@@ -114,10 +129,15 @@ async fn worker_readiness_uses_the_limits_installed_on_the_stream() {
     for (local_bytes, peer_bytes, local_fds, peer_fds) in [(4096, 8192, 3, 2), (8192, 4096, 2, 3)] {
         let (mut host, mut peer) = raw_stream_pair();
         let hello = WorkerHello::new(ControlLimits::new(local_bytes, local_fds).unwrap()).unwrap();
-        let response = HelloResponse::new(
-            FeatureSet::WORKER_PIDFD,
+        let (response, _) = HelloResponse::accept(
+            hello.request(),
+            lasper_guest_protocol::HelloOffer {
+                supported_features: FeatureSet::WORKER_PIDFD,
+                ..lasper_guest_protocol::HelloOffer::local(
+                    ControlLimits::new(peer_bytes, peer_fds).unwrap(),
+                )
+            },
             BrokerId::new([0x5a; 16]),
-            ControlLimits::new(peer_bytes, peer_fds).unwrap(),
         )
         .unwrap();
         let mut bytes = [0; lasper_guest_protocol::HELLO_PAYLOAD_BUFFER_BYTES];
@@ -166,13 +186,15 @@ async fn equal_requests_on_two_streams_keep_their_limits_and_brokers_separate() 
     let first_hello = WorkerHello::new(ControlLimits::CURRENT).unwrap();
     let second_hello = WorkerHello::new(ControlLimits::CURRENT).unwrap();
     assert_eq!(first_hello.request(), second_hello.request());
-    let first_response = HelloResponse::new(
+    let first_response = response_for(
+        first_hello.request(),
         FeatureSet::WORKER_PIDFD,
         BrokerId::new([1; 16]),
         ControlLimits::new(4096, 2).unwrap(),
     )
     .unwrap();
-    let second_response = HelloResponse::new(
+    let second_response = response_for(
+        second_hello.request(),
         FeatureSet::WORKER_PIDFD,
         BrokerId::new([2; 16]),
         ControlLimits::new(8192, 3).unwrap(),
@@ -202,7 +224,8 @@ async fn equal_requests_on_two_streams_keep_their_limits_and_brokers_separate() 
 async fn moving_a_stream_retains_hello_but_rewrapping_its_socket_does_not() {
     let (mut host, mut peer) = raw_stream_pair();
     let hello = WorkerHello::new(ControlLimits::CURRENT).unwrap();
-    let response = HelloResponse::new(
+    let response = response_for(
+        hello.request(),
         FeatureSet::WORKER_PIDFD,
         BrokerId::new([1; 16]),
         ControlLimits::CURRENT,
@@ -228,7 +251,8 @@ async fn moving_a_stream_retains_hello_but_rewrapping_its_socket_does_not() {
 async fn an_invalidated_stream_cannot_complete_worker_readiness() {
     let (mut host, mut peer) = raw_stream_pair();
     let hello = WorkerHello::new(ControlLimits::CURRENT).unwrap();
-    let response = HelloResponse::new(
+    let response = response_for(
+        hello.request(),
         FeatureSet::WORKER_PIDFD,
         BrokerId::new([1; 16]),
         ControlLimits::CURRENT,
@@ -255,7 +279,14 @@ async fn invalid_hello_payload_or_features_cannot_establish_a_stream() {
                 .unwrap();
             peer.write_all(b"{}").unwrap();
         } else {
-            write_hello_response(&mut peer);
+            write_hello_frame(
+                &mut peer,
+                invalid_hello::response(
+                    FeatureSet::EMPTY,
+                    BrokerId::new([0x5a; 16]),
+                    ControlLimits::CURRENT,
+                ),
+            );
         }
         let error = host.handshake(17, request).await.unwrap_err();
         if invalid_payload {
@@ -265,7 +296,7 @@ async fn invalid_hello_payload_or_features_cannot_establish_a_stream() {
         } else {
             assert!(matches!(
                 error,
-                HandshakeError::Negotiation(HelloNegotiationError::UnsupportedFeatures { .. })
+                HandshakeError::Negotiation(CompatibilityError::MissingFeatures { .. })
             ));
         }
         assert!(!host.can_continue());
@@ -295,7 +326,8 @@ fn establish_guest_with_peer(peer: &mut StdUnixStream, guest: &mut GuestControlS
     assert_eq!(received.header().kind(), MessageKind::HelloRequest);
     send_guest_frame(
         guest,
-        ControlFrameHeader::new(
+        ControlFrameHeader::new_with_version(
+            lasper_guest_protocol::ProtocolVersion { major: 1, minor: 0 },
             MessageKind::HelloResponse,
             received.header().request_id(),
             0,
@@ -311,7 +343,20 @@ fn establish_guest_with_peer(peer: &mut StdUnixStream, guest: &mut GuestControlS
     peer.read_exact(&mut response).unwrap();
     let response = ControlFrameHeader::decode(&response).unwrap();
     assert_eq!(response.kind(), MessageKind::HelloResponse);
-    guest.complete_hello(current_limits()).unwrap();
+    let request = HelloRequest::new(FeatureSet::EMPTY, current_limits().get()).unwrap();
+    let protocol = request
+        .negotiate_protocol(
+            lasper_guest_protocol::ProtocolVersion::BOOTSTRAP,
+            response_for(
+                request,
+                FeatureSet::WORKER_PIDFD,
+                BrokerId::new([1; 16]),
+                current_limits().get(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    guest.complete_protocol(protocol).unwrap();
 }
 
 fn set_small_send_buffer(stream: &StdUnixStream) {
@@ -354,7 +399,8 @@ async fn host_rejects_minor_mismatch_before_reading_hello_or_established_payload
             MessageKind::HelloResponse
         };
         let mut bytes = header(kind, b"not sent", 0).encode();
-        bytes[14..16].copy_from_slice(&(ProtocolVersion::CURRENT.minor + 1).to_le_bytes());
+        bytes[14..16]
+            .copy_from_slice(&((ProtocolVersion { major: 1, minor: 0 }).minor + 1).to_le_bytes());
         peer.write_all(&bytes).unwrap();
         let error = tokio::time::timeout(std::time::Duration::from_secs(1), host.receive_frame())
             .await
@@ -419,16 +465,20 @@ async fn host_and_guest_transports_exchange_typed_hello_payloads() {
         assert!(frame.descriptors().is_empty());
         let request = HelloRequest::decode_payload(frame.payload()).unwrap();
 
-        let response = HelloResponse::new(
-            FeatureSet::EMPTY,
+        let response = response_for(
+            request,
+            FeatureSet::WORKER_PIDFD,
             BrokerId::new([0x5a; 16]),
             ControlLimits::CURRENT,
         )
         .unwrap();
-        let mut response_payload = [0; 256];
+        let mut response_payload = [0; lasper_guest_protocol::HELLO_PAYLOAD_BUFFER_BYTES];
         let response_len = response.encode_payload(&mut response_payload).unwrap();
         let negotiated = request
-            .negotiate(lasper_guest_protocol::ProtocolVersion::CURRENT, response)
+            .negotiate_protocol(
+                lasper_guest_protocol::ProtocolVersion { major: 1, minor: 0 },
+                response,
+            )
             .unwrap();
         send_guest_frame(
             &guest,
@@ -437,7 +487,7 @@ async fn host_and_guest_transports_exchange_typed_hello_payloads() {
             &[],
         )
         .unwrap();
-        guest.complete_hello(negotiated).unwrap();
+        guest.complete_protocol(negotiated).unwrap();
 
         let mut next_payload = [0; 32];
         let next = receive_guest_frame(&guest, &mut next_payload).unwrap();
@@ -456,7 +506,10 @@ async fn host_and_guest_transports_exchange_typed_hello_payloads() {
     .await
     .unwrap();
 
-    assert_eq!(guest_task.await.unwrap(), negotiated.limits());
+    let guest_protocol = guest_task.await.unwrap();
+    assert_eq!(guest_protocol.profile(), negotiated.profile());
+    assert_eq!(guest_protocol.features(), negotiated.features());
+    assert_eq!(guest_protocol.limits(), negotiated.limits());
 }
 
 #[tokio::test]
@@ -476,8 +529,14 @@ async fn hello_phase_rejects_oversized_response_before_negotiation_finishes() {
     .unwrap();
 
     let malicious_payload = lasper_guest_protocol::HELLO_PAYLOAD_BUFFER_BYTES + 1;
-    let malicious_header =
-        ControlFrameHeader::new(HelloResponse::KIND, 17, malicious_payload as u32, 0).unwrap();
+    let malicious_header = ControlFrameHeader::new_with_version(
+        lasper_guest_protocol::ProtocolVersion { major: 1, minor: 0 },
+        HelloResponse::KIND,
+        17,
+        malicious_payload as u32,
+        0,
+    )
+    .unwrap();
     guest.write_all(&malicious_header.encode()).unwrap();
 
     let result = tokio::time::timeout(std::time::Duration::from_millis(20), host.receive_frame())
@@ -501,12 +560,11 @@ async fn hello_frames_use_the_fixed_bootstrap_envelope() {
             > declared_limits.max_control_frame_bytes()
     );
 
-    let response = HelloResponse::new(
-        FeatureSet::EMPTY,
+    let response = invalid_hello::response(
+        FeatureSet::WORKER_PIDFD,
         BrokerId::new([0x5a; 16]),
         ControlLimits::CURRENT,
-    )
-    .unwrap();
+    );
     let mut response_payload = [0; lasper_guest_protocol::HELLO_PAYLOAD_BUFFER_BYTES];
     let response_len = response.encode_payload(&mut response_payload).unwrap();
     assert!(
@@ -517,16 +575,15 @@ async fn hello_frames_use_the_fixed_bootstrap_envelope() {
     peer.write_all(&response_header.encode()).unwrap();
     peer.write_all(&response_payload[..response_len]).unwrap();
 
-    let negotiated = host.handshake(17, request).await.unwrap();
-    assert_eq!(negotiated.response(), response);
-    assert_eq!(negotiated.limits().get(), declared_limits);
-
-    let error = host
-        .send_frame(header(MessageKind::PrepareRequest, b"x", 0), b"x", &[])
-        .await
-        .unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
-    assert!(host.can_continue());
+    // Hello itself fits the bootstrap envelope. Profile validation then
+    // rejects the offered application capacity, after decoding the response.
+    assert!(matches!(
+        host.handshake(17, request).await,
+        Err(HandshakeError::Negotiation(
+            CompatibilityError::InsufficientFrameCapacity { .. }
+        ))
+    ));
+    assert!(!host.can_continue());
 }
 
 #[tokio::test]
@@ -861,10 +918,10 @@ fn guest_rejects_excess_rights_without_leaking_received_descriptors() {
             };
             assert_eq!(
                 error,
-                if count == 4 {
+                if count <= 6 {
                     lasper_guest_runtime::transport::TransportError::DescriptorCountMismatch {
                         declared: 2,
-                        actual: 4,
+                        actual: count,
                     }
                 } else {
                     lasper_guest_runtime::transport::TransportError::Truncated

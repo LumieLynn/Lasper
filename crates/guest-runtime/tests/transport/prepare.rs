@@ -1,6 +1,6 @@
 use lasper_guest_protocol::{
     BrokerId, ControlLimitError, ControlLimits, FeatureSet, HelloRequest, HelloResponse,
-    MessageKind, PrepareFrameError, ProtocolVersion,
+    MessageKind, PrepareFrameError,
 };
 use lasper_guest_runtime::session::{PrepareBuffer, PrepareStorage, PrepareStorageError};
 use std::io::Write;
@@ -9,13 +9,14 @@ use std::task::Poll;
 use super::support::{established, header};
 
 fn limits(value: ControlLimits) -> lasper_guest_protocol::EnforcedControlLimits {
-    HelloRequest::new(FeatureSet::EMPTY, value)
-        .unwrap()
-        .negotiate(
-            ProtocolVersion::CURRENT,
-            HelloResponse::new(FeatureSet::EMPTY, BrokerId::new([1; 16]), value).unwrap(),
-        )
-        .unwrap()
+    HelloResponse::accept(
+        HelloRequest::new(FeatureSet::EMPTY, value).unwrap(),
+        lasper_guest_protocol::HelloOffer::local(value),
+        BrokerId::new([1; 16]),
+    )
+    .unwrap()
+    .1
+    .limits()
 }
 
 #[test]
@@ -48,7 +49,8 @@ fn freezing_requires_the_header_that_allocated_the_storage() {
     let (guest, mut peer) = established(ControlLimits::CURRENT);
     let broker = BrokerId::new([1; 16]);
     let expected = header(MessageKind::PrepareRequest, 2, 0);
-    let actual = lasper_guest_protocol::ControlFrameHeader::new(
+    let actual = lasper_guest_protocol::ControlFrameHeader::new_with_version(
+        lasper_guest_protocol::ProtocolVersion { major: 1, minor: 0 },
         MessageKind::PrepareRequest,
         expected.request_id() + 1,
         2,

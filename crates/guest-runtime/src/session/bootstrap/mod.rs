@@ -20,7 +20,6 @@ use supervisor::Supervisor;
 pub use supervisor::SupervisorStatus;
 
 pub const GUARDIAN_START_BYTE: u8 = 1;
-const HELLO_TIMEOUT_MS: u64 = 1000;
 
 /// Initializes a guardian child before any worker is created.
 pub struct GuardianBootstrap {
@@ -33,7 +32,7 @@ pub struct GuardianBootstrap {
 impl GuardianBootstrap {
     /// Waits for the broker's Go, completes Hello and calls `entry`.
     ///
-    /// The deadline is one second after `accepted_at_ms`, measured in
+    /// The Hello policy sets the deadline relative to `accepted_at_ms`, in
     /// `CLOCK_MONOTONIC` milliseconds. Failure exits without creating a worker.
     ///
     /// # Safety
@@ -103,7 +102,10 @@ impl GuardianBootstrap {
             .context("make guardian broker pipe nonblocking")?;
         let signals = signals.finish().context("initialize guardian signals")?;
         linux::set_subreaper().context("set guardian subreaper")?;
-        let hello_deadline_ms = self.accepted_at_ms.saturating_add(HELLO_TIMEOUT_MS);
+        let hello_deadline_ms = self
+            .accepted_at_ms
+            .checked_add(crate::policy::hello_timeout_ms())
+            .ok_or(GuardianError::StartupExpired)?;
         wait_for_start(&broker, &signals, hello_deadline_ms)?;
         // SAFETY: The connected FD has one fresh owner in this child.
         let mut connection = unsafe { GuestControlStream::from_raw_fd(control.into_raw()) };

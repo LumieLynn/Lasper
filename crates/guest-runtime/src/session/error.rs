@@ -30,8 +30,12 @@ pub enum GuardianError {
         actual: lasper_guest_protocol::BrokerId,
     },
     ExistingChildren,
+    ReadyDescriptorCapacity {
+        required: u16,
+        available: u16,
+    },
     NotPrepared,
-    ReadyAlreadyTaken,
+    ReadyAlreadyDelivered,
     AlreadyStarted,
     InvalidStart(lasper_guest_protocol::SessionPayloadError),
     InvalidStatus,
@@ -68,7 +72,7 @@ impl GuardianError {
             | Self::SessionAlreadyCreated
             | Self::ExistingChildren
             | Self::NotPrepared
-            | Self::ReadyAlreadyTaken
+            | Self::ReadyAlreadyDelivered
             | Self::AlreadyStarted
             | Self::Lifecycle(_) => FailureClass::Internal,
             Self::StartupNotReleased
@@ -80,6 +84,7 @@ impl GuardianError {
             | Self::Control(_)
             | Self::UnexpectedBrokerData
             | Self::MismatchedBroker { .. }
+            | Self::ReadyDescriptorCapacity { .. }
             | Self::InvalidStart(_)
             | Self::InvalidStatus => FailureClass::Protocol,
         }

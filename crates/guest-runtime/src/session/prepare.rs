@@ -1,10 +1,36 @@
 use lasper_guest_protocol::{
     BrokerId, ControlFrameHeader, ControlLimitError, EnforcedControlLimits, PayloadCodecError,
-    PrepareFrameError, PrepareRequestFrame,
+    PrepareDecodeStorage, PrepareFrameError, PrepareRequestFrame,
 };
 
 use crate::memory::Mapping;
 use crate::transport::GuestReceivedFrame;
+use core::ops::Deref;
+
+const METADATA_OFFSET: usize = lasper_guest_protocol::MAX_PREPARE_UNESCAPE_BYTES
+    .next_multiple_of(core::mem::align_of::<PrepareDecodeStorage<'static>>());
+const DECODE_STORAGE_BYTES: usize = (METADATA_OFFSET
+    + core::mem::size_of::<PrepareDecodeStorage<'static>>())
+.next_multiple_of(64 * 1024);
+
+const _: () = {
+    assert!(METADATA_OFFSET.is_multiple_of(core::mem::align_of::<PrepareDecodeStorage<'static>>()));
+    assert!(
+        METADATA_OFFSET + core::mem::size_of::<PrepareDecodeStorage<'static>>()
+            <= DECODE_STORAGE_BYTES
+    );
+};
+
+/// Owns decoded request metadata while its string views borrow the wire storage.
+pub struct DecodedPrepare<'a>(PrepareRequestFrame<'a>);
+
+impl<'a> Deref for DecodedPrepare<'a> {
+    type Target = PrepareRequestFrame<'a>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PrepareStorageError {
@@ -88,8 +114,37 @@ impl PrepareStorage {
         Ok(Self(buffer))
     }
 
-    pub fn request(&self) -> Result<PrepareRequestFrame<'_>, PrepareStorageError> {
-        PrepareRequestFrame::decode_parts(self.0.header, self.0.as_ref(), 0, self.0.broker)
-            .map_err(PrepareStorageError::Frame)
+    pub fn request_with(
+        &self,
+        protocol: lasper_guest_protocol::NegotiatedProtocol,
+    ) -> Result<DecodedPrepare<'_>, PrepareStorageError> {
+        decode_request(protocol, self.0.header, self.0.as_ref(), self.0.broker)
     }
+}
+
+pub(super) fn decode_request<'a>(
+    protocol: lasper_guest_protocol::NegotiatedProtocol,
+    header: ControlFrameHeader,
+    payload: &'a [u8],
+    broker: BrokerId,
+) -> Result<DecodedPrepare<'a>, PrepareStorageError> {
+    let mut decode = Mapping::new(DECODE_STORAGE_BYTES).map_err(PrepareStorageError::System)?;
+    let (scratch, metadata) = decode.as_mut().split_at_mut(METADATA_OFFSET);
+    // SAFETY: mmap is page aligned, the offset preserves metadata alignment,
+    // and the const assertions reserve the whole initialized object.
+    let storage = unsafe {
+        let slot = metadata.as_mut_ptr().cast::<PrepareDecodeStorage<'_>>();
+        slot.write(PrepareDecodeStorage::new());
+        &mut *slot
+    };
+    let result = protocol
+        .decode_prepare_into(storage, header, payload, 0, broker, scratch)
+        .cloned();
+    // Only the validated view metadata escapes. Its strings borrow the
+    // wire payload, so the decoder mapping can be released before fork.
+    // SAFETY: storage was initialized above and no reference to it escapes.
+    unsafe { core::ptr::drop_in_place(storage) };
+    result
+        .map(DecodedPrepare)
+        .map_err(PrepareStorageError::Frame)
 }

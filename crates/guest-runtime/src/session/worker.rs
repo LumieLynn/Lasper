@@ -1,10 +1,16 @@
+//! Child-side setup and the private Start gate.
+//!
+//! Account resolution, credentials, argv and environment are fixed before the
+//! worker reports Prepared. While waiting for Start, it answers identity
+//! challenges as the selected account. Only the guardian can release its exec.
+
 use lasper_guest_protocol::{
     ExecutionKind, GuestIdentityReply, GuestProcess, PreparationId, PrepareRequestFrame,
-    ProjectionObservations, ProjectionRequests, StartRequest, TerminalSize,
+    StartRequest, TerminalSize,
 };
 
-use crate::identity::GuestIdentityChannel;
-use crate::linux::uapi::errno::{EINTR, EINVAL, EIO};
+use crate::identity::{GuestIdentityChannel, IdentityTransportError};
+use crate::linux::uapi::errno::{EINTR, EINVAL, EIO, EPIPE};
 
 use super::account::Account;
 use super::execution;
@@ -26,6 +32,7 @@ impl WorkerChannels {
         self,
         request: &'a PrepareRequestFrame<'a>,
         preparation: PreparationId,
+        profile: &'static lasper_guest_protocol::ProtocolProfile,
     ) -> WorkerBootstrap<'a> {
         let retained = [
             self.start.raw(),
@@ -62,11 +69,13 @@ impl WorkerChannels {
             linux::exit(crate::failure::FailureClass::Io.exit_code());
         }
         // SAFETY: Only this child owns the worker endpoint after descriptor pruning.
-        let identity =
-            unsafe { GuestIdentityChannel::from_raw_fd(self.identity.into_raw(), preparation) };
+        let identity = unsafe {
+            GuestIdentityChannel::from_raw_fd(self.identity.into_raw(), preparation, profile)
+        };
         WorkerBootstrap {
             request,
             preparation,
+            profile,
             start: self.start,
             status: self.status,
             identity,
@@ -74,11 +83,12 @@ impl WorkerChannels {
     }
 }
 
-/// The trusted worker entry calls `run` to prepare the account and wait for
-/// Start. It can report a setup failure, but cannot release an unchecked exec.
+/// Owns worker-side channels after inherited FDs have been pruned. `run`
+/// prepares execution and answers identity challenges until Start arrives.
 pub struct WorkerBootstrap<'a> {
     request: &'a PrepareRequestFrame<'a>,
     preparation: PreparationId,
+    profile: &'static lasper_guest_protocol::ProtocolProfile,
     start: Descriptor,
     status: Descriptor,
     identity: GuestIdentityChannel,
@@ -94,14 +104,12 @@ impl<'a> WorkerBootstrap<'a> {
     }
 
     /// Resolves local passwd/group, switches identity and enters home before
-    /// publishing Prepared. The observer runs under that selected identity.
+    /// publishing Prepared. Identity challenges are answered under that identity.
     ///
     /// The worker owns one WORKER_MEMORY_BYTES mapping for its account and
-    /// buffers. exec/exit releases it; entries do not allocate a second workspace.
-    pub fn run(
-        self,
-        mut observe: impl FnMut(&ProjectionRequests) -> Result<ProjectionObservations, WorkerFailure>,
-    ) -> ! {
+    /// buffers until exec/exit. Environment decoding and merging use a separate
+    /// mapping sized by the selected profile. Both are ready before Prepared.
+    pub fn run(self) -> ! {
         let mut memory = match WorkerMemory::new() {
             Ok(memory) => memory,
             Err(errno) => self.fail(WorkerFailure::new(WorkerStage::Memory, errno)),
@@ -112,28 +120,26 @@ impl<'a> WorkerBootstrap<'a> {
             self.fail(failure);
         }
         if let Err(failure) = account.enter(
-            self.request.request().execution() == ExecutionKind::Interactive,
+            self.request.request().execution() == ExecutionKind::Terminal,
             matches!(self.request.request().process(), GuestProcess::LoginShell),
         ) {
             self.fail(failure);
         }
-        let started = self.await_start(account, &mut storage.packet, &mut observe);
-        let failure = execution::execute(
-            account,
-            started.request.request(),
-            &started.start,
-            &mut storage.scratch,
-            &mut storage.packet,
-        );
-        fail(&started.status, failure)
+        let mut execution_memory = match execution::ExecutionMemory::new(self.profile.capacities())
+        {
+            Ok(memory) => memory,
+            Err(failure) => self.fail(failure),
+        };
+        let execution =
+            match execution_memory.prepare(account, self.request.request(), &mut storage.scratch) {
+                Ok(execution) => execution,
+                Err(failure) => self.fail(failure),
+            };
+        let status = self.await_start(account, &mut storage.packet);
+        fail(&status, execution.execute())
     }
 
-    fn await_start(
-        mut self,
-        account: &Account,
-        packet: &mut [u8],
-        observe: &mut impl FnMut(&ProjectionRequests) -> Result<ProjectionObservations, WorkerFailure>,
-    ) -> StartedWorker<'a> {
+    fn await_start(mut self, account: &Account, packet: &mut [u8]) -> Descriptor {
         if let Err(errno) = StatusMessage::Prepared.send(&self.status) {
             fail(&self.status, WorkerFailure::new(WorkerStage::Start, errno));
         }
@@ -151,7 +157,7 @@ impl<'a> WorkerBootstrap<'a> {
                 let mut filled = 0;
                 while filled < command.len() {
                     match self.start.read(&mut command[filled..]) {
-                        Ok(0) => linux::exit(125),
+                        Ok(0) => fail(&self.status, WorkerFailure::new(WorkerStage::Start, EPIPE)),
                         Ok(count) => filled += count,
                         Err(errno) => {
                             fail(&self.status, WorkerFailure::new(WorkerStage::Start, errno))
@@ -169,23 +175,14 @@ impl<'a> WorkerBootstrap<'a> {
                 }
                 drop(self.identity);
                 drop(self.start);
-                return StartedWorker {
-                    request: self.request,
-                    start,
-                    status: self.status,
-                };
+                // exec closes the CLOEXEC status pipe; a failed exec reports
+                // its errno through the same endpoint before exiting.
+                return self.status;
             }
             if fds[1].ready() {
                 let challenge = match self.identity.receive_challenge(packet) {
                     Ok(challenge) => challenge,
-                    Err(_) => fail(
-                        &self.status,
-                        WorkerFailure::new(WorkerStage::Projection, EIO),
-                    ),
-                };
-                let projections = match observe(self.request.request().projections()) {
-                    Ok(projections) => projections,
-                    Err(failure) => fail(&self.status, failure),
+                    Err(error) => fail(&self.status, identity_failure(error)),
                 };
                 let reply = match GuestIdentityReply::new(
                     challenge,
@@ -193,19 +190,15 @@ impl<'a> WorkerBootstrap<'a> {
                     account.username.as_str(),
                     account.uid,
                     account.gid,
-                    projections,
                 ) {
                     Ok(reply) => reply,
                     Err(_) => fail(
                         &self.status,
-                        WorkerFailure::new(WorkerStage::Projection, EINVAL),
+                        WorkerFailure::new(WorkerStage::Identity, EINVAL),
                     ),
                 };
-                if self.identity.send_reply(&reply, packet).is_err() {
-                    fail(
-                        &self.status,
-                        WorkerFailure::new(WorkerStage::Projection, EIO),
-                    );
+                if let Err(error) = self.identity.send_reply(&reply, packet) {
+                    fail(&self.status, identity_failure(error));
                 }
             }
         }
@@ -216,22 +209,12 @@ impl<'a> WorkerBootstrap<'a> {
     }
 }
 
-// The status pipe survives Start. exec closes it; setup or exec failure sends
-// an error before the worker exits.
-struct StartedWorker<'a> {
-    request: &'a PrepareRequestFrame<'a>,
-    start: StartRequest,
-    status: Descriptor,
-}
-
 pub(super) const START_BYTES: usize = 8;
 
 // Paths and account/argv cannot change at Start. This private pipe carries only
-// projection selection and dimensions; the worker uses its own original Prepare.
+// final terminal dimensions; the worker uses its own original Prepare.
 pub(super) fn encode_start(start: &StartRequest) -> [u8; START_BYTES] {
     let mut bytes = [0; START_BYTES];
-    bytes[0] = u8::from(start.wayland_display().is_some())
-        | (u8::from(start.x11_display().is_some()) << 1);
     if let Some(size) = start.terminal_size() {
         bytes[1] = 1;
         bytes[2..4].copy_from_slice(&size.cols().to_le_bytes());
@@ -246,7 +229,7 @@ fn decode_start(
     bytes: [u8; START_BYTES],
 ) -> Result<StartRequest, WorkerFailure> {
     let invalid = WorkerFailure::new(WorkerStage::Start, EINVAL);
-    if bytes[0] & !3 != 0 || bytes[1] > 1 || bytes[6..] != [0, 0] {
+    if bytes[0] != 0 || bytes[1] > 1 || bytes[6..] != [0, 0] {
         return Err(invalid);
     }
     let size = if bytes[1] == 1 {
@@ -263,18 +246,7 @@ fn decode_start(
         }
         None
     };
-    let projections = request.request().projections();
-    let wayland = if bytes[0] & 1 != 0 {
-        Some(projections.wayland().ok_or(invalid)?.target())
-    } else {
-        None
-    };
-    let x11 = if bytes[0] & 2 != 0 {
-        Some(projections.x11().ok_or(invalid)?.display())
-    } else {
-        None
-    };
-    StartRequest::new(request, preparation, wayland, x11, size, None).map_err(|_| invalid)
+    StartRequest::new(request, preparation, size, None).map_err(|_| invalid)
 }
 
 fn fail(status: &Descriptor, failure: WorkerFailure) -> ! {
@@ -282,6 +254,24 @@ fn fail(status: &Descriptor, failure: WorkerFailure) -> ! {
     linux::exit(failure.class().exit_code())
 }
 
+fn identity_failure(error: IdentityTransportError) -> WorkerFailure {
+    let errno = match error {
+        IdentityTransportError::Syscall(errno) => errno,
+        IdentityTransportError::UnexpectedEof | IdentityTransportError::Poisoned => EPIPE,
+        IdentityTransportError::Payload(_)
+        | IdentityTransportError::Truncated
+        | IdentityTransportError::UnexpectedAncillary
+        | IdentityTransportError::PreparationMismatch
+        | IdentityTransportError::ChallengeMismatch => EINVAL,
+        IdentityTransportError::WriteZero | IdentityTransportError::UnexpectedPhase => EIO,
+    };
+    WorkerFailure::new(WorkerStage::Identity, errno)
+}
+
 #[cfg(test)]
 #[path = "../../tests/support/clock_worker.rs"]
 pub(super) mod clock_fixture;
+
+#[cfg(test)]
+#[path = "../../tests/session/worker.rs"]
+mod tests;

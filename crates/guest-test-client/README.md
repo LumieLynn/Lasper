@@ -1,10 +1,10 @@
 # Guest runtime test client
 
-`lasper-guest-test-client` connects from the host to a guest runtime inside a container to run commands or open an interactive shell. It uses `guest-host-transport` and `guest-protocol` to test runtime startup, connections, and sessions independently before integrating them into the Lasper TUI.
+`lasper-guest-test-client` connects to a guest runtime from the host. It can run a command in the guest or open an interactive shell, so you can test the runtime on its own. The client uses `guest-host-transport` for host-side connections and `guest-protocol` for the wire protocol.
 
-The broker is the guest runtime process that stays running inside the container. It listens on a Unix socket, handles client requests, and manages command and shell sessions. The wrapper starts the broker before running a specified program. It forks the broker, waits for it to become ready, then replaces itself with that program through `execve`, keeping the same PID.
+Inside the container, the broker is the long-running guest runtime process. It listens on a Unix socket and manages command and shell sessions. The wrapper provides another way to start it: it forks the broker, waits until it is ready, and then calls `execve` for the requested program. The program inherits the wrapper's PID.
 
-The client runs on the host, looks up the container through machined, and locates the broker socket through a pinned handle to the guest root. It doesn't enter the container's namespaces. The host needs systemd, machined, and a system bus; the guest doesn't need D-Bus. These experiments currently focus on non-systemd rootfs images. The `Boot=yes` entry preserves the image's original `/sbin/init`.
+On the host, the client looks up the container through machined and locates the broker socket relative to a pinned handle to the guest root. It does not enter the container's namespaces. The host needs systemd, machined, and a system bus, while the guest does not need D-Bus. The `Boot=yes` setup described here preserves the image's original `/sbin/init`; it is intended for rootfs images without an existing systemd installation.
 
 ## Building
 
@@ -15,9 +15,9 @@ cargo build-guest-runtime-x86-64
 cargo build -p lasper-guest-test-client --locked
 ```
 
-On an aarch64 host, use `cargo build-guest-runtime-aarch64` and replace `x86_64-unknown-linux-musl` in the runtime output path below with `aarch64-unknown-linux-musl`. The runtime must match the guest's architecture.
+On an aarch64 host, use `cargo build-guest-runtime-aarch64`. In the runtime output path below, replace `x86_64-unknown-linux-musl` with `aarch64-unknown-linux-musl`. The runtime binary must match the guest's architecture.
 
-The following commands use x86_64 as an example. In a host terminal, set the paths to both executables and replace `ROOTFS` with the actual location of your test rootfs. Use a disposable copy so you can keep the original image intact.
+The examples below use x86_64. In a host terminal, set the paths to both executables and replace `ROOTFS` with the location of your test rootfs. Use a disposable copy to keep the original image intact.
 
 ```sh
 RUNTIME="$(realpath target/x86_64-unknown-linux-musl/guest-runtime/lasper-guest-runtime)"
@@ -25,17 +25,17 @@ CLIENT="$(realpath target/debug/lasper-guest-test-client)"
 ROOTFS=/absolute/path/to/test-rootfs
 ```
 
-If you open another terminal to run the client, set `CLIENT` there as well. The examples below use `lasper-test` as the registered machine name. Replace it with the actual name when using an existing container.
+If you use a second terminal for the client, set `CLIENT` in that terminal too. The examples use `lasper-test` as the registered machine name; substitute your container's name when testing an existing machine.
 
 Run `"$CLIENT" --help` for a command overview, or `"$CLIENT" exec --help` and `"$CLIENT" shell --help` for each command's arguments. The runtime also provides `--help` and `wrap --help`. None of these help commands require a running container.
 
 ## Starting the runtime inside a container
 
-The runtime executable is made available inside the guest through a read-only bind mount. Its socket and lock file live at `/var/opt/lasper`. Add the `.nspawn` configuration below to your test container's settings file manually. Replace the source on the left side of `BindReadOnly=` with the actual absolute path stored in `RUNTIME`.
+The runtime binary is bind-mounted read-only into the guest. Its socket and lock file are stored under `/var/opt/lasper`. Add the relevant settings below to the container's `.nspawn` file. In each `BindReadOnly=` entry, replace the host-side path with the absolute path in `RUNTIME`.
 
 ### Boot=no: run the broker directly
 
-With `Boot=no`, you can run the broker as the container's main process, then connect with the client to run commands or open a shell:
+With `Boot=no`, start the broker directly as the container's main process. You can then use the client to run guest commands or open a shell:
 
 ```ini
 [Exec]
@@ -48,13 +48,13 @@ TemporaryFileSystem=/var/opt/lasper:mode=0700
 BindReadOnly=/absolute/host/path/lasper-guest-runtime:/opt/lasper/guest-runtime
 ```
 
-Here, the broker itself is PID 1, with no placeholder program. With `ProcessTwo=yes`, nspawn's stub init becomes PID 1 and the broker runs as PID 2. The direct `--broker` entry requires the runtime directory to exist; the tmpfs above provides it before the broker starts.
+In this configuration, the broker runs as PID 1. Set `ProcessTwo=yes` if you want nspawn's stub init to run as PID 1 and the broker as PID 2. The direct `--broker` entry expects the runtime directory to exist already; the tmpfs mount creates it before startup.
 
-To run the container's intended command alongside the broker, use the wrapper. It forks the broker, then replaces itself with that command without changing its PID. The syntax is `wrap -- /absolute/program [ARGS...]`; you must explicitly specify the program to run.
+To start the broker and the container's intended command together, use the wrapper. It forks the broker and then calls `execve` for the requested program, which inherits the wrapper's PID. Specify the program explicitly after `wrap --`, as in `wrap -- /absolute/program [ARGS...]`.
 
-Without a tmpfs mount, the wrapper creates missing parent directories and the runtime directory on a writable filesystem. New parent directories have mode 0755, and the runtime directory has mode 0700. Existing directory ownership and permissions are left unchanged.
+If you omit the tmpfs mount, the wrapper creates any missing parent directories and the runtime directory on the guest's writable filesystem. It creates parent directories with mode 0755 and the runtime directory with mode 0700. Existing directories keep their current ownership and permissions.
 
-The following standalone `Boot=no` command lets you observe the wrapper handing execution over to another program. It does not read a `.nspawn` file; all required mounts are specified on the command line:
+To try the wrapper without a `.nspawn` file, run nspawn directly with the required mounts on its command line:
 
 ```sh
 sudo systemd-nspawn \
@@ -68,13 +68,13 @@ sudo systemd-nspawn \
     /opt/lasper/guest-runtime wrap -- /bin/sleep 86400
 ```
 
-This command stays in the foreground, so run the connection tests in another host terminal. When `sleep 86400` exits, the broker stops as well. To keep only the broker running, use the direct entry shown earlier. If the image has no `/bin/sleep`, substitute a program available in it. Add `--as-pid2` to keep nspawn's stub init as PID 1.
+The command runs nspawn in the foreground, so use another host terminal for the connection tests. When `/bin/sleep` exits, the wrapper exits and the broker stops with it. To leave the broker running on its own, use the direct entry above. If the image does not contain `/bin/sleep`, choose another program that is present. Add `--as-pid2` to keep nspawn's stub init as PID 1.
 
 ### Boot=yes: run the guest's original `/sbin/init`
 
-With `Boot=yes`, nspawn searches its init candidate paths. Bind the runtime to one of the systemd candidate locations so nspawn starts it first. After forking the broker, the runtime replaces itself with `/sbin/init` without changing its PID, so the guest's `/sbin/init` runs as PID 1. This entry shares its startup logic with the explicit `Boot=no` wrapper, and the broker uses the same `/var/opt/lasper` directory.
+With `Boot=yes`, nspawn checks its init candidate paths before starting the guest. Bind the runtime to an unused systemd candidate so nspawn starts it as the entry point. The runtime forks the broker and then calls `execve` for the guest's original `/sbin/init`; the init process continues as PID 1. The broker uses the same `/var/opt/lasper` directory as in the `Boot=no` setup.
 
-This setup requires an image without an existing systemd installation. Before the first bind mount, check both candidate paths from inside the test rootfs. This avoids covering an existing program and ensures that absolute guest symlinks resolve inside the guest rather than on the host. Use the following script:
+Use this setup only with an image that does not have systemd installed. Before adding the bind mount, check both candidate paths inside the rootfs. They must be absent: otherwise the mount would hide an existing program. Checking inside the rootfs also confirms that symlinks resolve against the guest filesystem. Run:
 
 ```sh
 sudo chroot "$ROOTFS" /bin/sh -ec '
@@ -100,9 +100,9 @@ TemporaryFileSystem=/var/opt/lasper:mode=0700
 BindReadOnly=/absolute/host/path/lasper-guest-runtime:/lib/systemd/systemd
 ```
 
-When switching from `Boot=no` to `Boot=yes`, remove the `Parameters=` value previously used to start the runtime. With `Boot=yes`, the guest runtime forwards `Parameters=` to the original init, so set it only when you need to pass arguments to init. In particular, when nspawn starts the runtime through an init candidate path, `wrap` is forwarded to init as an argument; it is not interpreted as a guest runtime subcommand.
+When changing from `Boot=no` to `Boot=yes`, remove the `Parameters=` value that launched the runtime directly. In `Boot=yes` mode, nspawn passes `Parameters=` to the original init through the runtime. Leave it unset unless the init needs arguments. For example, if `Parameters=wrap` is present, `wrap` becomes an argument to init; the runtime does not treat it as a subcommand.
 
-Save the configuration and start the container as you normally would. After replacing the runtime executable, restart the container to use the new version. The candidate-path check is intended for a rootfs where the runtime has not yet been bound. Earlier tests can leave empty mount points behind, especially if you changed the bind target, which can cause the chroot script above to reject the rootfs.
+Save the configuration and start the container as usual. If you replace the runtime binary, restart the container to load the new one. The candidate-path check assumes the runtime has not already been bound into the rootfs. Earlier tests may leave an empty directory at a previous bind target; if so, the script above will report that path as occupied.
 
 ## Connecting to the container
 
@@ -112,11 +112,11 @@ On the host, confirm that the container is registered:
 machinectl show lasper-test -p Name -p Leader -p Unit
 ```
 
-The current connection implementation requires host support for pidfd and `SO_PEERPIDFD`, and machined must provide a nonzero `LeaderPIDFDId`. If these capabilities are missing, the client returns an error rather than falling back to a numeric PID alone. The examples below use `sudo` to read host procfs information and access the guest's private socket.
+The host kernel must support pidfd and `SO_PEERPIDFD`, and machined must report a nonzero `LeaderPIDFDId`. If any of these requirements is missing, the client reports an error; it does not fall back to identifying the process by numeric PID alone. The examples use `sudo` because the client needs access to host procfs data and the guest's private socket.
 
 ### Running commands
 
-Start with a command that checks stdout, stderr, and the exit code separately:
+First, check that stdout, stderr, and the guest exit code all reach the host:
 
 ```sh
 sudo "$CLIENT" exec --machine lasper-test --user root -- \
@@ -124,19 +124,21 @@ sudo "$CLIENT" exec --machine lasper-test --user root -- \
 printf 'client exit=%s\n' "$?"
 ```
 
-You should see both output lines followed by `client exit=7`. This confirms that the command ran inside the guest and that its output and exit status reached the host. If your host shell has `set -e` enabled, disable it before testing this expected nonzero exit code.
+The output should contain both lines, followed by `client exit=7`. This confirms that the guest command's output and exit status reached the host. If the host shell has `set -e` enabled, turn it off for this test because the guest command intentionally exits with a nonzero status.
 
-The `--` separator after `exec` separates client options from the guest command. The program must be specified by an absolute path inside the guest. The default user is root; use `--user` to select another existing guest account. The client does not create users or install programs.
+The `--` after `exec` marks the end of client options; everything after it is the guest command. Give the command an absolute path inside the guest. The default account is root. To use another account, pass its name with `--user`; that account and its programs must already exist in the image.
 
-Commands have no execution time limit by default. Use `exec --timeout SECONDS` to set a positive whole-second budget, including with `--tty`. The client rejects values above the protocol's maximum execution budget before connecting. The guest measures this budget from acceptance of Start; preparation and the wait before Start do not count. For example, the following command has three minutes to run:
+By default, commands have no execution time limit. Pass `--timeout SECONDS` to set a positive whole-second limit; this option also works with `--tty`. Before connecting, the client rejects values above the protocol's maximum. The guest starts the timer when it accepts Start, so preparation time and any wait before Start do not count. For example, this command has up to three minutes to run:
 
 ```sh
 sudo "$CLIENT" exec --machine lasper-test --timeout 180 -- /bin/sleep 120
 ```
 
-Ordinary `exec` returns captured output after the command exits. Capture is limited to 64 KiB in total, independently of the execution timeout. Each stream is guaranteed half of the available budget and can borrow space its peer has not used; later stderr can reclaim its share even after stdout has filled the buffer. The client warns when output is truncated or incomplete. This mode is unsuitable for following continuous logs.
+For ordinary `exec`, stdout and stderr travel through separate pipes and are forwarded as they arrive. The client does not capture or truncate the output, and the execution timeout does not limit output size. Once the command finishes, the exit report includes its status and the cleanup result.
 
-For an ordinary worker exit with complete cleanup, the client returns its exit code or `128 + signal`. A command that finishes before the guardian can confirm exec still retains its known exit status. Session failures, including the execution deadline, return 125 with a diagnostic even if the worker subsequently exits with status 0. If Start acceptance cannot be determined, the diagnostic states that the command may have run; the client does not retry it. Guest setup and exec failures retain their failed stage and errno in the diagnostic. Command-line argument errors return 2.
+If writing to either host output stream fails, the client requests session cleanup and continues reading the other stream. SIGTERM also requests cleanup. In ordinary `exec` mode, SIGINT does the same; in interactive mode, Ctrl-C is sent through the PTY to the guest process. After the client receives the final session status, it gives the output streams one second to close. If they remain open, it reports an error.
+
+When the worker exits normally and cleanup completes, the client returns the command's exit code, or `128 + signal` if it was killed by a signal. The client can still report a known exit status if the command finishes before the guardian confirms that `exec` succeeded. For a session failure, including a timeout, the client exits with status 125 and prints a diagnostic even if the worker later exits with status 0. If the client cannot determine whether Start was accepted, the diagnostic warns that the command may have run; the client does not retry it. Diagnostics for guest setup and `exec` failures include the failing stage and errno. Invalid command-line arguments produce exit status 2.
 
 ### Opening an interactive shell
 
@@ -146,23 +148,23 @@ Run the following command in an interactive terminal on the host:
 sudo "$CLIENT" shell --machine lasper-test --user root
 ```
 
-The `shell` command starts the shell listed in the guest account record as a login shell, with `HOME` and the working directory taken from that account. It does not display a login prompt, authenticate a password, or register a PAM/logind session. To use a regular user, replace `root` with an account that already exists in the image and make sure its home directory exists.
+The `shell` command starts the login shell listed for the selected guest account. It sets `HOME` and the working directory from that account's record. It does not show a login prompt, check a password, or register a PAM or logind session. To open a shell as a regular user, choose an account that already exists in the image and make sure its home directory is present.
 
 Once inside, run `id`, `pwd`, and `printf '%s\n' "$0" "$SHELL" "$HOME"` to check the account and shell environment. The `tty` command should show the guest's PTY. Run `stty size`, resize the host terminal window, and run it again; the dimensions should change accordingly. Run `sleep 30` and press Ctrl-C to check that terminal signals reach the guest program.
 
-To choose a shell explicitly or run another interactive program, use `exec --tty`. For example, if the image has bash:
+To choose a shell yourself, or to run another interactive program, use `exec --tty`. For example, if Bash is installed in the guest:
 
 ```sh
 sudo "$CLIENT" exec --tty --machine lasper-test --user root -- /bin/bash -l
 ```
 
-To check the interactive client's exit code, enter `exit 7` in the guest shell. Wait for the host prompt to return, then run this command separately:
+To check the client's exit code, enter `exit 7` in the guest shell. After the host prompt returns, run this command at the host prompt:
 
 ```sh
 printf 'client exit=%s\n' "$?"
 ```
 
-Do not paste this command together with the command that starts the shell, or the guest shell may consume it. After exiting, host terminal echo and newline handling should work normally again.
+Do not paste the `printf` command together with the command that starts the shell. The guest shell could read it as input. After the shell exits, the host terminal's echo and newline handling should work normally again.
 
 The client connects to `/var/opt/lasper/guest-exec.sock` by default. When testing another runtime directory, specify the endpoint with `--socket /guest/path/to/guest-exec.sock`. This path is resolved within the guest root.
 
@@ -170,7 +172,7 @@ The client connects to `/var/opt/lasper/guest-exec.sock` by default. When testin
 
 After connecting to a shell with `Boot=yes`, inspect `readlink /proc/1/exe` and `/proc/1/cmdline` inside the guest to confirm that PID 1 is now the original init. The executable may be busybox on a BusyBox image, and Void's runit-init may go on to execute runit. The final command line does not have to keep showing `/sbin/init`. The `/var/opt/lasper` directory should be owned by root with mode 0700, and its socket and lock file should have mode 0600.
 
-If a connection fails, keep the actual startup configuration, the client's stderr output, and its exit code. If the container is still running, use the repository's `collect-diagnostics.sh` script to collect host state:
+If a connection fails, save the startup configuration, the client's stderr output, and its exit code. If the container is still running, collect host-side state with `collect-diagnostics.sh`:
 
 ```sh
 # make sure you're in the project root.
@@ -179,7 +181,7 @@ sudo bash crates/guest-test-client/scripts/collect-diagnostics.sh \
     lasper-test target/guest-runtime-test-logs/lasper-test-state.txt
 ```
 
-The script reads the machined registration, the machine leader's procfs information, endpoint metadata, and host logs. It does not enter guest namespaces or modify the guest. The output file must not already exist; choose a different filename for each collection. When reporting a problem, include the image source, version, architecture, and the runtime executable you used.
+The script records the machined registration, procfs details for the machine leader, socket metadata, and host logs. It neither enters the guest's namespaces nor changes the guest. It will not overwrite an existing output file, so use a new filename for each run. When reporting a problem, include the image source and version, its architecture, and the runtime binary used for the test.
 
 If the guest has no journal data, `journalctl -M` may produce no output. In that case, inspect the terminal output of a foreground nspawn process or query the host unit running the container:
 
@@ -188,9 +190,9 @@ unit=$(machinectl show lasper-test -p Unit --value)
 sudo journalctl -b -u "$unit" -n 100
 ```
 
-These logs mainly show startup and console output. They may contain terminal control bytes or messages from guest services that repeatedly fail. Complete guest logs depend on the logging service used by the image.
+These logs mainly contain startup and console output. They can also include terminal control bytes or repeated errors from guest services. What other guest logs are available depends on the logging service in the image.
 
-To end an experiment, run `sudo machinectl terminate lasper-test`. To test a normal shutdown initiated by the guest, run the guest's `poweroff` command from its shell. The container may exit before the client receives the final status, causing a disconnection error. Check whether nspawn has exited, the machined registration has disappeared, and any processes remain to determine whether shutdown completed. Restart the container and connect again to continue testing with the new machine instance.
+To stop the experiment, run `sudo machinectl terminate lasper-test`. To test shutdown from inside the guest, run `poweroff` in its shell. The container may stop before the client receives the final status, in which case the client reports a disconnection. Check whether nspawn has exited, the machined registration is gone, and any guest processes remain. To continue testing, start the container again and reconnect to the new machine instance.
 
 ## Testing and guest results
 
@@ -202,8 +204,8 @@ cargo test -p lasper-guest-runtime --test wrapper --locked -- \
     --binary target/x86_64-unknown-linux-musl/guest-runtime/lasper-guest-runtime
 ```
 
-The wrapper tests cover program handoff, creation and validation of the runtime directory and its parents, cleanup after exec failure, and rejection of recursive invocation. Add `--pid1` to test the PID 1 entry path. This requires an environment that allows creating a PID namespace and mounting its procfs.
+The wrapper tests cover program handoff, runtime-directory setup and validation, cleanup after an `exec` failure, and rejection of recursive invocation. Add `--pid1` to exercise the PID 1 entry path; that test requires permission to create a PID namespace and mount its procfs.
 
-Tests with LXC rootfs images for alpine-edge, devuan-excalibur, slackware-current, voidlinux, and gentoo-openrc succeeded in all three modes: `Boot=yes`, `Boot=no` running the broker directly, and `Boot=no` starting a program through the wrapper.
+The runtime has been tested with LXC rootfs images for alpine-edge, devuan-excalibur, slackware-current, voidlinux, and gentoo-openrc. Each image worked in all three modes: `Boot=yes`, `Boot=no` with the broker running directly, and `Boot=no` with the wrapper starting another program.
 
-In the gentoo-openrc image used for these tests, `/sbin/init` defaults to SysVinit. To use OpenRC's init entry point instead, adjust the image's init configuration.
+In the gentoo-openrc image used for these tests, `/sbin/init` points to SysVinit by default. Adjust the image's init configuration if you want to test OpenRC's init entry point instead.

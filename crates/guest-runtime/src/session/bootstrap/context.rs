@@ -56,7 +56,11 @@ impl GuardianContext {
     }
 
     pub const fn negotiated_limits(&self) -> EnforcedControlLimits {
-        self.hello.limits
+        self.hello.negotiated.limits()
+    }
+
+    pub const fn negotiated_protocol(&self) -> lasper_guest_protocol::NegotiatedProtocol {
+        self.hello.negotiated
     }
 
     pub const fn hello_completed_at_ms(&self) -> u64 {
@@ -78,6 +82,8 @@ impl GuardianContext {
         self.supervisor.status()
     }
 
+    /// After request and supervisor checks pass, failures still consume this
+    /// context's only worker creation attempt.
     pub fn spawn<'a>(
         &self,
         request: &'a PrepareRequestFrame<'a>,
@@ -94,6 +100,18 @@ impl GuardianContext {
                 actual: request.broker_id(),
             });
         }
+        // Ready exports all endpoints together. Reject before forking rather
+        // than creating a worker whose descriptors cannot reach the host.
+        let required = lasper_guest_protocol::PrepareReady::descriptor_count_for(
+            request.request().execution(),
+        );
+        let available = self.negotiated_limits().get().max_descriptors();
+        if required > available {
+            return Err(GuardianError::ReadyDescriptorCapacity {
+                required,
+                available,
+            });
+        }
         self.supervisor.ensure_alive()?;
         self.session_created.set(true);
         // SAFETY: Only the non-returning fork entry can create this context.
@@ -101,7 +119,7 @@ impl GuardianContext {
         unsafe {
             SessionGuardian::spawn(
                 &self.connection,
-                self.hello.limits,
+                self.hello.negotiated,
                 request,
                 preparation,
                 now_ms,

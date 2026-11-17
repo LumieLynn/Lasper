@@ -13,6 +13,7 @@ pub struct Broker {
     pub child: Child,
     pub directory: PathBuf,
     stopped: bool,
+    guest: bool,
 }
 impl Broker {
     pub fn spawn(privileged: bool) -> Self {
@@ -38,6 +39,7 @@ impl Broker {
             child,
             directory,
             stopped: false,
+            guest,
         };
         broker.wait_listener();
         broker
@@ -62,6 +64,7 @@ impl Broker {
             child,
             directory,
             stopped: false,
+            guest: false,
         };
         broker.wait_listener();
         broker
@@ -85,6 +88,7 @@ impl Broker {
             child,
             directory,
             stopped: false,
+            guest: false,
         };
         broker.wait_listener();
         broker
@@ -122,6 +126,9 @@ impl Broker {
     }
     pub fn restart_with_umask(&mut self, privileged: bool, mask: Option<libc::mode_t>) {
         let mut command = command(&self.directory, privileged);
+        if self.guest {
+            command.arg("--guest");
+        }
         if let Some(mask) = mask {
             command.args(["--umask", &format!("{mask:o}")]);
         }

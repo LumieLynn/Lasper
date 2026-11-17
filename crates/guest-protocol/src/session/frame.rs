@@ -1,9 +1,13 @@
+//! Envelope and correlation checks shared by descriptor-free session codecs.
+//! These helpers bind replies to requests and preparations. The selected version,
+//! capacities and feature gates are checked by NegotiatedProtocol.
+
 use serde::Serialize;
 
-use crate::messages::encode_json_payload;
+use crate::json::encode_json_payload;
 use crate::{
     BrokerId, ControlFrameError, ControlFrameHeader, ControlFrameHeaderError, MessageKind,
-    PayloadCodecError, PreparationId, PrepareRequestFrame,
+    PayloadCodecError, PreparationId,
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -11,16 +15,19 @@ pub enum SessionPayloadError {
     Payload(PayloadCodecError),
     BrokerMismatch,
     PreparationMismatch,
-    UnrequestedProjection,
+    FeatureNotNegotiated,
     InvalidTerminalSize,
     InvalidExecutionTimeout,
     InvalidResponse,
 }
 
+/// A malformed or mismatched frame, distinct from a valid guest rejection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionFrameError {
     Frame(ControlFrameError),
     Header(ControlFrameHeaderError),
+    ProtocolVersion(crate::ProtocolVersionMismatch),
+    Limit(crate::ControlLimitError),
     Payload(SessionPayloadError),
     UnexpectedMessageKind { actual: MessageKind },
     MismatchedRequestId { expected: u64, actual: u64 },
@@ -51,12 +58,12 @@ pub(super) fn validate_session_frame(
 }
 
 pub(super) fn validate_token(
-    request: &PrepareRequestFrame<'_>,
+    expected_broker_id: BrokerId,
     expected_preparation_id: PreparationId,
     broker_id: BrokerId,
     preparation_id: PreparationId,
 ) -> Result<(), SessionPayloadError> {
-    if broker_id != request.broker_id() {
+    if broker_id != expected_broker_id {
         return Err(SessionPayloadError::BrokerMismatch);
     }
     if preparation_id != expected_preparation_id {
@@ -82,13 +89,14 @@ pub(super) fn check_reply(
 }
 
 pub(super) fn encode_frame(
+    version: crate::ProtocolVersion,
     kind: MessageKind,
     request_id: u64,
     value: &impl Serialize,
     payload: &mut [u8],
 ) -> Result<(ControlFrameHeader, usize), SessionFrameError> {
     let length = encode_json_payload(value, payload).map_err(codec_error)?;
-    let header = ControlFrameHeader::new(kind, request_id, length as u32, 0)
+    let header = ControlFrameHeader::new_with_version(version, kind, request_id, length as u32, 0)
         .map_err(SessionFrameError::Header)?;
     Ok((header, length))
 }

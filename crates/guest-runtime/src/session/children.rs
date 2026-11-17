@@ -19,6 +19,8 @@ pub enum CleanupProgress {
     Complete,
 }
 
+// The guardian is a subreaper. Descendants that leave the worker's process group
+// are found through adoption, so killing the original group alone is not enough.
 pub(super) struct Children {
     guardian_pid: i32,
     guardian_tid: i32,

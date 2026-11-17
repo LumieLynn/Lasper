@@ -12,6 +12,15 @@ mod hello;
 #[path = "control.rs"]
 pub mod wire;
 
+pub fn protocol() -> lasper_guest_protocol::NegotiatedProtocol {
+    use lasper_guest_protocol::*;
+    negotiate_hello(
+        HelloRequest::new(FeatureSet::EMPTY, ControlLimits::CURRENT).unwrap(),
+        HelloOffer::local(ControlLimits::CURRENT),
+    )
+    .unwrap()
+}
+
 pub struct ForkedGuardian {
     pub control: UnixStream,
     broker: PipeWriter,
@@ -21,6 +30,13 @@ pub struct ForkedGuardian {
 
 impl ForkedGuardian {
     pub fn spawn(entry: fn(GuardianContext) -> i32) -> Self {
+        Self::spawn_with_limits(entry, lasper_guest_protocol::ControlLimits::CURRENT)
+    }
+
+    pub fn spawn_with_limits(
+        entry: fn(GuardianContext) -> i32,
+        limits: lasper_guest_protocol::ControlLimits,
+    ) -> Self {
         let (control, child_control) = UnixStream::pair().unwrap();
         let (child_broker, broker) = std::io::pipe().unwrap();
         let accepted_at = crate::linux::monotonic_ms().unwrap();
@@ -50,7 +66,7 @@ impl ForkedGuardian {
             reaped: false,
         };
         guardian.broker.write_all(&[GUARDIAN_START_BYTE]).unwrap();
-        hello::exchange(&mut guardian.control);
+        hello::exchange_with_limits(&mut guardian.control, limits);
         guardian
     }
 

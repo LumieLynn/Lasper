@@ -18,6 +18,7 @@ pub struct PreparedWorker<'payload> {
     ready: PrepareReadyFrame,
     target: Arc<MachineTarget>,
     terminal: Option<OwnedFd>,
+    pipes: Option<(OwnedFd, OwnedFd)>,
     identity: IdentityWorker<'payload>,
 }
 
@@ -35,8 +36,9 @@ impl<'payload> PreparedWorker<'payload> {
             ));
         }
         let (header, payload, descriptors) = frame.into_parts();
-        let ready = request
-            .decode_ready_parts(header, &payload, descriptors.len())
+        let ready = readiness
+            .protocol()
+            .decode_ready(&request, header, &payload, descriptors.len())
             .map_err(|error| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -54,16 +56,30 @@ impl<'payload> PreparedWorker<'payload> {
         // The protocol decoder has checked the exact count and role order.
         let channel = descriptors.next().expect("PrepareReady identity channel");
         let pidfd = descriptors.next().expect("PrepareReady worker pidfd");
+        let pipes = if request.request().execution() == lasper_guest_protocol::ExecutionKind::Piped
+        {
+            Some((
+                descriptors.next().expect("PrepareReady stdout"),
+                descriptors.next().expect("PrepareReady stderr"),
+            ))
+        } else {
+            None
+        };
+        if let Some((stdout, stderr)) = &pipes {
+            verify_pipe(stdout.as_fd())?;
+            verify_pipe(stderr.as_fd())?;
+        }
         let process = WorkerProcess::open(pidfd)?;
         target.verify_worker(&process)?;
         if let Some(terminal) = &terminal {
             verify_terminal(terminal.as_fd(), &process)?;
         }
-        let channel = UnixIdentityChannel::new(channel, ready)?;
+        let channel = UnixIdentityChannel::new(channel, ready, readiness.profile())?;
         Ok(Self {
             ready,
             target,
             terminal,
+            pipes,
             identity: IdentityWorker::new(channel, request, process),
         })
     }
@@ -76,8 +92,12 @@ impl<'payload> PreparedWorker<'payload> {
         self.terminal.as_ref().map(AsFd::as_fd)
     }
 
-    pub(crate) fn into_terminal(self) -> Option<OwnedFd> {
-        self.terminal
+    pub(crate) fn take_io(&mut self) -> PreparedIo {
+        match (self.terminal.take(), self.pipes.take()) {
+            (Some(pty), None) => PreparedIo::Terminal(pty),
+            (None, Some((stdout, stderr))) => PreparedIo::Pipes { stdout, stderr },
+            _ => unreachable!("prepared data descriptors were already delivered"),
+        }
     }
 
     pub fn process(&self) -> &WorkerProcess {
@@ -90,8 +110,8 @@ impl<'payload> PreparedWorker<'payload> {
         self.identity.can_continue()
     }
 
-    /// Checks the reply and, for interactive workers, the terminal assignment.
-    /// The same target instance is checked before and after the reply.
+    /// Checks the identity reply against the pinned target and assigned worker.
+    /// While this owner retains the PTY, it also checks terminal ownership.
     /// The caller supplies the deadline; cancellation invalidates preparation.
     pub async fn observe(&mut self) -> io::Result<WorkerObservation> {
         let result = async {
@@ -152,5 +172,36 @@ fn verify_terminal(terminal: BorrowedFd<'_>, worker: &WorkerProcess) -> io::Resu
         }
     }
     worker.recheck()?;
+    Ok(())
+}
+
+/// Data descriptors received in Ready. These do not retain the control owner.
+#[derive(Debug)]
+pub enum PreparedIo {
+    Terminal(OwnedFd),
+    Pipes { stdout: OwnedFd, stderr: OwnedFd },
+}
+
+fn verify_pipe(fd: BorrowedFd<'_>) -> io::Result<()> {
+    let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fstat writes one stat to the live output slot; fcntl only reads flags.
+    let flags = unsafe {
+        if libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        libc::fcntl(fd.as_raw_fd(), libc::F_GETFL)
+    };
+    if flags < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: fstat succeeded above.
+    if unsafe { stat.assume_init() }.st_mode & libc::S_IFMT != libc::S_IFIFO
+        || flags & libc::O_ACCMODE != libc::O_RDONLY
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "PrepareReady output is not a pipe read end",
+        ));
+    }
     Ok(())
 }

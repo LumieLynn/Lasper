@@ -5,12 +5,10 @@ use super::fixture::{
 use crate::control::{receive_guest_frame, send_guest_frame};
 use crate::session_clock::{advance_with_queued_frame, assert_expired, drive_io, snapshot};
 use crate::worker::TestWorker;
-use lasper_guest_host_transport::{
-    BrokerSessionError, SessionPhase, SessionStartOptions, StartOutcome,
-};
+use lasper_guest_host_transport::{BrokerSessionError, SessionPhase, StartOptions, StartOutcome};
 use lasper_guest_protocol::{
-    CapturedOutput, CleanupStatus, ExecutionStatus, ExitFrame, ExitReason, ExitReport, ExitStatus,
-    OutputStream, PreparationControl, PreparationControlKind, StartAcceptedFrame, StartFrame,
+    CleanupStatus, ExecutionStatus, ExitFrame, ExitReason, ExitReport, ExitStatus,
+    PreparationControl, PreparationControlKind, StartAcceptedFrame,
 };
 use std::time::Duration;
 
@@ -49,7 +47,6 @@ async fn expired_keep(with_ack: bool, wrong_preparation: bool) {
             reply(&guest, keep, 45_000);
         }
         if wrong_preparation {
-            let empty = OutputStream::new(&[], false, true).unwrap();
             let report = ExitFrame::new(
                 &request,
                 lasper_guest_protocol::PreparationId::new([0x9a; 16]),
@@ -60,11 +57,12 @@ async fn expired_keep(with_ack: bool, wrong_preparation: bool) {
                     ExitReason::LeaseExpired,
                 )
                 .unwrap(),
-                Some(CapturedOutput::new(empty, empty).unwrap()),
             )
             .unwrap();
             let mut bytes = [0; 4096];
-            let (header, length) = report.encode_parts(&mut bytes).unwrap();
+            let (header, length) = super::fixture::protocol()
+                .encode_exit(&report, &mut bytes)
+                .unwrap();
             send_guest_frame(&guest, header, &bytes[..length], &[]).unwrap();
         } else {
             final_exit(&guest, &request, ExitReason::LeaseExpired);
@@ -91,16 +89,13 @@ async fn expired_keep(with_ack: bool, wrong_preparation: bool) {
         Err(BrokerSessionError::Deadline)
     ));
     drop(recheck);
-    let failed = snapshot(&mut state, |state| state.phase() == SessionPhase::Failed).await;
+    let failed = snapshot(&mut state, |state| state.phase() == SessionPhase::Finished).await;
     assert_expired(&failed);
     if wrong_preparation {
-        assert!(failed.exit().is_none());
+        assert!(failed.report.is_none());
     } else {
-        assert_eq!(
-            failed.exit().unwrap().report().reason(),
-            ExitReason::LeaseExpired
-        );
-        assert!(failed.exit().unwrap().report().is_final());
+        assert_eq!(failed.report.unwrap().reason(), ExitReason::LeaseExpired);
+        assert!(failed.report.unwrap().is_final());
     }
     assert!(matches!(
         session.recheck().await,
@@ -119,6 +114,175 @@ async fn start_delivery_expiry_keeps_the_execution_report() {
     expired_start(true).await;
 }
 
+#[tokio::test]
+async fn start_ack_timeout_retains_the_connection_for_late_acceptance_and_close() {
+    for late_acceptance in [false, true] {
+        let (starting, started) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let server = Server::spawn(move |guest, request| {
+            let _worker = ready(&guest, &request, 45_000);
+            reply(&guest, command(&guest, &request), 45_000);
+            let mut bytes = [0; 4096];
+            let frame = receive_guest_frame(&guest, &mut bytes).unwrap();
+            let start_id = frame.header().request_id();
+            assert_eq!(
+                frame.header().kind(),
+                lasper_guest_protocol::MessageKind::Start
+            );
+            drop(frame);
+            starting.send(()).unwrap();
+            released.recv_timeout(Duration::from_secs(3)).unwrap();
+            if late_acceptance {
+                let accepted =
+                    StartAcceptedFrame::new(start_id, PreparationControl::new(BROKER, PREPARATION));
+                let (header, length) = super::fixture::protocol()
+                    .encode_start_accepted(&accepted, &mut bytes)
+                    .unwrap();
+                send_guest_frame(&guest, header, &bytes[..length], &[]).unwrap();
+            }
+            let close = command(&guest, &request);
+            assert_eq!(close.kind(), PreparationControlKind::Close);
+            reply(&guest, close, 0);
+            final_exit(&guest, &request, ExitReason::ClientClosed);
+            assert!(receive_guest_frame(&guest, &mut bytes).is_err());
+        });
+        let mut session = server.prepare().await;
+        let mut state = session.subscribe();
+        tokio::time::pause();
+        let mut start = Box::pin(session.start(StartOptions::default()));
+        drive_io(async {
+            tokio::select! {
+                result = &mut start => panic!("Start has not been acknowledged: {result:?}"),
+                result = started => result.unwrap(),
+            }
+        })
+        .await;
+        tokio::time::advance(Duration::from_millis(5001)).await;
+        assert!(matches!(
+            drive_io(&mut start).await,
+            Ok(StartOutcome::Unknown { .. })
+        ));
+        drop(start);
+        assert_eq!(session.snapshot().phase(), SessionPhase::Starting);
+        assert!(session.snapshot().error().is_none());
+        assert!(matches!(
+            session.start(StartOptions::default()).await,
+            Err(lasper_guest_host_transport::StartError::NotSubmitted(
+                BrokerSessionError::InvalidState(SessionPhase::Starting)
+            ))
+        ));
+        release.send(()).unwrap();
+        if late_acceptance {
+            snapshot(&mut state, |state| state.phase() == SessionPhase::Accepted).await;
+        }
+        drive_io(session.close()).await.unwrap();
+        let completion = drive_io(session.wait()).await;
+        assert!(completion.report.unwrap().is_final());
+        assert!(completion.error.is_none());
+        drive_io(server.finish()).await;
+        tokio::time::resume();
+    }
+}
+
+#[tokio::test]
+async fn cleanup_expiry_retains_a_queued_start_ack_and_final_exit() {
+    cleanup_expiry_retains_start_reply(false).await;
+}
+
+#[tokio::test]
+async fn cleanup_expiry_retains_a_queued_start_rejection_and_final_exit() {
+    cleanup_expiry_retains_start_reply(true).await;
+}
+
+async fn cleanup_expiry_retains_start_reply(rejected: bool) {
+    let (starting, started) = tokio::sync::oneshot::channel();
+    let (closing, closed) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let (sent, queued) = std::sync::mpsc::channel();
+    let server = Server::spawn(move |guest, request| {
+        let _worker = ready(&guest, &request, 45_000);
+        reply(&guest, command(&guest, &request), 45_000);
+        let mut bytes = [0; 4096];
+        let frame = receive_guest_frame(&guest, &mut bytes).unwrap();
+        let start_id = frame.header().request_id();
+        drop(frame);
+        starting.send(()).unwrap();
+        let close = command(&guest, &request);
+        assert_eq!(close.kind(), PreparationControlKind::Close);
+        closing.send(()).unwrap();
+        released.recv_timeout(Duration::from_secs(3)).unwrap();
+        let (header, length) = if rejected {
+            let error = lasper_guest_protocol::ErrorFrame::new(
+                start_id,
+                BROKER,
+                Some(PREPARATION),
+                lasper_guest_protocol::GuestOperation::Start,
+                lasper_guest_protocol::GuestErrorCode::InvalidState,
+                None,
+            )
+            .unwrap();
+            super::fixture::protocol()
+                .encode_error(&error, &mut bytes)
+                .unwrap()
+        } else {
+            let accepted =
+                StartAcceptedFrame::new(start_id, PreparationControl::new(BROKER, PREPARATION));
+            super::fixture::protocol()
+                .encode_start_accepted(&accepted, &mut bytes)
+                .unwrap()
+        };
+        send_guest_frame(&guest, header, &bytes[..length], &[]).unwrap();
+        reply(&guest, close, 0);
+        final_exit(&guest, &request, ExitReason::ClientClosed);
+        sent.send(()).unwrap();
+        assert!(receive_guest_frame(&guest, &mut bytes).is_err());
+    });
+    let mut session = server.prepare().await;
+    tokio::time::pause();
+    let mut start = Box::pin(session.start(StartOptions::default()));
+    drive_io(async {
+        tokio::select! {
+            result = &mut start => panic!("Start has not been acknowledged: {result:?}"),
+            result = started => result.unwrap(),
+        }
+    })
+    .await;
+    tokio::time::advance(Duration::from_millis(5001)).await;
+    assert!(matches!(
+        drive_io(&mut start).await,
+        Ok(StartOutcome::Unknown { .. })
+    ));
+    drop(start);
+    let mut close = Box::pin(session.close());
+    drive_io(async {
+        tokio::select! {
+            result = &mut close => panic!("cleanup is not acknowledged: {result:?}"),
+            result = closed => result.unwrap(),
+        }
+    })
+    .await;
+    advance_with_queued_frame(Duration::from_millis(15_001), release, queued).await;
+    assert!(matches!(
+        drive_io(close).await,
+        Err(BrokerSessionError::Deadline)
+    ));
+    let completion = drive_io(session.wait()).await;
+    assert_eq!(
+        completion.submission,
+        if rejected {
+            lasper_guest_host_transport::StartSubmission::Rejected
+        } else {
+            lasper_guest_host_transport::StartSubmission::Accepted
+        }
+    );
+    assert!(completion.report.unwrap().is_final());
+    assert!(matches!(
+        completion.error.as_deref(),
+        Some(BrokerSessionError::Deadline)
+    ));
+    drive_io(server.finish()).await;
+}
+
 async fn expired_start(accepted: bool) {
     let (starting, started) = tokio::sync::oneshot::channel();
     let (release_ack, ack_released) = std::sync::mpsc::channel();
@@ -130,15 +294,16 @@ async fn expired_start(accepted: bool) {
         reply(&guest, recheck, 45_000);
         let mut bytes = [0; 4096];
         let frame = receive_guest_frame(&guest, &mut bytes).unwrap();
-        let start = StartFrame::decode_for(
-            frame.header().request_id(),
-            &request,
-            PREPARATION,
-            frame.header(),
-            frame.payload(),
-            frame.descriptors().len(),
-        )
-        .unwrap();
+        let start = super::fixture::protocol()
+            .decode_start_frame(
+                frame.header().request_id(),
+                &request,
+                PREPARATION,
+                frame.header(),
+                frame.payload(),
+                frame.descriptors().len(),
+            )
+            .unwrap();
         drop(frame);
         starting.send(()).unwrap();
         if accepted {
@@ -147,7 +312,9 @@ async fn expired_start(accepted: bool) {
                 start.request_id(),
                 PreparationControl::new(BROKER, PREPARATION),
             );
-            let (header, length) = ack.encode_parts(&mut bytes).unwrap();
+            let (header, length) = super::fixture::protocol()
+                .encode_start_accepted(&ack, &mut bytes)
+                .unwrap();
             send_guest_frame(&guest, header, &bytes[..length], &[]).unwrap();
         }
         released.recv_timeout(Duration::from_secs(3)).unwrap();
@@ -161,7 +328,6 @@ async fn expired_start(accepted: bool) {
                 ExitReason::WorkerExited,
             )
             .unwrap(),
-            OutputStream::new(b"finished", false, true).unwrap(),
         );
         sent.send(()).unwrap();
         assert!(receive_guest_frame(&guest, &mut [0; 4096]).is_err());
@@ -169,7 +335,7 @@ async fn expired_start(accepted: bool) {
     let mut session = server.prepare().await;
     let mut state = session.subscribe();
     tokio::time::pause();
-    let mut start = Box::pin(session.start(SessionStartOptions::default()));
+    let mut start = Box::pin(session.start(StartOptions::default()));
     drive_io(async {
         tokio::select! {
             result = &mut start => panic!("Start has not been acknowledged: {result:?}"),
@@ -181,10 +347,7 @@ async fn expired_start(accepted: bool) {
     if accepted {
         // Leave Start unpolled once the ack can arrive so its result stays uncollected.
         release_ack.send(()).unwrap();
-        snapshot(&mut state, |state| {
-            state.phase() == SessionPhase::StartAccepted
-        })
-        .await;
+        snapshot(&mut state, |state| state.phase() == SessionPhase::Accepted).await;
     }
     advance_with_queued_frame(
         Duration::from_millis(if accepted { 15_001 } else { 5001 }),
@@ -192,23 +355,20 @@ async fn expired_start(accepted: bool) {
         queued,
     )
     .await;
-    let failed = snapshot(&mut state, |state| state.phase() == SessionPhase::Failed).await;
+    let failed = snapshot(&mut state, |state| state.phase() == SessionPhase::Finished).await;
     if accepted {
         assert_expired(&failed);
     } else {
         assert!(matches!(
             drive_io(&mut start).await,
-            Ok(StartOutcome::Unknown {
-                cause: BrokerSessionError::Deadline
-            })
+            Ok(StartOutcome::Unknown { cause }) if matches!(cause.as_ref(), BrokerSessionError::Deadline)
         ));
-        assert!(matches!(failed.error(), Some(BrokerSessionError::Deadline)));
+        assert!(failed.error().is_none());
     }
     drop(start);
-    let exit = failed.exit().unwrap();
-    assert!(exit.report().is_final());
-    assert_eq!(exit.report().execution(), ExecutionStatus::Started);
-    assert_eq!(exit.output().unwrap().stdout().bytes(), b"finished");
+    let exit = failed.report.unwrap();
+    assert!(exit.is_final());
+    assert_eq!(exit.execution(), ExecutionStatus::Started);
     drive_io(server.finish()).await;
 }
 
@@ -229,9 +389,8 @@ async fn expired_frame(complete: bool) {
     let (release, released) = std::sync::mpsc::channel();
     let (sent, queued) = std::sync::mpsc::channel();
     let server = Server::spawn(move |guest, request| {
-        let _worker = ready(&guest, &request, 45_000);
+        let _worker = ready(&guest, &request, 12_000);
         begun.recv_timeout(Duration::from_secs(3)).unwrap();
-        let empty = OutputStream::new(&[], false, true).unwrap();
         let exit = ExitFrame::new(
             &request,
             PREPARATION,
@@ -242,11 +401,12 @@ async fn expired_frame(complete: bool) {
                 ExitReason::LeaseExpired,
             )
             .unwrap(),
-            Some(CapturedOutput::new(empty, empty).unwrap()),
         )
         .unwrap();
         let mut payload = [0; 4096];
-        let (header, length) = exit.encode_parts(&mut payload).unwrap();
+        let (header, length) = super::fixture::protocol()
+            .encode_exit(&exit, &mut payload)
+            .unwrap();
         let bytes = [header.encode().as_slice(), &payload[..length]].concat();
         send_guest_fragment(&guest, &bytes[..1]);
         fragment.send(()).unwrap();
@@ -265,13 +425,13 @@ async fn expired_frame(complete: bool) {
     tokio::time::pause();
     begin.send(()).unwrap();
     drive_io(received).await.unwrap();
-    // Tokio rounds timers up to a millisecond, so exactly ten seconds can
+    // Tokio rounds timers up to a millisecond, so exactly four seconds can
     // leave Keep pending while the paused clock waits for the peer.
-    tokio::time::advance(Duration::from_millis(10_001)).await;
+    tokio::time::advance(Duration::from_millis(4001)).await;
     drive_io(renewal).await.unwrap();
     advance_with_queued_frame(Duration::from_millis(5001), release, queued).await;
-    let failed = snapshot(&mut state, |state| state.phase() == SessionPhase::Failed).await;
+    let failed = snapshot(&mut state, |state| state.phase() == SessionPhase::Finished).await;
     assert_expired(&failed);
-    assert_eq!(failed.exit().is_some(), complete);
+    assert_eq!(failed.report.is_some(), complete);
     drive_io(server.finish()).await;
 }

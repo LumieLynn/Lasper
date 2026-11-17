@@ -3,8 +3,8 @@ use lasper_guest_protocol::{
     StartRequest, MAX_PREPARED_LEASE_MS,
 };
 
-pub(super) const WORKER_SETUP_TIMEOUT_MS: u64 = 5_000;
-
+/// Execution and cleanup phases observed by the guardian. WireSessionState
+/// separately tracks requests and replies, including a rejected Start.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionPhase {
     Preparing,
@@ -74,8 +74,7 @@ pub enum SessionLifecycleError {
     InvalidTransition { phase: SessionPhase },
 }
 
-/// Start carries an inline path buffer, so its request stays out of the small
-/// results used by lease, control, and cleanup events.
+/// Keeps the accepted Start separate from lease and cleanup decisions.
 #[derive(Debug, Eq, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum StartDecision {
@@ -160,7 +159,7 @@ impl SessionLifecycle {
     ) -> Result<Self, SessionLifecycleError> {
         let mut lifecycle = Self::new(broker_id, preparation_id, now_ms, lease_ms)?;
         lifecycle.deadline_ms = now_ms
-            .checked_add(WORKER_SETUP_TIMEOUT_MS)
+            .checked_add(crate::policy::worker_setup_timeout_ms())
             .ok_or(SessionLifecycleError::ClockOverflow)?;
         lifecycle.state = State::Preparing;
         Ok(lifecycle)
@@ -276,7 +275,7 @@ impl SessionLifecycle {
         match (self.state, frame.kind()) {
             (State::AwaitingStart, PreparationControlKind::KeepPrepared) => {
                 let deadline_ms = now_ms
-                    .checked_add(u64::from(MAX_PREPARED_LEASE_MS))
+                    .checked_add(u64::from(self.lease_ms))
                     .ok_or(SessionLifecycleError::ClockOverflow)?;
                 self.deadline_ms = deadline_ms;
                 Ok(SessionAction::LeaseRenewed { deadline_ms })

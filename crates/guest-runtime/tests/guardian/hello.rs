@@ -81,7 +81,14 @@ fn request() -> Vec<u8> {
     let request = HelloRequest::new(FeatureSet::WORKER_PIDFD, ControlLimits::CURRENT).unwrap();
     let mut payload = [0; HELLO_PAYLOAD_BUFFER_BYTES];
     let length = request.encode_payload(&mut payload).unwrap();
-    let header = ControlFrameHeader::new(MessageKind::HelloRequest, 1, length as u32, 0).unwrap();
+    let header = ControlFrameHeader::new_with_version(
+        lasper_guest_protocol::ProtocolVersion { major: 1, minor: 0 },
+        MessageKind::HelloRequest,
+        1,
+        length as u32,
+        0,
+    )
+    .unwrap();
     let mut bytes = header.encode().to_vec();
     bytes.extend_from_slice(&payload[..length]);
     bytes
@@ -187,7 +194,14 @@ fn supervisor_stop() {
 fn invalid_payload() {
     let mut guardian = spawn("hello-invalid");
     guardian.release();
-    let header = ControlFrameHeader::new(MessageKind::HelloRequest, 1, 1, 0).unwrap();
+    let header = ControlFrameHeader::new_with_version(
+        lasper_guest_protocol::ProtocolVersion { major: 1, minor: 0 },
+        MessageKind::HelloRequest,
+        1,
+        1,
+        0,
+    )
+    .unwrap();
     guardian.control.write_all(&header.encode()).unwrap();
     guardian.control.write_all(b"{").unwrap();
     rejected(&mut guardian, "HelloPayload(InvalidJson)", 65);
@@ -196,8 +210,73 @@ fn invalid_payload() {
 fn hello_only() {
     let mut guardian = spawn("hello-probe");
     guardian.release();
-    guardian.hello();
+    guardian.control.write_all(&request()).unwrap();
+    let mut bytes = [0; CONTROL_FRAME_HEADER_BYTES];
+    guardian.control.read_exact(&mut bytes).unwrap();
+    let header = ControlFrameHeader::decode(&bytes).unwrap();
+    assert_eq!(header.kind(), MessageKind::HelloResponse);
+    let mut payload = vec![0; header.payload_bytes() as usize];
+    guardian.control.read_exact(&mut payload).unwrap();
+    let response = lasper_guest_protocol::HelloResponse::decode_payload(&payload).unwrap();
+    let local = lasper_guest_protocol::HelloOffer::local(ControlLimits::CURRENT);
+    assert_eq!(response.offer(), local);
+    let host = HelloRequest::new(FeatureSet::WORKER_PIDFD, ControlLimits::CURRENT).unwrap();
+    assert_eq!(
+        response.selected(),
+        lasper_guest_protocol::negotiate_hello(host, local)
+            .unwrap()
+            .selection()
+    );
     assert!(guardian.wait().success());
+    assert_eq!(guardian.control.read(&mut [0]).unwrap(), 0);
+}
+
+fn incompatible_offer() {
+    let mut guardian = spawn("hello-invalid");
+    guardian.release();
+    let local = lasper_guest_protocol::HelloOffer::local(ControlLimits::CURRENT);
+    let request = HelloRequest::from_offer(
+        lasper_guest_protocol::HelloOffer {
+            protocols: lasper_guest_protocol::ProtocolRange {
+                min_minor: local.protocols.max_minor + 1,
+                max_minor: local.protocols.max_minor + 1,
+                ..local.protocols
+            },
+            ..local
+        },
+        FeatureSet::EMPTY,
+    )
+    .unwrap();
+    let mut payload = [0; HELLO_PAYLOAD_BUFFER_BYTES];
+    let length = request.encode_payload(&mut payload).unwrap();
+    let header = ControlFrameHeader::new_with_version(
+        lasper_guest_protocol::ProtocolVersion { major: 1, minor: 0 },
+        MessageKind::HelloRequest,
+        1,
+        length as u32,
+        0,
+    )
+    .unwrap();
+    guardian.control.write_all(&header.encode()).unwrap();
+    guardian.control.write_all(&payload[..length]).unwrap();
+    let mut bytes = [0; CONTROL_FRAME_HEADER_BYTES];
+    guardian.control.read_exact(&mut bytes).unwrap();
+    let header = ControlFrameHeader::decode(&bytes).unwrap();
+    assert_eq!(header.kind(), MessageKind::HelloRejected);
+    guardian
+        .control
+        .read_exact(&mut payload[..header.payload_bytes() as usize])
+        .unwrap();
+    let response = lasper_guest_protocol::HelloRejected::decode_payload(
+        &payload[..header.payload_bytes() as usize],
+    )
+    .unwrap();
+    assert_eq!(response.offer, local);
+    assert!(matches!(
+        response.reason,
+        lasper_guest_protocol::CompatibilityError::NoCommonMinor { .. }
+    ));
+    rejected(&mut guardian, "NoCommonMinor", 65);
     assert_eq!(guardian.control.read(&mut [0]).unwrap(), 0);
 }
 
@@ -214,7 +293,58 @@ fn established_connection() {
     assert!(guardian.wait().success());
 }
 
+fn invalid_offer_rejection() {
+    for (low, high, supported, required, capacity) in
+        [(9, 0, 3, 0, 4096), (0, 0, 1, 2, 4096), (0, 0, 3, 0, 31)]
+    {
+        let mut guardian = spawn("hello-invalid-offer");
+        guardian.release();
+        let payload = format!(
+            r#"{{"offer":{{"protocols":{{"major":1,"min_minor":{low},"max_minor":{high}}},"supported_features":{supported},"limits":{{"max_control_frame_bytes":{capacity},"max_descriptors":4}}}},"required_features":{required}}}"#
+        );
+        let header = ControlFrameHeader::new_with_version(
+            lasper_guest_protocol::ProtocolVersion::BOOTSTRAP,
+            MessageKind::HelloRequest,
+            1,
+            payload.len() as u32,
+            0,
+        )
+        .unwrap();
+        guardian.control.write_all(&header.encode()).unwrap();
+        guardian.control.write_all(payload.as_bytes()).unwrap();
+        let mut bytes = [0; CONTROL_FRAME_HEADER_BYTES];
+        guardian.control.read_exact(&mut bytes).unwrap();
+        let header = ControlFrameHeader::decode(&bytes).unwrap();
+        assert_eq!(header.kind(), MessageKind::HelloRejected);
+        assert_eq!(header.request_id(), 1);
+        assert_eq!(header.descriptor_count(), 0);
+        let mut bytes = [0; HELLO_PAYLOAD_BUFFER_BYTES];
+        guardian
+            .control
+            .read_exact(&mut bytes[..header.payload_bytes() as usize])
+            .unwrap();
+        let rejected_offer = lasper_guest_protocol::HelloRejected::decode_payload(
+            &bytes[..header.payload_bytes() as usize],
+        )
+        .unwrap();
+        assert_eq!(
+            rejected_offer.reason,
+            lasper_guest_protocol::CompatibilityError::InvalidOffer
+        );
+        assert_eq!(
+            rejected_offer.offer,
+            lasper_guest_protocol::HelloOffer::local(ControlLimits::CURRENT)
+        );
+        rejected(&mut guardian, "InvalidOffer", 65);
+        assert_eq!(guardian.control.read(&mut [0]).unwrap(), 0);
+    }
+}
+
 pub(super) const SCENARIOS: &[(&str, fn())] = &[
+    (
+        "invalid host offers receive HelloRejected before the session starts",
+        invalid_offer_rejection,
+    ),
     ("Go without Hello expires with a live broker", || {
         incomplete_hello(0)
     }),
@@ -231,6 +361,10 @@ pub(super) const SCENARIOS: &[(&str, fn())] = &[
     ("supervisor stop interrupts partial Hello", supervisor_stop),
     ("invalid Hello never enters the session", invalid_payload),
     ("Hello-only probe creates no worker", hello_only),
+    (
+        "HelloRejected advertises the manifest offer",
+        incompatible_offer,
+    ),
     (
         "completed Hello is not an established-session idle timeout",
         established_connection,

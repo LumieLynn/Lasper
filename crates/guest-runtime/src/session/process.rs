@@ -1,3 +1,8 @@
+//! Guardian-side ownership of the worker's pidfd, channels and data endpoints.
+//!
+//! Ready transfers the data endpoints to the host. The guardian keeps the pidfd
+//! and status pipe so it can observe exec and reap the worker independently of I/O.
+
 use crate::linux::uapi::errno::EIO;
 use core::marker::PhantomData;
 use lasper_guest_protocol::{
@@ -17,8 +22,8 @@ use super::{GuardianError, WorkerExit};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WorkerObservation {
-    /// Worker account/session setup is complete. Ready delivery and Start
-    /// eligibility belong to the guardian's protocol phase.
+    /// Account, credentials, argv and environment are prepared. Ready delivery
+    /// and Start eligibility belong to SessionLifecycle.
     pub prepared: bool,
     pub start_requested: bool,
     pub exec: Option<ExecOutcome>,
@@ -31,9 +36,9 @@ pub struct WorkerObservation {
 /// Kernel resources for one guardian's worker. SessionLifecycle decides which
 /// operation wins; this owner performs it without replacing the assigned child.
 ///
-/// Polling and cleanup never block on child exit. Drop is a last-resort force
-/// cleanup and can wait indefinitely; this type belongs in the dedicated guest
-/// guardian, never in the host UI or an async executor.
+/// Normal cleanup progresses through poll without blocking on child exit.
+/// Drop force-kills remaining children and waits without a deadline, so the
+/// owning guardian must keep polling until cleanup completes.
 #[must_use = "the guardian must retain the worker until cleanup is complete"]
 pub(super) struct GuardianWorker<'a> {
     request: &'a PrepareRequestFrame<'a>,
@@ -78,6 +83,7 @@ impl<'a> GuardianWorker<'a> {
     pub unsafe fn spawn(
         request: &'a PrepareRequestFrame<'a>,
         preparation: PreparationId,
+        profile: &'static lasper_guest_protocol::ProtocolProfile,
         entry: fn(WorkerBootstrap<'_>) -> !,
     ) -> Result<Self, GuardianError> {
         let mut existing = false;
@@ -102,7 +108,7 @@ impl<'a> GuardianWorker<'a> {
         let (identity, child_identity) =
             linux::identity_pair().context("create worker identity channel")?;
         let (terminal, stdout, stderr, input, output, error) = match request.request().execution() {
-            ExecutionKind::Interactive => {
+            ExecutionKind::Terminal => {
                 let size = request
                     .request()
                     .initial_size()
@@ -117,7 +123,7 @@ impl<'a> GuardianWorker<'a> {
                     None,
                 )
             }
-            ExecutionKind::Bounded => {
+            ExecutionKind::Piped => {
                 let stdout = Pipe::new().context("create worker stdout")?;
                 let stderr = Pipe::new().context("create worker stderr")?;
                 stdout
@@ -151,8 +157,8 @@ impl<'a> GuardianWorker<'a> {
         let pid = unsafe { linux::fork() }.context("fork worker")?;
         if pid == 0 {
             // Entry never returns, so this child's inherited request frame
-            // stays alive through exec without copying its inline paths/argv.
-            entry(child.bootstrap(request, preparation));
+            // stays alive through exec without copying its argv views.
+            entry(child.bootstrap(request, preparation, profile));
         }
         drop(child);
         // This guardian alone owns wait. Even an early-exit child keeps its
@@ -299,9 +305,19 @@ impl<'a> GuardianWorker<'a> {
         let pidfd = self.pidfd.as_ref().ok_or(GuardianError::NotPrepared)?;
         let identity = self.identity.take().ok_or(GuardianError::NotPrepared)?;
         let terminal = self.terminal.take();
+        let stdout = self.stdout.take();
+        let stderr = self.stderr.take();
         let (fds, count) = match terminal.as_ref() {
-            Some(terminal) => ([terminal.raw(), identity.raw(), pidfd.raw()], 3),
-            None => ([identity.raw(), pidfd.raw(), -1], 2),
+            Some(terminal) => ([terminal.raw(), identity.raw(), pidfd.raw(), -1], 3),
+            None => (
+                [
+                    identity.raw(),
+                    pidfd.raw(),
+                    stdout.as_ref().ok_or(GuardianError::NotPrepared)?.raw(),
+                    stderr.as_ref().ok_or(GuardianError::NotPrepared)?.raw(),
+                ],
+                4,
+            ),
         };
         // The transport duplicates these endpoints before returning. Only its
         // pending sender then owns the export copies; observation keeps pidfd.
@@ -323,8 +339,6 @@ impl<'a> GuardianWorker<'a> {
         StartRequest::new(
             self.request,
             self.preparation,
-            start.wayland_display(),
-            start.x11_display(),
             start.terminal_size(),
             start.execution_timeout_ms(),
         )
@@ -332,8 +346,8 @@ impl<'a> GuardianWorker<'a> {
         Ok(())
     }
 
-    /// One small atomic write releases this worker. The pipe is private and
-    /// empty: a failed write is reported, never replayed to a replacement child.
+    /// Releases the worker with one atomic write to its private, empty pipe.
+    /// Failure is reported without starting a replacement worker.
     pub fn start(&mut self, start: &StartRequest) -> Result<(), GuardianError> {
         if self.start.requested() {
             return Err(GuardianError::AlreadyStarted);
@@ -370,19 +384,6 @@ impl<'a> GuardianWorker<'a> {
         self.children.begin(now_ms);
     }
 
-    pub fn read_stdout(&mut self, buffer: &mut [u8]) -> Result<usize, GuardianError> {
-        match &self.stdout {
-            Some(fd) => {
-                let count = fd.read(buffer).context("read worker stdout")?;
-                if count == 0 && !buffer.is_empty() {
-                    self.stdout = None;
-                }
-                Ok(count)
-            }
-            None => Ok(0),
-        }
-    }
-
     pub fn force_cleanup(&mut self) {
         if matches!(self.start, StartDelivery::Waiting(_)) {
             self.start = StartDelivery::Cancelled;
@@ -390,22 +391,7 @@ impl<'a> GuardianWorker<'a> {
         self.children.force();
     }
 
-    pub fn read_stderr(&mut self, buffer: &mut [u8]) -> Result<usize, GuardianError> {
-        match &self.stderr {
-            Some(fd) => {
-                let count = fd.read(buffer).context("read worker stderr")?;
-                if count == 0 && !buffer.is_empty() {
-                    self.stderr = None;
-                }
-                Ok(count)
-            }
-            None => Ok(0),
-        }
-    }
-
-    /// Status readiness, assigned-worker exit, and bounded output are all
-    /// pollable by the guardian event loop alongside its control/broker FDs.
-    pub fn poll_descriptors(&self) -> [i32; 4] {
+    pub fn poll_descriptors(&self) -> [i32; 2] {
         [
             self.status.descriptor(),
             if self.exit.is_none() {
@@ -413,14 +399,7 @@ impl<'a> GuardianWorker<'a> {
             } else {
                 -1
             },
-            self.stdout.as_ref().map_or(-1, Descriptor::raw),
-            self.stderr.as_ref().map_or(-1, Descriptor::raw),
         ]
-    }
-
-    pub fn close_output(&mut self) {
-        self.stdout.take();
-        self.stderr.take();
     }
 
     fn setup_ready(&self) -> bool {

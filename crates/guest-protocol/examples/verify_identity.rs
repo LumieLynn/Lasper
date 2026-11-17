@@ -2,9 +2,16 @@ use lasper_guest_protocol::{Architecture, RuntimeIdentity, IDENTITY_FRAME_BYTES}
 use std::io::Read;
 
 fn main() -> Result<(), String> {
-    let target = std::env::args()
-        .nth(1)
-        .ok_or_else(|| "expected a guest runtime target".to_string())?;
+    let mut arguments = std::env::args().skip(1);
+    if arguments.next().as_deref() != Some("--artifact-target") {
+        return Err("expected --artifact-target <target>".into());
+    }
+    let target = arguments
+        .next()
+        .ok_or_else(|| "expected an artifact target".to_string())?;
+    if arguments.next().is_some() {
+        return Err("unexpected artifact verification argument".into());
+    }
     let architecture = match target.as_str() {
         "x86_64-unknown-linux-musl" => Architecture::X86_64,
         "aarch64-unknown-linux-musl" => Architecture::Aarch64,

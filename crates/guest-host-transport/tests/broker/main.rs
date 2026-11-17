@@ -3,7 +3,8 @@ mod session;
 #[path = "../support/target.rs"]
 mod target;
 
-use lasper_guest_host_transport::{BrokerConnectError, BrokerConnection};
+use lasper_guest_host_transport::raw::BrokerConnection;
+use lasper_guest_host_transport::BrokerConnectError;
 use lasper_guest_protocol::ControlLimits;
 use std::future::Future;
 use std::io::{Read, Write};

@@ -7,10 +7,14 @@ use std::{fmt, io, sync::Arc};
 pub enum BrokerSessionError {
     Io(Arc<io::Error>),
     Protocol(SessionFrameError),
+    Wire(lasper_guest_protocol::WireSessionError),
     Rejected(ErrorFrame),
     InvalidRequest(String),
     InvalidState(SessionPhase),
-    ProjectionChanged,
+    UnsupportedFeatures {
+        required: lasper_guest_protocol::FeatureSet,
+        available: lasper_guest_protocol::FeatureSet,
+    },
     Deadline,
     DriverStopped,
 }
@@ -20,6 +24,7 @@ impl fmt::Display for BrokerSessionError {
         match self {
             Self::Io(error) => write!(f, "guest session: {error}"),
             Self::Protocol(error) => write!(f, "invalid guest session reply: {error:?}"),
+            Self::Wire(error) => write!(f, "invalid guest session sequence: {error:?}"),
             Self::Rejected(error) => {
                 write!(
                     f,
@@ -39,8 +44,12 @@ impl fmt::Display for BrokerSessionError {
             Self::InvalidState(phase) => {
                 write!(f, "guest session cannot accept this operation in {phase:?}")
             }
-            Self::ProjectionChanged => f.write_str(
-                "guest display evidence changed; recheck and prepare display access again",
+            Self::UnsupportedFeatures {
+                required,
+                available,
+            } => write!(
+                f,
+                "guest session requires features {required:?}, available {available:?}"
             ),
             Self::Deadline => f.write_str("guest session operation deadline expired"),
             Self::DriverStopped => f.write_str("guest session owner has stopped"),

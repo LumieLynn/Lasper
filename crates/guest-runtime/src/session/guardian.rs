@@ -1,11 +1,12 @@
 use crate::transport::{GuestControlStream, IoBudget};
 use core::task::Poll;
 use lasper_guest_protocol::{
-    EnforcedControlLimits, PreparationControl, PreparationControlFrame, PreparationId,
-    PrepareReadyFrame, PrepareRequestFrame, StartAcceptedFrame, StartFrame, MAX_PREPARED_LEASE_MS,
+    PreparationControl, PreparationControlFrame, PreparationId, PrepareReadyFrame,
+    PrepareRequestFrame, StartAcceptedFrame, StartFrame,
 };
 
 use super::process::GuardianWorker;
+use super::reply::{Payload, PendingReply, ReplyKind};
 use super::{
     CleanupProgress, CleanupReason, ExecOutcome, GuardianError, SessionAction, SessionConnection,
     SessionLifecycle, SessionPhase, StartDecision, WorkerBootstrap, WorkerObservation,
@@ -18,15 +19,15 @@ pub struct GuardianObservation {
     pub worker: WorkerObservation,
 }
 
-/// Owns the protocol decision and the assigned child through cleanup. All
-/// events are applied by one guardian loop; callers do not synchronize a second
-/// process registry with the preparation state.
+/// Applies lifecycle decisions to one assigned worker and its queued reply.
+/// The control loop checks wire ordering separately, so accepting Start and
+/// delivering StartAccepted are distinct events.
 pub struct SessionGuardian<'a, 'control> {
     session: SessionLifecycle,
     worker: GuardianWorker<'a>,
     connection: &'control GuestControlStream,
-    limits: EnforcedControlLimits,
-    pending: Option<super::ready::PendingReply<'control>>,
+    negotiated: lasper_guest_protocol::NegotiatedProtocol,
+    pending: Option<PendingReply<'control>>,
     ready_frame: Option<PrepareReadyFrame>,
     completed_ready: Option<PrepareReadyFrame>,
     execution_deadline_ms: Option<u64>,
@@ -35,7 +36,7 @@ pub struct SessionGuardian<'a, 'control> {
 impl<'a, 'control> SessionGuardian<'a, 'control> {
     pub(super) unsafe fn spawn(
         connection: &'control GuestControlStream,
-        limits: EnforcedControlLimits,
+        negotiated: lasper_guest_protocol::NegotiatedProtocol,
         request: &'a PrepareRequestFrame<'a>,
         preparation: PreparationId,
         now_ms: u64,
@@ -45,16 +46,17 @@ impl<'a, 'control> SessionGuardian<'a, 'control> {
             request.broker_id(),
             preparation,
             now_ms,
-            MAX_PREPARED_LEASE_MS,
+            crate::policy::prepared_lease_ms(),
         )
         .map_err(GuardianError::Lifecycle)?;
         // SAFETY: The caller guarantees exclusive child ownership and a fork-safe entry.
-        let worker = unsafe { GuardianWorker::spawn(request, preparation, entry) }?;
+        let worker =
+            unsafe { GuardianWorker::spawn(request, preparation, negotiated.profile(), entry) }?;
         Ok(Self {
             session: lifecycle,
             worker,
             connection,
-            limits,
+            negotiated,
             pending: None,
             ready_frame: None,
             completed_ready: None,
@@ -64,6 +66,10 @@ impl<'a, 'control> SessionGuardian<'a, 'control> {
 
     pub const fn pid(&self) -> i32 {
         self.worker.pid()
+    }
+
+    pub(super) const fn negotiated_protocol(&self) -> lasper_guest_protocol::NegotiatedProtocol {
+        self.negotiated
     }
 
     pub const fn phase(&self) -> SessionPhase {
@@ -143,7 +149,9 @@ impl<'a, 'control> SessionGuardian<'a, 'control> {
                 .map_err(GuardianError::Lifecycle)?,
             _ if worker.failure.is_some() => self.session.worker_failed(),
             _ if worker.exit.is_some() => self.session.worker_exited(),
-            _ if worker.error.is_some() => self.session.worker_failed(),
+            _ if worker.error.is_some() => {
+                self.session.fail(CleanupReason::WorkerObservationFailed)
+            }
             (SessionPhase::Starting, Some(outcome)) => self
                 .session
                 .exec_outcome(outcome)
@@ -180,7 +188,7 @@ impl<'a, 'control> SessionGuardian<'a, 'control> {
     ) -> Result<Poll<PrepareReadyFrame>, GuardianError> {
         self.poll(now_ms)?;
         if self.phase() == SessionPhase::AwaitingStart {
-            return Err(GuardianError::ReadyAlreadyTaken);
+            return Err(GuardianError::ReadyAlreadyDelivered);
         }
         if self.phase() == SessionPhase::Prepared {
             self.queue_ready(now_ms)?;
@@ -189,7 +197,7 @@ impl<'a, 'control> SessionGuardian<'a, 'control> {
             return Err(GuardianError::NotPrepared);
         }
         match self.flush(now_ms, budget)? {
-            Poll::Ready(super::ready::ReplyKind::Ready) => Ok(Poll::Ready(
+            Poll::Ready(ReplyKind::Ready) => Ok(Poll::Ready(
                 self.ready_frame.ok_or(GuardianError::NotPrepared)?,
             )),
             _ => Ok(Poll::Pending),
@@ -205,11 +213,11 @@ impl<'a, 'control> SessionGuardian<'a, 'control> {
             .map_err(GuardianError::Lifecycle)?;
         let remaining = self.remaining_lease_ms(now_ms);
         let result = self.worker.ready(remaining, |frame, descriptors| {
-            let frame = super::ready::Payload::ready(frame)?;
-            self.pending = Some(super::ready::PendingReply::new(
+            let frame = Payload::ready(frame, self.negotiated)?;
+            self.pending = Some(PendingReply::new(
                 self.connection,
-                self.limits,
-                super::ready::ReplyKind::Ready,
+                self.negotiated.limits(),
+                ReplyKind::Ready,
                 now_ms,
                 frame,
                 descriptors,
@@ -230,19 +238,16 @@ impl<'a, 'control> SessionGuardian<'a, 'control> {
 
     pub(super) fn queue_reply(
         &mut self,
-        kind: super::ready::ReplyKind,
+        kind: ReplyKind,
         now_ms: u64,
-        frame: (
-            lasper_guest_protocol::ControlFrameHeader,
-            super::ready::Payload,
-        ),
+        frame: (lasper_guest_protocol::ControlFrameHeader, Payload),
     ) -> Result<(), GuardianError> {
         if self.pending.is_some() {
             return Err(GuardianError::ReplyPending);
         }
-        self.pending = Some(super::ready::PendingReply::new(
+        self.pending = Some(PendingReply::new(
             self.connection,
-            self.limits,
+            self.negotiated.limits(),
             kind,
             now_ms,
             frame,
@@ -255,14 +260,14 @@ impl<'a, 'control> SessionGuardian<'a, 'control> {
         &mut self,
         now_ms: u64,
         budget: &mut IoBudget,
-    ) -> Result<Poll<super::ready::ReplyKind>, GuardianError> {
+    ) -> Result<Poll<ReplyKind>, GuardianError> {
         let Some(reply) = self.pending.as_mut() else {
             return Ok(Poll::Pending);
         };
         match reply.advance(now_ms, budget) {
             Ok(Poll::Ready(kind)) => {
                 self.pending.take();
-                if kind == super::ready::ReplyKind::Ready {
+                if kind == ReplyKind::Ready {
                     self.session
                         .ready_delivered()
                         .map_err(GuardianError::Lifecycle)?;
@@ -276,7 +281,7 @@ impl<'a, 'control> SessionGuardian<'a, 'control> {
                 self.pending.take();
                 self.fail(
                     now_ms,
-                    if kind == super::ready::ReplyKind::Ready {
+                    if kind == ReplyKind::Ready {
                         CleanupReason::ReadyDeliveryFailed
                     } else {
                         CleanupReason::ClientClosed
@@ -292,16 +297,12 @@ impl<'a, 'control> SessionGuardian<'a, 'control> {
         self.perform(action, now_ms);
     }
 
-    pub(super) fn close_output(&mut self) {
-        self.worker.close_output();
-    }
-
     pub(super) fn force_cleanup(&mut self, reason: CleanupReason) {
         self.session.fail(reason);
         if self
             .pending
             .as_ref()
-            .is_some_and(|reply| reply.kind() == super::ready::ReplyKind::Ready)
+            .is_some_and(|reply| reply.kind() == ReplyKind::Ready)
         {
             self.pending.take();
         }
@@ -318,14 +319,17 @@ impl<'a, 'control> SessionGuardian<'a, 'control> {
         }
     }
 
-    /// Acknowledges the one Start accepted for this assignment. This says
-    /// nothing about exec success; poll observations retain that separate result.
+    /// Releases the assigned worker and constructs StartAccepted. The caller
+    /// sends that acknowledgment; exec evidence arrives separately through poll.
     pub fn start(
         &mut self,
         now_ms: u64,
         frame: StartFrame,
     ) -> Result<StartAcceptedFrame, GuardianError> {
         self.poll(now_ms)?;
+        self.negotiated
+            .validate_start(frame.request())
+            .map_err(GuardianError::InvalidStart)?;
         self.worker.validate_start(frame.request())?;
         let execution_deadline_ms = frame
             .request()
@@ -380,15 +384,8 @@ impl<'a, 'control> SessionGuardian<'a, 'control> {
         Ok(action)
     }
 
-    pub fn read_stdout(&mut self, buffer: &mut [u8]) -> Result<usize, GuardianError> {
-        self.worker.read_stdout(buffer)
-    }
-
-    pub fn read_stderr(&mut self, buffer: &mut [u8]) -> Result<usize, GuardianError> {
-        self.worker.read_stderr(buffer)
-    }
-
-    pub fn poll_descriptors(&self) -> [i32; 4] {
+    /// Worker status and exit notification. Data endpoints belong to Ready.
+    pub fn poll_descriptors(&self) -> [i32; 2] {
         self.worker.poll_descriptors()
     }
 
@@ -396,7 +393,7 @@ impl<'a, 'control> SessionGuardian<'a, 'control> {
         if let SessionAction::BeginCleanup(_) = action {
             if matches!(
                 self.pending.as_ref().map(|reply| reply.kind()),
-                Some(super::ready::ReplyKind::Ready)
+                Some(ReplyKind::Ready)
             ) {
                 self.pending.take();
             }

@@ -1,11 +1,11 @@
-use crate::{ProtocolVersion, MAX_CONTROL_FRAME_BYTES, PROTOCOL_MAJOR, PROTOCOL_MINOR};
+use crate::{ProtocolVersion, MAX_CONTROL_FRAME_BYTES};
 
 const CONTROL_FRAME_MAGIC: [u8; 8] = *b"LSPGCTL1";
 const CONTROL_FRAME_FORMAT: u16 = 1;
 pub const CONTROL_FRAME_HEADER_BYTES: usize = 32;
 /// The byte that anchors descriptor rights to a frame.
 pub const CONTROL_FRAME_DESCRIPTOR_ANCHOR_BYTES: usize = 1;
-pub const MAX_CONTROL_DESCRIPTORS: u16 = 3;
+pub const MAX_CONTROL_DESCRIPTORS: u16 = crate::BUILD_CAPACITIES.max_control_descriptors;
 pub const MAX_CONTROL_PAYLOAD_BYTES: u32 =
     MAX_CONTROL_FRAME_BYTES - CONTROL_FRAME_HEADER_BYTES as u32;
 
@@ -23,6 +23,7 @@ pub enum MessageKind {
     Close = 9,
     Exit = 10,
     Error = 11,
+    HelloRejected = 12,
 }
 
 impl MessageKind {
@@ -39,6 +40,7 @@ impl MessageKind {
             9 => Ok(Self::Close),
             10 => Ok(Self::Exit),
             11 => Ok(Self::Error),
+            12 => Ok(Self::HelloRejected),
             _ => Err(ControlFrameHeaderError::UnknownMessageKind),
         }
     }
@@ -61,8 +63,10 @@ pub struct ControlFrameHeader {
 }
 
 impl ControlFrameHeader {
-    /// Creates a header only when its declared shape fits the wire limits.
-    pub const fn new(
+    /// Stores the supplied version without negotiating it. Callers supply the
+    /// bootstrap version for Hello and the selected version thereafter.
+    pub const fn new_with_version(
+        version: ProtocolVersion,
         kind: MessageKind,
         request_id: u64,
         payload_bytes: u32,
@@ -76,8 +80,8 @@ impl ControlFrameHeader {
         }
         Ok(Self {
             kind,
-            protocol_major: PROTOCOL_MAJOR,
-            protocol_minor: PROTOCOL_MINOR,
+            protocol_major: version.major,
+            protocol_minor: version.minor,
             request_id,
             payload_bytes,
             descriptor_count,
@@ -187,7 +191,7 @@ impl ControlFrameHeader {
         Ok(())
     }
 
-    /// Confirms that the supplied payload and descriptors match this header.
+    /// Confirms that the supplied payload length and FD count match this header.
     pub const fn validate_shape(
         self,
         payload_bytes: usize,
@@ -200,7 +204,8 @@ impl ControlFrameHeader {
         self.validate_descriptor_count(descriptor_count)
     }
 
-    /// Check attached FDs before allocating payload storage.
+    /// Checks the received count against the header declaration. Message codecs
+    /// check the expected count; the transport validates and owns the actual FDs.
     pub const fn validate_descriptor_count(
         self,
         descriptor_count: usize,
@@ -248,6 +253,7 @@ impl ControlFrameHeader {
     }
 }
 
+/// Borrowed header and payload bytes, without ancillary FD ownership or JSON validation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ControlFrame<'a> {
     header: ControlFrameHeader,
@@ -266,6 +272,8 @@ impl<'a> ControlFrame<'a> {
         Ok(frame)
     }
 
+    /// Parses the first complete frame and returns its byte length. Trailing
+    /// bytes may belong to another frame; ancillary FDs are handled separately.
     pub fn decode_prefix(bytes: &'a [u8]) -> Result<(Self, usize), ControlFrameError> {
         if bytes.len() < CONTROL_FRAME_HEADER_BYTES {
             return Err(ControlFrameError::TruncatedHeader {
@@ -351,194 +359,5 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn control_frame_round_trips_a_borrowed_payload() {
-        let payload = b"{\"operation\":\"prepare\"}";
-        let header =
-            ControlFrameHeader::new(MessageKind::PrepareRequest, 17, payload.len() as u32, 0)
-                .unwrap();
-        let mut output = [0; CONTROL_FRAME_HEADER_BYTES + 64];
-
-        let frame_bytes = header.encode_frame(payload, &mut output).unwrap();
-        let decoded = ControlFrame::decode(&output[..frame_bytes]).unwrap();
-
-        assert_eq!(decoded.header(), header);
-        assert_eq!(decoded.payload(), payload);
-    }
-
-    #[test]
-    fn control_frame_encoding_requires_matching_lengths_and_capacity() {
-        let header = ControlFrameHeader::new(MessageKind::PrepareRequest, 17, 4, 0).unwrap();
-        let mut output = [0; CONTROL_FRAME_HEADER_BYTES + 2];
-
-        assert_eq!(
-            header.encode_frame(b"abc", &mut output),
-            Err(ControlFrameError::PayloadLengthMismatch {
-                declared: 4,
-                actual: 3,
-            })
-        );
-        let descriptor_header =
-            ControlFrameHeader::new(MessageKind::PrepareRequest, 17, 3, 0).unwrap();
-        assert_eq!(
-            descriptor_header.validate_shape(3, 1),
-            Err(ControlFrameError::DescriptorCountMismatch {
-                declared: 0,
-                actual: 1,
-            })
-        );
-
-        let header = ControlFrameHeader::new(MessageKind::PrepareRequest, 17, 3, 0).unwrap();
-        assert_eq!(
-            header.encode_frame(b"abc", &mut output),
-            Err(ControlFrameError::OutputTooSmall {
-                required: CONTROL_FRAME_HEADER_BYTES + 3,
-                available: CONTROL_FRAME_HEADER_BYTES + 2,
-            })
-        );
-    }
-
-    #[test]
-    fn control_frame_decoding_rejects_incomplete_and_trailing_data() {
-        assert_eq!(
-            ControlFrame::decode(&[0; CONTROL_FRAME_HEADER_BYTES - 1]),
-            Err(ControlFrameError::TruncatedHeader {
-                actual: CONTROL_FRAME_HEADER_BYTES - 1,
-            })
-        );
-
-        let header = ControlFrameHeader::new(MessageKind::PrepareRequest, 17, 3, 0).unwrap();
-        let mut encoded = [0; CONTROL_FRAME_HEADER_BYTES + 3];
-        header.encode_frame(b"abc", &mut encoded).unwrap();
-
-        assert_eq!(
-            ControlFrame::decode(&encoded[..CONTROL_FRAME_HEADER_BYTES + 2]),
-            Err(ControlFrameError::TruncatedPayload {
-                declared: 3,
-                available: 2,
-            })
-        );
-        let mut trailing = [0; CONTROL_FRAME_HEADER_BYTES + 4];
-        trailing[..encoded.len()].copy_from_slice(&encoded);
-        assert_eq!(
-            ControlFrame::decode(&trailing),
-            Err(ControlFrameError::TrailingBytes {
-                expected: CONTROL_FRAME_HEADER_BYTES + 3,
-                actual: CONTROL_FRAME_HEADER_BYTES + 4,
-            })
-        );
-    }
-
-    #[test]
-    fn control_frame_prefix_decoding_preserves_a_coalesced_next_frame() {
-        let first_payload = b"first";
-        let second_payload = b"second";
-        let first =
-            ControlFrameHeader::new(MessageKind::HelloRequest, 1, first_payload.len() as u32, 0)
-                .unwrap();
-        let second = ControlFrameHeader::new(
-            MessageKind::HelloResponse,
-            2,
-            second_payload.len() as u32,
-            0,
-        )
-        .unwrap();
-        let first_bytes = CONTROL_FRAME_HEADER_BYTES + first_payload.len();
-        let total_bytes = first_bytes + CONTROL_FRAME_HEADER_BYTES + second_payload.len();
-        let mut stream = [0; CONTROL_FRAME_HEADER_BYTES * 2 + 11];
-        first
-            .encode_frame(first_payload, &mut stream[..first_bytes])
-            .unwrap();
-        second
-            .encode_frame(second_payload, &mut stream[first_bytes..total_bytes])
-            .unwrap();
-
-        let (decoded_first, consumed) =
-            ControlFrame::decode_prefix(&stream[..total_bytes]).unwrap();
-        let decoded_second = ControlFrame::decode(&stream[consumed..total_bytes]).unwrap();
-
-        assert_eq!(decoded_first.header(), first);
-        assert_eq!(decoded_first.payload(), first_payload);
-        assert_eq!(decoded_second.header(), second);
-        assert_eq!(decoded_second.payload(), second_payload);
-    }
-
-    #[test]
-    fn control_header_round_trips() {
-        let header = ControlFrameHeader::new(MessageKind::PrepareReady, 42, 4096, 2).unwrap();
-
-        assert_eq!(ControlFrameHeader::decode(&header.encode()), Ok(header));
-    }
-
-    #[test]
-    fn control_header_keeps_peer_protocol_version_for_negotiation() {
-        let mut encoded = ControlFrameHeader::new(MessageKind::HelloRequest, 7, 0, 0)
-            .unwrap()
-            .encode();
-        encoded[12..14].copy_from_slice(&9u16.to_le_bytes());
-        encoded[14..16].copy_from_slice(&3u16.to_le_bytes());
-
-        let decoded = ControlFrameHeader::decode(&encoded).unwrap();
-        assert_eq!(decoded.protocol_major(), 9);
-        assert_eq!(decoded.protocol_minor(), 3);
-    }
-
-    #[test]
-    fn control_header_rejects_unbounded_payloads_and_descriptors() {
-        assert_eq!(
-            ControlFrameHeader::new(
-                MessageKind::PrepareRequest,
-                1,
-                MAX_CONTROL_PAYLOAD_BYTES + 1,
-                0,
-            ),
-            Err(ControlFrameHeaderError::PayloadTooLarge)
-        );
-        assert_eq!(
-            ControlFrameHeader::new(MessageKind::PrepareReady, 1, 0, MAX_CONTROL_DESCRIPTORS + 1,),
-            Err(ControlFrameHeaderError::TooManyDescriptors)
-        );
-
-        let mut payload = ControlFrameHeader::new(MessageKind::PrepareRequest, 1, 0, 0)
-            .unwrap()
-            .encode();
-        payload[24..28].copy_from_slice(&(MAX_CONTROL_PAYLOAD_BYTES + 1).to_le_bytes());
-        assert_eq!(
-            ControlFrameHeader::decode(&payload),
-            Err(ControlFrameHeaderError::PayloadTooLarge)
-        );
-
-        let mut descriptors = ControlFrameHeader::new(MessageKind::PrepareReady, 1, 0, 0)
-            .unwrap()
-            .encode();
-        descriptors[28..30].copy_from_slice(&(MAX_CONTROL_DESCRIPTORS + 1).to_le_bytes());
-        assert_eq!(
-            ControlFrameHeader::decode(&descriptors),
-            Err(ControlFrameHeaderError::TooManyDescriptors)
-        );
-    }
-
-    #[test]
-    fn control_header_rejects_unknown_kinds_and_reserved_bits() {
-        let mut kind = ControlFrameHeader::new(MessageKind::HelloRequest, 1, 0, 0)
-            .unwrap()
-            .encode();
-        kind[10..12].copy_from_slice(&u16::MAX.to_le_bytes());
-        assert_eq!(
-            ControlFrameHeader::decode(&kind),
-            Err(ControlFrameHeaderError::UnknownMessageKind)
-        );
-
-        let mut reserved = ControlFrameHeader::new(MessageKind::HelloRequest, 1, 0, 0)
-            .unwrap()
-            .encode();
-        reserved[31] = 1;
-        assert_eq!(
-            ControlFrameHeader::decode(&reserved),
-            Err(ControlFrameHeaderError::ReservedBytesSet)
-        );
-    }
-}
+#[path = "../tests/frame/header.rs"]
+mod tests;

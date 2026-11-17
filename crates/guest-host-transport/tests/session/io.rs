@@ -1,9 +1,8 @@
 use super::fixture::{command, final_exit, ready, reply, send_guest_bytes, Server, PREPARATION};
 use lasper_guest_host_transport::SessionPhase;
 use lasper_guest_protocol::{
-    CapturedOutput, CleanupStatus, ControlReplyFrame, ControlReplyStatus, ExecutionStatus,
-    ExitFrame, ExitReason, ExitReport, OutputStream, PreparationControlKind,
-    CONTROL_FRAME_HEADER_BYTES,
+    CleanupStatus, ControlReplyFrame, ControlReplyStatus, ExecutionStatus, ExitFrame, ExitReason,
+    ExitReport, PreparationControlKind, CONTROL_FRAME_HEADER_BYTES,
 };
 use std::time::Duration;
 use tokio::time::timeout;
@@ -29,15 +28,16 @@ async fn cleanup_with_partial_reply(kind: PreparationControlKind, prefix: usize)
         let keep = command(&guest, &request);
         assert_eq!(keep.kind(), PreparationControlKind::KeepPrepared);
         let mut payload = [0; 512];
-        let (header, length) = ControlReplyFrame::new(
+        let response = ControlReplyFrame::new(
             keep,
             ControlReplyStatus::Prepared {
                 remaining_lease_ms: 45_000,
             },
         )
-        .unwrap()
-        .encode_parts(&mut payload)
         .unwrap();
+        let (header, length) = super::fixture::protocol()
+            .encode_control_reply(&response, &mut payload)
+            .unwrap();
         let bytes = [header.encode().as_slice(), &payload[..length]].concat();
         send_guest_bytes(&guest, &bytes[..prefix]);
         fragment.send(()).unwrap();
@@ -76,7 +76,7 @@ async fn cleanup_with_partial_reply(kind: PreparationControlKind, prefix: usize)
             let state = session.snapshot();
             assert!(state.error().is_none(), "{:?}", state.error());
             assert_ne!(state.phase(), SessionPhase::Prepared);
-            if state.phase() == SessionPhase::Closed {
+            if state.phase() == SessionPhase::Finished {
                 break;
             }
             session.changed().await.unwrap();
@@ -98,16 +98,11 @@ async fn a_partial_notification_does_not_block_lease_renewal() {
             ExitReason::LeaseExpired,
         )
         .unwrap();
-        let empty = OutputStream::new(&[], false, false).unwrap();
-        let exit = ExitFrame::new(
-            &request,
-            PREPARATION,
-            report,
-            Some(CapturedOutput::new(empty, empty).unwrap()),
-        )
-        .unwrap();
+        let exit = ExitFrame::new(&request, PREPARATION, report).unwrap();
         let mut payload = [0; 4096];
-        let (header, length) = exit.encode_parts(&mut payload).unwrap();
+        let (header, length) = super::fixture::protocol()
+            .encode_exit(&exit, &mut payload)
+            .unwrap();
         let bytes = [header.encode().as_slice(), &payload[..length]].concat();
         send_guest_bytes(&guest, &bytes[..1]);
         assert_eq!(
@@ -119,7 +114,7 @@ async fn a_partial_notification_does_not_block_lease_renewal() {
     });
     let mut session = server.prepare().await;
     timeout(Duration::from_secs(2), async {
-        while session.snapshot().phase() != SessionPhase::Closed {
+        while session.snapshot().phase() != SessionPhase::Finished {
             session.changed().await.unwrap();
         }
     })

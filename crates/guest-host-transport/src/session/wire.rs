@@ -1,8 +1,8 @@
 use super::BrokerSessionError;
 use crate::{BrokerConnection, ReceivedControlFrame};
 use lasper_guest_protocol::{
-    ControlFrameHeader, ErrorFrame, MessageKind, PayloadCodecError, PreparationId,
-    PrepareRequestFrame, MAX_EXECUTION_TIMEOUT_MS,
+    ControlFrameHeader, MessageKind, PayloadCodecError, PreparationId, PrepareRequestFrame,
+    MAX_EXECUTION_TIMEOUT_MS,
 };
 use std::fmt;
 use tokio::time::{timeout_at, Duration, Instant};
@@ -24,6 +24,10 @@ pub(super) fn execution_timeout_ms(duration: Duration) -> Result<u64, BrokerSess
 
 pub(super) fn encoding(error: impl fmt::Debug) -> BrokerSessionError {
     BrokerSessionError::InvalidRequest(format!("{error:?}"))
+}
+
+pub(super) fn sequence(error: lasper_guest_protocol::WireSessionError) -> BrokerSessionError {
+    BrokerSessionError::Wire(error)
 }
 
 pub(super) fn encode(
@@ -80,13 +84,14 @@ pub(super) async fn receive(
 }
 
 pub(super) fn rejection(
+    protocol: &lasper_guest_protocol::NegotiatedProtocol,
     request_header: ControlFrameHeader,
     request: &PrepareRequestFrame<'_>,
     preparation: Option<PreparationId>,
     frame: &ReceivedControlFrame,
 ) -> Result<(), BrokerSessionError> {
     if frame.header().kind() == MessageKind::Error {
-        return Err(BrokerSessionError::Rejected(ErrorFrame::decode_for(
+        return Err(BrokerSessionError::Rejected(protocol.decode_error(
             request_header,
             request,
             preparation,
@@ -99,39 +104,5 @@ pub(super) fn rejection(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn execution_budgets_round_up_without_wrapping() {
-        for (duration, expected) in [
-            (Duration::from_nanos(1), 1),
-            (Duration::from_millis(1), 1),
-            (Duration::from_nanos(1_000_001), 2),
-            (Duration::from_secs(120), 120_000),
-            (
-                Duration::from_millis(MAX_EXECUTION_TIMEOUT_MS) - Duration::from_nanos(1),
-                MAX_EXECUTION_TIMEOUT_MS,
-            ),
-            (
-                Duration::from_millis(MAX_EXECUTION_TIMEOUT_MS),
-                MAX_EXECUTION_TIMEOUT_MS,
-            ),
-        ] {
-            assert_eq!(execution_timeout_ms(duration).unwrap(), expected);
-        }
-        for duration in [
-            Duration::ZERO,
-            Duration::from_millis(MAX_EXECUTION_TIMEOUT_MS) + Duration::from_nanos(1),
-            Duration::from_millis(MAX_EXECUTION_TIMEOUT_MS + 1),
-            Duration::from_millis(u64::MAX),
-            Duration::from_millis(u64::MAX) + Duration::from_nanos(1),
-            Duration::MAX,
-        ] {
-            assert!(matches!(
-                execution_timeout_ms(duration),
-                Err(BrokerSessionError::InvalidRequest(_))
-            ));
-        }
-    }
-}
+#[path = "../../tests/session/wire.rs"]
+mod tests;

@@ -1,7 +1,12 @@
+//! Retains frame progress across polls of the session driver's event loop.
+//!
+//! Reads own received FDs immediately. Writes retain their next connection state
+//! until every byte has been sent; cancellation of a poll preserves both buffers.
+
 use super::{
     invalid_data, invalid_header, invalid_inbound_session, invalid_outbound_frame,
     invalid_outbound_session, recvmsg_once, sendmsg_once, shutdown_stream, validate_descriptors,
-    ControlFrameHeader, ControlSessionState, ReceivedControlFrame, UnixControlStream,
+    ControlConnectionState, ControlFrameHeader, ReceivedControlFrame, UnixControlStream,
     CONTROL_FRAME_DESCRIPTOR_ANCHOR_BYTES, CONTROL_FRAME_HEADER_BYTES,
 };
 use std::future::pending;
@@ -46,7 +51,7 @@ impl ControlIo {
     pub(super) async fn receive_frame(
         &mut self,
         stream: &UnixStream,
-        session: ControlSessionState,
+        session: ControlConnectionState,
     ) -> io::Result<ReceivedControlFrame> {
         loop {
             if let Some(frame) = self.input.advance(stream, session).await? {
@@ -147,7 +152,7 @@ impl UnixControlStream {
             return Err(invalid_data("control stream cannot be reused"));
         }
         let event = tokio::select! {
-            // Prefer writes so continuous guest output cannot delay Close.
+            // Prefer writes so incoming control reports cannot delay Close.
             biased;
             sent = async {
                 match &mut self.io.output {
@@ -212,7 +217,7 @@ impl Input {
     async fn advance(
         &mut self,
         stream: &UnixStream,
-        session: ControlSessionState,
+        session: ControlConnectionState,
     ) -> io::Result<Option<ReceivedControlFrame>> {
         loop {
             stream.readable().await?;
@@ -229,7 +234,7 @@ impl Input {
     fn try_advance(
         &mut self,
         stream: &UnixStream,
-        session: ControlSessionState,
+        session: ControlConnectionState,
         budget: usize,
     ) -> io::Result<(usize, Option<ReceivedControlFrame>)> {
         let read;
@@ -299,7 +304,7 @@ struct Output {
     header: [u8; CONTROL_FRAME_HEADER_BYTES],
     payload: Box<[u8]>,
     offset: usize,
-    session: ControlSessionState,
+    session: ControlConnectionState,
 }
 
 impl Output {

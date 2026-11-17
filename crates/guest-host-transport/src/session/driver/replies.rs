@@ -2,15 +2,40 @@ use super::control::{unexpected_reply, ReplyValue, RequestPurpose};
 use super::operation::Operation;
 use super::worker::Worker;
 use super::{renewal, Owner};
-use crate::session::{
-    BrokerSessionError, SessionExit, SessionPhase, StartOutcome, OPERATION_TIMEOUT,
-};
+use crate::session::{BrokerSessionError, SessionPhase, StartOutcome};
 use crate::ReceivedControlFrame;
-use lasper_guest_protocol::{ControlReplyStatus, ExitFrame, MessageKind};
-use std::sync::Arc;
+use lasper_guest_protocol::{ControlReplyStatus, ExitReport, MessageKind};
 use tokio::time::Instant;
 
 impl Owner<'_> {
+    pub(super) fn decode_reply(
+        &mut self,
+        expected: super::control::ExpectedReply,
+        frame: &ReceivedControlFrame,
+    ) -> Result<ReplyValue, BrokerSessionError> {
+        let decoded = expected.decode(
+            &self.hello.protocol(),
+            &self.request,
+            self.token.preparation_id(),
+            frame,
+        );
+        let reply = match &decoded {
+            Ok(ReplyValue::StartAccepted) => lasper_guest_protocol::WireReply::StartAccepted,
+            Ok(ReplyValue::Control(ControlReplyStatus::Prepared { .. })) => {
+                lasper_guest_protocol::WireReply::Prepared
+            }
+            Ok(ReplyValue::Control(ControlReplyStatus::CleanupRequested)) => {
+                lasper_guest_protocol::WireReply::CleanupRequested
+            }
+            Err(BrokerSessionError::Rejected(_)) => lasper_guest_protocol::WireReply::Rejected,
+            Err(_) => return decoded,
+        };
+        self.wire_state
+            .reply(frame.header().request_id(), expected.operation(), reply)
+            .map_err(crate::session::wire::sequence)?;
+        decoded
+    }
+
     pub(super) fn receive(
         &mut self,
         frame: ReceivedControlFrame,
@@ -23,9 +48,43 @@ impl Owner<'_> {
         if frame.header().kind() == MessageKind::Exit {
             return self.exit(frame);
         }
+        if self.state.borrow().report.is_some() {
+            let expected = if self
+                .retired
+                .is_some_and(|reply| reply.header().request_id() == frame.header().request_id())
+            {
+                self.retired.take()
+            } else {
+                self.pending.take().map(|pending| pending.expected)
+            }
+            .ok_or_else(unexpected_reply)?;
+            match self.decode_reply(expected, &frame) {
+                Ok(ReplyValue::StartAccepted) => self
+                    .state
+                    .send_modify(|s| s.submission = crate::StartSubmission::Accepted),
+                Err(BrokerSessionError::Rejected(_))
+                    if matches!(expected, super::control::ExpectedReply::Start(_)) =>
+                {
+                    self.state
+                        .send_modify(|s| s.submission = crate::StartSubmission::Rejected)
+                }
+                Ok(_) | Err(BrokerSessionError::Rejected(_)) => {}
+                Err(error) => return Err(error),
+            }
+            return Ok(());
+        }
         if let Some(expected) = self.retired {
             if expected.header().request_id() == frame.header().request_id() {
-                match expected.decode(&self.request, self.token.preparation_id(), &frame) {
+                match self.decode_reply(expected, &frame) {
+                    Ok(ReplyValue::StartAccepted) => self
+                        .state
+                        .send_modify(|s| s.submission = crate::StartSubmission::Accepted),
+                    Err(BrokerSessionError::Rejected(_))
+                        if matches!(expected, super::control::ExpectedReply::Start(_)) =>
+                    {
+                        self.state
+                            .send_modify(|s| s.submission = crate::StartSubmission::Rejected)
+                    }
                     Ok(_) | Err(BrokerSessionError::Rejected(_)) => {}
                     Err(error) => return Err(error),
                 }
@@ -34,17 +93,29 @@ impl Owner<'_> {
             }
         }
         let pending = self.pending.take().ok_or_else(unexpected_reply)?;
-        let value =
-            match pending
-                .expected
-                .decode(&self.request, self.token.preparation_id(), &frame)
-            {
-                Ok(value) => value,
-                Err(error) => {
-                    pending.reject(&error);
-                    return Err(error);
+        let value = match self.decode_reply(pending.expected, &frame) {
+            Ok(value) => value,
+            Err(error) => {
+                if matches!(pending.purpose, RequestPurpose::Start)
+                    && matches!(error, BrokerSessionError::Rejected(_))
+                {
+                    self.state.send_modify(|s| {
+                        s.submission = crate::StartSubmission::Rejected;
+                        s.phase = SessionPhase::Closing;
+                    });
+                    if let Some(operation) = self.operation.take() {
+                        operation.reject(error);
+                    }
+                    return self.begin_cleanup(super::control::CleanupRequest {
+                        kind: lasper_guest_protocol::PreparationControlKind::Close,
+                        deadline: Instant::now() + self.timeouts.cleanup_observation,
+                        reply: None,
+                    });
                 }
-            };
+                pending.reject(&error);
+                return Err(error);
+            }
+        };
         match (pending.purpose, value) {
             (
                 RequestPurpose::Keep,
@@ -65,20 +136,32 @@ impl Owner<'_> {
                 }
             }
             (RequestPurpose::Start, ReplyValue::StartAccepted) => {
-                let Some(Operation::Starting {
-                    reply, delivered, ..
-                }) = self.operation.take()
-                else {
-                    return Err(unexpected_reply());
+                self.set_phase(SessionPhase::Accepted);
+                self.state
+                    .send_modify(|s| s.submission = crate::StartSubmission::Accepted);
+                let Some(operation) = self.operation.take() else {
+                    // The caller already received Unknown when the Start
+                    // reply deadline elapsed. This late reply updates observers.
+                    return Ok(());
                 };
-                self.set_phase(SessionPhase::StartAccepted);
-                let terminal = self.worker.take_terminal();
-                if reply.send(Ok(StartOutcome::Accepted { terminal })).is_err() {
+                let (reply, delivered) = match operation {
+                    Operation::Starting {
+                        reply, delivered, ..
+                    } => (reply, delivered),
+                    operation @ Operation::Delivering { .. } => {
+                        // Unknown has been sent, but its caller has not yet
+                        // confirmed delivery. Keep that cancellation guard.
+                        self.operation = Some(operation);
+                        return Ok(());
+                    }
+                    _ => return Err(unexpected_reply()),
+                };
+                if reply.send(Ok(StartOutcome::Accepted)).is_err() {
                     self.abandon_start()?;
                 } else {
                     self.operation = Some(Operation::Delivering {
                         received: delivered,
-                        deadline: Instant::now() + OPERATION_TIMEOUT,
+                        deadline: Instant::now() + self.timeouts.cleanup_observation,
                     });
                 }
             }
@@ -107,29 +190,34 @@ impl Owner<'_> {
 
     fn exit(&mut self, frame: ReceivedControlFrame) -> Result<(), BrokerSessionError> {
         let exit = self.decode_exit(frame)?;
-        let phase = if exit.report().is_final() {
-            SessionPhase::Closed
+        self.wire_state
+            .exit(self.request.request_id(), exit.is_final())
+            .map_err(crate::session::wire::sequence)?;
+        let phase = if exit.is_final() {
+            SessionPhase::Finished
         } else {
-            self.limit_cleanup_observation(Instant::now() + OPERATION_TIMEOUT);
+            self.limit_cleanup_observation(Instant::now() + self.timeouts.cleanup_observation);
             SessionPhase::Closing
         };
         self.state.send_modify(|state| {
             state.phase = phase;
-            state.exit = Some(Arc::clone(&exit));
+            state.report = Some(exit);
         });
         if let Some(operation) = self.operation.take() {
             match operation {
                 Operation::Starting { reply, .. } => {
-                    let _ = reply.send(Ok(StartOutcome::Reported(Arc::clone(&exit))));
+                    let _ = reply.send(Ok(StartOutcome::Reported(exit)));
                 }
                 operation => {
                     operation.reject(BrokerSessionError::InvalidState(phase));
                 }
             }
         }
-        if let Some(pending) = self.pending.take() {
-            if let RequestPurpose::Cleanup(Some(reply)) = pending.purpose {
-                let _ = reply.send(Ok(()));
+        if let Some(pending) = self.pending.as_mut() {
+            if let RequestPurpose::Cleanup(reply) = &mut pending.purpose {
+                if let Some(reply) = reply.take() {
+                    let _ = reply.send(Ok(()));
+                }
             }
         }
         if let Some(cleanup) = self.cleanup.take() {
@@ -141,21 +229,20 @@ impl Owner<'_> {
             command.reject(BrokerSessionError::InvalidState(phase));
         }
         self.worker = Worker::Unavailable;
-        self.retired = None;
         Ok(())
     }
 
     pub(super) fn decode_exit(
         &self,
         frame: ReceivedControlFrame,
-    ) -> Result<Arc<SessionExit>, BrokerSessionError> {
-        let exit = ExitFrame::decode_for(
+    ) -> Result<ExitReport, BrokerSessionError> {
+        let exit = self.hello.protocol().decode_exit(
             &self.request,
             self.token.preparation_id(),
             frame.header(),
             frame.payload(),
             frame.descriptors().len(),
         )?;
-        Ok(Arc::new(SessionExit::decode(exit)?))
+        Ok(exit.report())
     }
 }

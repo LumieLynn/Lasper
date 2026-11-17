@@ -93,7 +93,10 @@ impl GuardianProcess {
     }
 
     pub fn hello(&mut self) {
-        hello::exchange(&mut self.control);
+        hello::exchange_with_limits(
+            &mut self.control,
+            lasper_guest_protocol::ControlLimits::CURRENT,
+        );
     }
 
     pub fn wait(&mut self) -> ExitStatus {

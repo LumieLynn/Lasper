@@ -82,7 +82,7 @@ impl TestWorker {
             )
         };
         let (master, slave) = if request.execution()
-            == lasper_guest_protocol::ExecutionKind::Interactive
+            == lasper_guest_protocol::ExecutionKind::Terminal
         {
             // SAFETY: posix_openpt creates an owned master; grantpt/unlockpt
             // prepare its slave and TIOCGPTPEER opens that same slave.
@@ -151,8 +151,13 @@ impl TestWorker {
                     libc::_exit(4);
                 }
             }
-            let mut channel =
-                unsafe { GuestIdentityChannel::from_raw_fd(guest.into_raw_fd(), preparation) };
+            let mut channel = unsafe {
+                GuestIdentityChannel::from_raw_fd(
+                    guest.into_raw_fd(),
+                    preparation,
+                    &lasper_guest_protocol::protocol_profiles()[0],
+                )
+            };
             let mut bytes = [0; MAX_IDENTITY_MESSAGE_BYTES];
             let mut observations = 0;
             while let Ok(challenge) = channel.receive_challenge(&mut bytes) {
@@ -198,7 +203,6 @@ impl TestWorker {
                     "alice",
                     unsafe { libc::getuid() },
                     unsafe { libc::getgid() },
-                    Default::default(),
                 ) else {
                     unsafe { libc::_exit(5) };
                 };

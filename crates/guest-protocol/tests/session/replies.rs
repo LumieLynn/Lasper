@@ -5,16 +5,13 @@ use lasper_guest_protocol::{
     SessionPayloadError, CONTROL_FRAME_HEADER_BYTES, MAX_PREPARED_LEASE_MS,
 };
 
-use super::support::{preparation, request, resized};
+use super::support::{preparation, protocol, request, resized};
 
 fn command(kind: PreparationControlKind) -> PreparationControlFrame {
     PreparationControlFrame::new(
         9,
         kind,
-        PreparationControl::new(
-            request(ExecutionKind::Interactive).broker_id(),
-            preparation(),
-        ),
+        PreparationControl::new(request(ExecutionKind::Terminal).broker_id(), preparation()),
     )
 }
 
@@ -59,9 +56,11 @@ fn control_replies_distinguish_live_preparations_from_requested_cleanup() {
 fn round_trip(command: PreparationControlFrame, status: ControlReplyStatus) {
     let reply = ControlReplyFrame::new(command, status).unwrap();
     let mut bytes = [0; 512];
-    let (header, length) = reply.encode_parts(&mut bytes).unwrap();
+    let (header, length) = protocol().encode_control_reply(&reply, &mut bytes).unwrap();
     assert_eq!(
-        ControlReplyFrame::decode_for(&command, header, &bytes[..length], 0).unwrap(),
+        protocol()
+            .decode_control_reply(&command, header, &bytes[..length], 0)
+            .unwrap(),
         reply
     );
 }
@@ -77,20 +76,27 @@ fn control_reply_is_bound_to_the_command_and_both_session_tokens() {
     )
     .unwrap();
     let mut bytes = [0; 512];
-    let (header, length) = reply.encode_parts(&mut bytes).unwrap();
+    let (header, length) = protocol().encode_control_reply(&reply, &mut bytes).unwrap();
     let payload = &bytes[..length];
-    let wrong_id = ControlFrameHeader::new(header.kind(), 10, length as u32, 0).unwrap();
+    let wrong_id = ControlFrameHeader::new_with_version(
+        lasper_guest_protocol::ProtocolVersion { major: 1, minor: 0 },
+        header.kind(),
+        10,
+        length as u32,
+        0,
+    )
+    .unwrap();
     assert!(matches!(
-        ControlReplyFrame::decode_for(&expected, wrong_id, payload, 0),
+        protocol().decode_control_reply(&expected, wrong_id, payload, 0),
         Err(SessionFrameError::MismatchedRequestId { .. })
     ));
     let other = command(PreparationControlKind::Recheck);
     assert!(matches!(
-        ControlReplyFrame::decode_for(&other, header, payload, 0),
+        protocol().decode_control_reply(&other, header, payload, 0),
         Err(SessionFrameError::UnexpectedMessageKind { .. })
     ));
     assert!(matches!(
-        ControlReplyFrame::decode_for(&expected, header, payload, 1),
+        protocol().decode_control_reply(&expected, header, payload, 1),
         Err(SessionFrameError::UnexpectedDescriptors { .. })
     ));
     for (broker, preparation, error) in [
@@ -100,7 +106,7 @@ fn control_reply_is_bound_to_the_command_and_both_session_tokens() {
             SessionPayloadError::BrokerMismatch,
         ),
         (
-            request(ExecutionKind::Interactive).broker_id(),
+            request(ExecutionKind::Terminal).broker_id(),
             PreparationId::new([1; 16]),
             SessionPayloadError::PreparationMismatch,
         ),
@@ -111,13 +117,13 @@ fn control_reply_is_bound_to_the_command_and_both_session_tokens() {
             PreparationControl::new(broker, preparation),
         );
         assert_eq!(
-            ControlReplyFrame::decode_for(&other, header, payload, 0),
+            protocol().decode_control_reply(&other, header, payload, 0),
             Err(SessionFrameError::Payload(error))
         );
     }
     let text = std::str::from_utf8(payload).unwrap().replace("100", "0");
     assert_eq!(
-        ControlReplyFrame::decode_for(&expected, resized(header, text.len()), text.as_bytes(), 0),
+        protocol().decode_control_reply(&expected, resized(header, text.len()), text.as_bytes(), 0),
         Err(SessionFrameError::Payload(
             SessionPayloadError::InvalidResponse
         ))
@@ -125,11 +131,48 @@ fn control_reply_is_bound_to_the_command_and_both_session_tokens() {
 }
 
 #[test]
+fn control_reply_rejects_extra_fields_at_every_object_level() {
+    let command = command(PreparationControlKind::Recheck);
+    let reply = ControlReplyFrame::new(
+        command,
+        ControlReplyStatus::Prepared {
+            remaining_lease_ms: 100,
+        },
+    )
+    .unwrap();
+    let mut bytes = [0; 512];
+    let (header, length) = protocol().encode_control_reply(&reply, &mut bytes).unwrap();
+    let payload = std::str::from_utf8(&bytes[..length]).unwrap();
+    for invalid in [
+        format!("{},\"unknown\":true}}", &payload[..payload.len() - 1]),
+        payload.replace("\"prepared\":{", "\"unknown\":true,\"prepared\":{"),
+        payload.replace(
+            "\"remaining_lease_ms\":100",
+            "\"remaining_lease_ms\":100,\"unknown\":true",
+        ),
+    ] {
+        assert!(
+            protocol()
+                .decode_control_reply(
+                    &command,
+                    resized(header, invalid.len()),
+                    invalid.as_bytes(),
+                    0,
+                )
+                .is_err(),
+            "{invalid}"
+        );
+    }
+}
+
+#[test]
 fn prepare_errors_can_precede_assignment_but_system_errors_require_errno() {
-    let request = request(ExecutionKind::Bounded);
+    let request = request(ExecutionKind::Piped);
     let mut bytes = [0; 512];
     let mut prepare_payload = [0; 1024];
-    request.encode_into(&mut prepare_payload).unwrap();
+    super::support::protocol()
+        .encode_prepare_frame(&request, &mut prepare_payload)
+        .unwrap();
     let prepare_header =
         ControlFrameHeader::decode(&prepare_payload[..CONTROL_FRAME_HEADER_BYTES]).unwrap();
     for (code, errno) in [
@@ -147,9 +190,10 @@ fn prepare_errors_can_precede_assignment_but_system_errors_require_errno() {
             errno,
         )
         .unwrap();
-        let (header, length) = reply.encode_parts(&mut bytes).unwrap();
+        let (header, length) = protocol().encode_error(&reply, &mut bytes).unwrap();
         assert_eq!(
-            ErrorFrame::decode_for(prepare_header, &request, None, header, &bytes[..length], 0)
+            protocol()
+                .decode_error(prepare_header, &request, None, header, &bytes[..length], 0)
                 .unwrap(),
             reply
         );
@@ -187,8 +231,15 @@ fn prepare_errors_can_precede_assignment_but_system_errors_require_errno() {
 
 #[test]
 fn error_reply_cannot_change_the_operation_or_preparation_being_rejected() {
-    let request = request(ExecutionKind::Bounded);
-    let start_header = ControlFrameHeader::new(MessageKind::Start, 9, 0, 0).unwrap();
+    let request = request(ExecutionKind::Piped);
+    let start_header = ControlFrameHeader::new_with_version(
+        lasper_guest_protocol::ProtocolVersion { major: 1, minor: 0 },
+        MessageKind::Start,
+        9,
+        0,
+        0,
+    )
+    .unwrap();
     let mut bytes = [0; 512];
     let reply = ErrorFrame::new(
         9,
@@ -199,25 +250,33 @@ fn error_reply_cannot_change_the_operation_or_preparation_being_rejected() {
         None,
     )
     .unwrap();
-    let (header, length) = reply.encode_parts(&mut bytes).unwrap();
+    let (header, length) = protocol().encode_error(&reply, &mut bytes).unwrap();
     assert_eq!(
-        ErrorFrame::decode_for(
-            start_header,
-            &request,
-            Some(preparation()),
-            header,
-            &bytes[..length],
-            0
-        )
-        .unwrap(),
+        protocol()
+            .decode_error(
+                start_header,
+                &request,
+                Some(preparation()),
+                header,
+                &bytes[..length],
+                0
+            )
+            .unwrap(),
         reply
     );
-    assert!(
-        ErrorFrame::decode_for(start_header, &request, None, header, &bytes[..length], 0).is_err()
-    );
-    let cancel_header = ControlFrameHeader::new(MessageKind::Cancel, 9, 0, 0).unwrap();
+    assert!(protocol()
+        .decode_error(start_header, &request, None, header, &bytes[..length], 0)
+        .is_err());
+    let cancel_header = ControlFrameHeader::new_with_version(
+        lasper_guest_protocol::ProtocolVersion { major: 1, minor: 0 },
+        MessageKind::Cancel,
+        9,
+        0,
+        0,
+    )
+    .unwrap();
     assert_eq!(
-        ErrorFrame::decode_for(
+        protocol().decode_error(
             cancel_header,
             &request,
             Some(preparation()),
@@ -233,7 +292,7 @@ fn error_reply_cannot_change_the_operation_or_preparation_being_rejected() {
         .unwrap()
         .replace("\"expired\"", "\"system\"");
     assert_eq!(
-        ErrorFrame::decode_for(
+        protocol().decode_error(
             start_header,
             &request,
             Some(preparation()),
@@ -249,9 +308,15 @@ fn error_reply_cannot_change_the_operation_or_preparation_being_rejected() {
 
 #[test]
 fn worker_rejections_preserve_and_validate_the_failed_stage() {
-    let request = request(ExecutionKind::Bounded);
-    let request_header =
-        ControlFrameHeader::new(MessageKind::PrepareRequest, request.request_id(), 0, 0).unwrap();
+    let request = request(ExecutionKind::Piped);
+    let request_header = ControlFrameHeader::new_with_version(
+        lasper_guest_protocol::ProtocolVersion { major: 1, minor: 0 },
+        MessageKind::PrepareRequest,
+        request.request_id(),
+        0,
+        0,
+    )
+    .unwrap();
     let reply = ErrorFrame::new(
         request.request_id(),
         request.broker_id(),
@@ -264,10 +329,10 @@ fn worker_rejections_preserve_and_validate_the_failed_stage() {
     .with_stage(Some(GuestFailureStage::HomeDirectory))
     .unwrap();
     let mut bytes = [0; 1024];
-    let (header, length) = reply.encode_parts(&mut bytes).unwrap();
-    let decoded =
-        ErrorFrame::decode_for(request_header, &request, None, header, &bytes[..length], 0)
-            .unwrap();
+    let (header, length) = protocol().encode_error(&reply, &mut bytes).unwrap();
+    let decoded = protocol()
+        .decode_error(request_header, &request, None, header, &bytes[..length], 0)
+        .unwrap();
     assert_eq!(decoded, reply);
     assert_eq!(decoded.stage(), Some(GuestFailureStage::HomeDirectory));
     assert_eq!(decoded.errno(), Some(13));
@@ -277,15 +342,16 @@ fn worker_rejections_preserve_and_validate_the_failed_stage() {
         text.replace("\"home_directory\"", "\"not_a_stage\""),
         text.replace("\"errno\":13", "\"errno\":0"),
     ] {
-        assert!(ErrorFrame::decode_for(
-            request_header,
-            &request,
-            None,
-            resized(header, invalid.len()),
-            invalid.as_bytes(),
-            0
-        )
-        .is_err());
+        assert!(protocol()
+            .decode_error(
+                request_header,
+                &request,
+                None,
+                resized(header, invalid.len()),
+                invalid.as_bytes(),
+                0
+            )
+            .is_err());
     }
     assert!(ErrorFrame::new(
         request.request_id(),

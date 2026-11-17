@@ -1,8 +1,8 @@
-use lasper_guest_host_transport::UnixIdentityChannel;
+use lasper_guest_host_transport::raw::UnixIdentityChannel;
 use lasper_guest_protocol::{
     BrokerId, CommandArgv, ExecutionKind, GuestIdentityReply, GuestProcess, IdentityChallenge,
     PreparationId, PrepareReady, PrepareReadyFrame, PrepareRequest, PrepareRequestFrame,
-    ProjectionRequests, MAX_IDENTITY_MESSAGE_BYTES,
+    MAX_IDENTITY_MESSAGE_BYTES,
 };
 use lasper_guest_runtime::identity::{GuestIdentityChannel, IdentityTransportError};
 use std::io::{self, Read};
@@ -35,11 +35,10 @@ fn seqpacket_pair() -> (OwnedFd, OwnedFd) {
 fn request() -> PrepareRequest<'static> {
     PrepareRequest::new(
         "alice",
-        ExecutionKind::Bounded,
+        ExecutionKind::Piped,
         GuestProcess::Command(CommandArgv::new(&["/usr/bin/id"]).unwrap()),
+        lasper_guest_protocol::ProcessEnvironment::default(),
         None,
-        None,
-        ProjectionRequests::default(),
     )
     .unwrap()
 }
@@ -64,22 +63,18 @@ fn ready_for(preparation_id: PreparationId) -> PrepareReadyFrame {
 }
 
 fn reply(challenge: IdentityChallenge) -> GuestIdentityReply {
-    GuestIdentityReply::new(
-        challenge,
-        &request(),
-        "alice",
-        1234,
-        5678,
-        Default::default(),
-    )
-    .unwrap()
+    GuestIdentityReply::new(challenge, &request(), "alice", 1234, 5678).unwrap()
 }
 
 fn guest(socket: OwnedFd) -> GuestIdentityChannel {
     // SAFETY: The socketpair created a connected blocking seqpacket endpoint;
     // ownership moves into the channel and is not retained elsewhere.
     unsafe {
-        GuestIdentityChannel::from_raw_fd(socket.into_raw_fd(), PreparationId::new([0x31; 16]))
+        GuestIdentityChannel::from_raw_fd(
+            socket.into_raw_fd(),
+            PreparationId::new([0x31; 16]),
+            &lasper_guest_protocol::protocol_profiles()[0],
+        )
     }
 }
 
@@ -122,7 +117,17 @@ fn receive_challenge(fd: RawFd) -> IdentityChallenge {
     // SAFETY: The kernel writes at most packet.len() bytes into this live array.
     let length = unsafe { libc::recv(fd, packet.as_mut_ptr().cast(), packet.len(), 0) };
     assert!(length > 0, "{}", io::Error::last_os_error());
-    IdentityChallenge::decode_packet(&packet[..length as usize]).unwrap()
+    profile()
+        .decode_identity_challenge(&packet[..length as usize])
+        .unwrap()
+}
+
+fn profile() -> &'static lasper_guest_protocol::ProtocolProfile {
+    lasper_guest_protocol::protocol_profile(lasper_guest_protocol::ProtocolVersion {
+        major: 1,
+        minor: 0,
+    })
+    .unwrap()
 }
 
 fn assert_peer_closed(mut peer: UnixStream) {
@@ -158,7 +163,7 @@ fn enable_sender_pidfd(socket: RawFd) -> bool {
     }
 }
 
-fn assert_pidfd_matches(credentials: &lasper_guest_host_transport::IdentityPeerCredentials) {
+fn assert_pidfd_matches(credentials: &lasper_guest_host_transport::raw::IdentityPeerCredentials) {
     if let Some(pidfd) = credentials.pidfd() {
         let information =
             std::fs::read_to_string(format!("/proc/self/fdinfo/{}", pidfd.as_raw_fd())).unwrap();
@@ -174,7 +179,12 @@ fn assert_pidfd_matches(credentials: &lasper_guest_host_transport::IdentityPeerC
 async fn host_configures_only_its_endpoint_for_nonblocking_io() {
     let (host, worker) = seqpacket_pair();
     let host_fd = host.as_raw_fd();
-    let _host = UnixIdentityChannel::new(host, ready()).unwrap();
+    let _host = UnixIdentityChannel::new(
+        host,
+        ready(),
+        &lasper_guest_protocol::protocol_profiles()[0],
+    )
+    .unwrap();
     // SAFETY: Both descriptors remain owned and live for these flag reads.
     unsafe {
         assert_ne!(libc::fcntl(host_fd, libc::F_GETFL) & libc::O_NONBLOCK, 0);
@@ -189,7 +199,12 @@ async fn host_configures_only_its_endpoint_for_nonblocking_io() {
 async fn identity_exchange_uses_kernel_credentials_and_can_recheck() {
     let (host, worker) = seqpacket_pair();
     let pidfd_supported = enable_sender_pidfd(host.as_raw_fd());
-    let mut host = UnixIdentityChannel::new(host, ready()).unwrap();
+    let mut host = UnixIdentityChannel::new(
+        host,
+        ready(),
+        &lasper_guest_protocol::protocol_profiles()[0],
+    )
+    .unwrap();
     let task = tokio::task::spawn_blocking(move || {
         let mut worker = guest(worker);
         let mut packet = [0; 2048];
@@ -220,7 +235,9 @@ fn guest_rejects_a_challenge_for_another_preparation() {
     let mut worker = guest(worker);
     let foreign = challenge_for(PreparationId::new([0x32; 16]), 0x72);
     let mut packet = [0; 2048];
-    let length = foreign.encode_packet(&mut packet).unwrap();
+    let length = profile()
+        .encode_identity_challenge(foreign, &mut packet)
+        .unwrap();
     send_packet(host.as_raw_fd(), &packet[..length], &[]);
     assert_eq!(
         worker.receive_challenge(&mut packet),
@@ -241,7 +258,9 @@ fn guest_rejects_a_kernel_generated_pidfd() {
     }
     let mut worker = guest(worker);
     let mut packet = [0; 2048];
-    let length = challenge(0x72).encode_packet(&mut packet).unwrap();
+    let length = profile()
+        .encode_identity_challenge(challenge(0x72), &mut packet)
+        .unwrap();
     send_packet(host.as_raw_fd(), &packet[..length], &[]);
     assert_eq!(
         worker.receive_challenge(&mut packet),
@@ -254,10 +273,14 @@ fn guest_rejects_a_kernel_generated_pidfd() {
 async fn host_rejects_stream_socket() {
     let (stream, _peer) = UnixStream::pair().unwrap();
     assert_eq!(
-        UnixIdentityChannel::new(stream.into(), ready())
-            .err()
-            .unwrap()
-            .kind(),
+        UnixIdentityChannel::new(
+            stream.into(),
+            ready(),
+            &lasper_guest_protocol::protocol_profiles()[0]
+        )
+        .err()
+        .unwrap()
+        .kind(),
         io::ErrorKind::InvalidInput
     );
 }
@@ -269,11 +292,18 @@ async fn host_rejects_replies_from_another_check_or_preparation() {
         challenge_for(PreparationId::new([0x32; 16]), 0x72),
     ] {
         let (host, worker) = seqpacket_pair();
-        let mut host = UnixIdentityChannel::new(host, ready()).unwrap();
+        let mut host = UnixIdentityChannel::new(
+            host,
+            ready(),
+            &lasper_guest_protocol::protocol_profiles()[0],
+        )
+        .unwrap();
         let task = tokio::task::spawn_blocking(move || {
             assert_eq!(receive_challenge(worker.as_raw_fd()), challenge(0x72));
             let mut packet = [0; 2048];
-            let length = reply(stale).encode_packet(&mut packet).unwrap();
+            let length = profile()
+                .encode_identity_reply(&reply(stale), &mut packet)
+                .unwrap();
             send_packet(worker.as_raw_fd(), &packet[..length], &[]);
         });
         let error = host.observe([0x72; 32], &request()).await.unwrap_err();
@@ -286,7 +316,12 @@ async fn host_rejects_replies_from_another_check_or_preparation() {
 #[tokio::test]
 async fn host_cancellation_invalidates_the_channel() {
     let (host, worker) = seqpacket_pair();
-    let mut host = UnixIdentityChannel::new(host, ready()).unwrap();
+    let mut host = UnixIdentityChannel::new(
+        host,
+        ready(),
+        &lasper_guest_protocol::protocol_profiles()[0],
+    )
+    .unwrap();
     let error = tokio::time::timeout(
         Duration::from_millis(20),
         host.observe([0x72; 32], &request()),
@@ -307,7 +342,12 @@ async fn host_cancellation_invalidates_the_channel() {
 #[tokio::test]
 async fn host_rejects_eof_without_waiting_for_credentials() {
     let (host, worker) = seqpacket_pair();
-    let mut host = UnixIdentityChannel::new(host, ready()).unwrap();
+    let mut host = UnixIdentityChannel::new(
+        host,
+        ready(),
+        &lasper_guest_protocol::protocol_profiles()[0],
+    )
+    .unwrap();
     let task = tokio::task::spawn_blocking(move || {
         let _ = receive_challenge(worker.as_raw_fd());
     });
@@ -326,7 +366,12 @@ async fn host_rejects_eof_without_waiting_for_credentials() {
 async fn host_rejects_rights_and_closes_delivered_fds_even_on_truncation() {
     for (bytes, descriptor_count) in [(1, 1), (MAX_IDENTITY_MESSAGE_BYTES + 1, 1), (1, 64)] {
         let (host, worker) = seqpacket_pair();
-        let mut host = UnixIdentityChannel::new(host, ready()).unwrap();
+        let mut host = UnixIdentityChannel::new(
+            host,
+            ready(),
+            &lasper_guest_protocol::protocol_profiles()[0],
+        )
+        .unwrap();
         let (transferred, peer) = UnixStream::pair().unwrap();
         let task = tokio::task::spawn_blocking(move || {
             let _ = receive_challenge(worker.as_raw_fd());
@@ -354,7 +399,9 @@ fn guest_retains_pending_challenge_after_pre_io_errors() {
         Err(IdentityTransportError::UnexpectedPhase)
     );
     let current = challenge(0x72);
-    let length = current.encode_packet(&mut packet).unwrap();
+    let length = profile()
+        .encode_identity_challenge(current, &mut packet)
+        .unwrap();
     send_packet(host.as_raw_fd(), &packet[..length], &[]);
     assert_eq!(worker.receive_challenge(&mut packet).unwrap(), current);
     assert_eq!(
@@ -379,10 +426,9 @@ fn guest_retains_pending_challenge_after_pre_io_errors() {
         )
     };
     assert!(length > 0);
-    assert!(
-        GuestIdentityReply::decode_for(&reply_packet[..length as usize], current, &request())
-            .is_ok()
-    );
+    assert!(profile()
+        .decode_identity_reply(&reply_packet[..length as usize], current, &request())
+        .is_ok());
 }
 
 #[test]
@@ -452,10 +498,17 @@ async fn credentials_identify_the_sender_after_fork_not_the_socket_creator() {
     let (host_fd, worker_fd) = seqpacket_pair();
     let mut packet = [0; 2048];
     let current = challenge(0x72);
-    let length = reply(current).encode_packet(&mut packet).unwrap();
+    let length = profile()
+        .encode_identity_reply(&reply(current), &mut packet)
+        .unwrap();
     let host_raw = host_fd.as_raw_fd();
     let worker_raw = worker_fd.as_raw_fd();
-    let mut host = UnixIdentityChannel::new(host_fd, ready()).unwrap();
+    let mut host = UnixIdentityChannel::new(
+        host_fd,
+        ready(),
+        &lasper_guest_protocol::protocol_profiles()[0],
+    )
+    .unwrap();
     // SAFETY: After fork the child uses only async-signal-safe syscalls and
     // _exit; it neither runs Rust destructors nor touches the Tokio runtime.
     let pid = unsafe { libc::fork() };
@@ -524,7 +577,12 @@ async fn a_full_send_queue_does_not_block_the_async_runtime() {
             break;
         }
     }
-    let mut host = UnixIdentityChannel::new(host, ready()).unwrap();
+    let mut host = UnixIdentityChannel::new(
+        host,
+        ready(),
+        &lasper_guest_protocol::protocol_profiles()[0],
+    )
+    .unwrap();
     assert!(tokio::time::timeout(
         Duration::from_millis(20),
         host.observe([0x72; 32], &request())
@@ -538,12 +596,19 @@ async fn a_full_send_queue_does_not_block_the_async_runtime() {
 #[tokio::test]
 async fn host_accepts_one_complete_packet_at_the_identity_limit() {
     let (host, worker) = seqpacket_pair();
-    let mut host = UnixIdentityChannel::new(host, ready()).unwrap();
+    let mut host = UnixIdentityChannel::new(
+        host,
+        ready(),
+        &lasper_guest_protocol::protocol_profiles()[0],
+    )
+    .unwrap();
     let current = challenge(0x72);
     let task = tokio::task::spawn_blocking(move || {
         assert_eq!(receive_challenge(worker.as_raw_fd()), current);
         let mut packet = vec![b' '; MAX_IDENTITY_MESSAGE_BYTES];
-        reply(current).encode_packet(&mut packet).unwrap();
+        profile()
+            .encode_identity_reply(&reply(current), &mut packet)
+            .unwrap();
         send_packet(worker.as_raw_fd(), &packet, &[]);
     });
     assert_eq!(

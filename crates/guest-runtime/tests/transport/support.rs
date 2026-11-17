@@ -27,19 +27,25 @@ pub fn established(limits: ControlLimits) -> (GuestControlStream, UnixStream) {
     send(&guest, header(MessageKind::HelloResponse, 0, 0), &[], &[]).unwrap();
     let mut response = [0; CONTROL_FRAME_HEADER_BYTES];
     peer.read_exact(&mut response).unwrap();
-    let limits = HelloRequest::new(FeatureSet::EMPTY, limits)
-        .unwrap()
-        .negotiate(
-            lasper_guest_protocol::ProtocolVersion::CURRENT,
-            HelloResponse::new(FeatureSet::EMPTY, BrokerId::new([1; 16]), limits).unwrap(),
-        )
-        .unwrap();
-    guest.complete_hello(limits).unwrap();
+    let (_, protocol) = HelloResponse::accept(
+        HelloRequest::new(FeatureSet::EMPTY, limits).unwrap(),
+        lasper_guest_protocol::HelloOffer::local(limits),
+        BrokerId::new([1; 16]),
+    )
+    .unwrap();
+    guest.complete_protocol(protocol).unwrap();
     (guest, peer)
 }
 
 pub fn header(kind: MessageKind, payload_bytes: usize, fds: u16) -> ControlFrameHeader {
-    ControlFrameHeader::new(kind, 17, payload_bytes as u32, fds).unwrap()
+    ControlFrameHeader::new_with_version(
+        lasper_guest_protocol::ProtocolVersion { major: 1, minor: 0 },
+        kind,
+        17,
+        payload_bytes as u32,
+        fds,
+    )
+    .unwrap()
 }
 
 pub fn receive<'a>(

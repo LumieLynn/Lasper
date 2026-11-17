@@ -1,8 +1,9 @@
 //! Supplements `compiler_builtins` with C ABI functions used by the libc-free ELF.
 //!
-//! `CStr::from_ptr` uses `strlen` when the wrapper checks the payload path. LLVM can
-//! emit calls to the memory functions directly. Volatile byte accesses keep
-//! these implementations from becoming calls to themselves.
+//! Pointer-based argument and environment handling uses `CStr::from_ptr`, which
+//! can call `strlen`. LLVM can emit calls to the memory functions directly.
+//! Volatile byte accesses keep these implementations from becoming calls to
+//! themselves.
 //!
 //! Callers must keep all accessed memory valid and prevent conflicting concurrent
 //! accesses. The memory functions access nothing when `count` is zero.

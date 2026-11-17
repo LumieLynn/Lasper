@@ -1,4 +1,7 @@
-//! Establish one helper connection against a pinned machine instance.
+//! Resolves the guest socket, verifies its peer and exchanges Hello.
+//!
+//! Endpoint retries stop after connect succeeds. Peer or Hello failure ends the
+//! attempt so a replacement broker cannot silently change this connection's target.
 
 mod endpoint;
 mod peer;
@@ -47,13 +50,31 @@ impl BrokerConnection {
         limits: ControlLimits,
         deadline: Instant,
     ) -> Result<Self, BrokerConnectError> {
-        let deadline = deadline.min(Instant::now() + CONNECT_HELLO_TIMEOUT);
+        Self::connect_with_features(
+            target,
+            endpoint,
+            limits,
+            lasper_guest_protocol::FeatureSet::from_bits(0),
+            deadline.min(Instant::now() + CONNECT_HELLO_TIMEOUT),
+        )
+        .await
+    }
+
+    /// Uses the supplied deadline for endpoint retries, peer checks and Hello.
+    /// Unlike `connect`, this entry point does not add a one-second cap.
+    pub async fn connect_with_features(
+        target: Arc<MachineTarget>,
+        endpoint: &str,
+        limits: ControlLimits,
+        required: lasper_guest_protocol::FeatureSet,
+        deadline: Instant,
+    ) -> Result<Self, BrokerConnectError> {
         if Instant::now() >= deadline {
             return Err(BrokerConnectError::Deadline);
         }
         timeout_at(
             deadline,
-            Self::establish(target, endpoint, limits, deadline),
+            Self::establish(target, endpoint, limits, required, deadline),
         )
         .await
         .map_err(|_| BrokerConnectError::Deadline)?
@@ -63,10 +84,12 @@ impl BrokerConnection {
         target: Arc<MachineTarget>,
         endpoint: &str,
         limits: ControlLimits,
+        required: lasper_guest_protocol::FeatureSet,
         deadline: Instant,
     ) -> Result<Self, BrokerConnectError> {
         target.recheck().map_err(BrokerConnectError::Target)?;
-        let hello = WorkerHello::new(limits).map_err(BrokerConnectError::Readiness)?;
+        let hello =
+            WorkerHello::with_features(limits, required).map_err(BrokerConnectError::Readiness)?;
         let stream = connect_endpoint(&target, endpoint, deadline).await?;
         let peer = peer::identify(&stream, &target).map_err(BrokerConnectError::InvalidPeer)?;
         let mut control = UnixControlStream::new(stream);
@@ -85,12 +108,23 @@ impl BrokerConnection {
         })
     }
 
+    pub fn hello(&self) -> crate::NegotiatedHello {
+        *self
+            .control
+            .negotiated_hello()
+            .expect("established connection")
+    }
+
     pub fn target(&self) -> &Arc<MachineTarget> {
         &self.target
     }
 
     pub fn readiness(&self) -> &WorkerReadiness {
         &self.readiness
+    }
+
+    pub(crate) fn session_state(&self) -> lasper_guest_protocol::WireSessionState {
+        lasper_guest_protocol::WireSessionState::after_hello(HELLO_REQUEST_ID)
     }
 
     pub fn recheck(&self) -> io::Result<()> {
@@ -157,9 +191,7 @@ async fn exchange_hello(
         .await
         .map_err(|error| match error {
             HandshakeError::Transport(error) => BrokerConnectError::Hello(error),
-            HandshakeError::Negotiation(error) => {
-                BrokerConnectError::Readiness(WorkerReadinessError::Negotiation(error))
-            }
+            HandshakeError::Negotiation(error) => BrokerConnectError::Incompatible(error),
         })?;
     hello
         .complete(control)
@@ -173,6 +205,7 @@ pub enum BrokerConnectError {
     Connect(io::Error),
     InvalidPeer(io::Error),
     Hello(io::Error),
+    Incompatible(lasper_guest_protocol::CompatibilityError),
     Readiness(WorkerReadinessError),
     Deadline,
 }
@@ -187,6 +220,9 @@ impl fmt::Display for BrokerConnectError {
             Self::Connect(error) => write!(formatter, "connect guest broker socket: {error}"),
             Self::InvalidPeer(error) => write!(formatter, "verify guest broker process: {error}"),
             Self::Hello(error) => write!(formatter, "exchange guest broker Hello: {error}"),
+            Self::Incompatible(error) => {
+                write!(formatter, "guest protocol negotiation failed: {error:?}")
+            }
             Self::Readiness(error) => error.fmt(formatter),
             Self::Deadline => {
                 formatter.write_str("guest broker connect and Hello deadline expired")
@@ -204,6 +240,7 @@ impl std::error::Error for BrokerConnectError {
             | Self::InvalidPeer(error)
             | Self::Hello(error) => Some(error),
             Self::Readiness(error) => Some(error),
+            Self::Incompatible(_) => None,
             Self::Deadline => None,
         }
     }

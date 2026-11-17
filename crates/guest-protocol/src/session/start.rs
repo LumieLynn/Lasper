@@ -1,31 +1,24 @@
-use heapless::String;
 use serde::{Deserialize, Serialize};
 
 use super::control::PreparationControl;
 use super::frame::{
     encode_frame, validate_session_frame, validate_token, SessionFrameError, SessionPayloadError,
 };
-use crate::messages::{decode_json_payload_escaped, encode_json_payload};
-use crate::prepare::{validate_absolute_path, MAX_PROJECTION_PATH_BYTES};
+use crate::json::{decode_json_payload, encode_json_payload};
 use crate::{
     BrokerId, ControlFrameHeader, MessageKind, PayloadCodecError, PreparationId,
     PrepareRequestFrame, TerminalSize,
 };
 
-/// Reserve half the timestamp range for the guest's current monotonic time
-/// when adding an explicit execution budget to form an absolute deadline.
-pub const MAX_EXECUTION_TIMEOUT_MS: u64 = u64::MAX / 2;
+/// Build ceiling for explicit execution budgets. The selected profile supplies
+/// the connection's timeout limit, which may be lower.
+pub const MAX_EXECUTION_TIMEOUT_MS: u64 = crate::BUILD_CAPACITIES.max_execution_timeout_ms;
 
-/// Options accepted when a prepared worker is released. Display values can
-/// only repeat projections selected by the original Prepare.
+/// Final terminal dimensions and the execution budget for one prepared worker.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct StartRequest {
     broker_id: BrokerId,
     preparation_id: PreparationId,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    wayland_display: Option<String<MAX_PROJECTION_PATH_BYTES>>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    x11_display: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
     terminal_size: Option<TerminalSize>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -37,29 +30,31 @@ pub struct StartRequest {
 struct WireStartRequest {
     broker_id: BrokerId,
     preparation_id: PreparationId,
-    wayland_display: Option<String<MAX_PROJECTION_PATH_BYTES>>,
-    x11_display: Option<u16>,
+    #[serde(default, deserialize_with = "present")]
     terminal_size: Option<TerminalSize>,
+    #[serde(default, deserialize_with = "present")]
     execution_timeout_ms: Option<u64>,
+}
+
+// Missing fields use None; a present field must contain a value, never null.
+fn present<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 impl StartRequest {
     pub fn new(
         request: &PrepareRequestFrame<'_>,
         preparation_id: PreparationId,
-        wayland_display: Option<&str>,
-        x11_display: Option<u16>,
         terminal_size: Option<TerminalSize>,
         execution_timeout_ms: Option<u64>,
     ) -> Result<Self, SessionPayloadError> {
-        let wayland_display = wayland_display
-            .map(|value| bounded_path(value).map_err(SessionPayloadError::Payload))
-            .transpose()?;
         let start = Self {
             broker_id: request.broker_id(),
             preparation_id,
-            wayland_display,
-            x11_display,
             terminal_size,
             execution_timeout_ms,
         };
@@ -75,45 +70,39 @@ impl StartRequest {
         self.preparation_id
     }
 
-    pub fn wayland_display(&self) -> Option<&str> {
-        self.wayland_display.as_ref().map(String::as_str)
-    }
-
-    pub const fn x11_display(&self) -> Option<u16> {
-        self.x11_display
-    }
-
     pub const fn terminal_size(&self) -> Option<TerminalSize> {
         self.terminal_size
     }
 
-    /// An execution budget from 1 through [`MAX_EXECUTION_TIMEOUT_MS`], measured
-    /// in milliseconds by the guest's monotonic clock from acceptance of Start.
-    /// None leaves execution unlimited, for both interactive and bounded sessions.
+    /// Milliseconds from acceptance of Start, measured by the guest's monotonic
+    /// clock. `None` leaves execution unlimited. A supplied budget requires the
+    /// negotiated timeout feature and must fit the selected profile's limit.
     pub const fn execution_timeout_ms(&self) -> Option<u64> {
         self.execution_timeout_ms
     }
 
-    pub fn encode_payload(&self, output: &mut [u8]) -> Result<usize, PayloadCodecError> {
+    pub(crate) fn encode_payload(&self, output: &mut [u8]) -> Result<usize, PayloadCodecError> {
         encode_json_payload(self, output)
     }
 
-    /// Decodes a Start only after checking its token and environment against
-    /// the exact Prepare request that created the worker.
-    pub fn decode_for(
+    /// Decodes a Start and checks its token and I/O options against the Prepare
+    /// request that created the worker.
+    pub(crate) fn decode_for(
         request: &PrepareRequestFrame<'_>,
         preparation_id: PreparationId,
         bytes: &[u8],
     ) -> Result<Self, SessionPayloadError> {
-        let mut unescape_buffer = [0; MAX_PROJECTION_PATH_BYTES];
-        let wire: WireStartRequest = decode_json_payload_escaped(bytes, &mut unescape_buffer)
-            .map_err(SessionPayloadError::Payload)?;
-        validate_token(request, preparation_id, wire.broker_id, wire.preparation_id)?;
+        let wire: WireStartRequest =
+            decode_json_payload(bytes).map_err(SessionPayloadError::Payload)?;
+        validate_token(
+            request.broker_id(),
+            preparation_id,
+            wire.broker_id,
+            wire.preparation_id,
+        )?;
         let start = Self {
             broker_id: wire.broker_id,
             preparation_id: wire.preparation_id,
-            wayland_display: wire.wayland_display,
-            x11_display: wire.x11_display,
             terminal_size: wire.terminal_size,
             execution_timeout_ms: wire.execution_timeout_ms,
         };
@@ -128,34 +117,14 @@ impl StartRequest {
         {
             return Err(SessionPayloadError::InvalidExecutionTimeout);
         }
-        let projections = request.request().projections();
-        if let Some(display) = self.wayland_display() {
-            validate_absolute_path(display).map_err(SessionPayloadError::Payload)?;
-            if !matches!(
-                projections.wayland(),
-                Some(projection) if projection.target() == display
-            ) {
-                return Err(SessionPayloadError::UnrequestedProjection);
-            }
-        }
-        if let Some(display) = self.x11_display {
-            if !matches!(
-                projections.x11(),
-                Some(projection) if projection.display() == display
-            ) {
-                return Err(SessionPayloadError::UnrequestedProjection);
-            }
-        }
         match (request.request().execution(), self.terminal_size) {
-            (crate::ExecutionKind::Interactive, Some(_))
-            | (crate::ExecutionKind::Bounded, None) => Ok(()),
+            (crate::ExecutionKind::Terminal, _) | (crate::ExecutionKind::Piped, None) => Ok(()),
             _ => Err(SessionPayloadError::InvalidTerminalSize),
         }
     }
 }
 
-/// A Start frame is separate from small preparation-control frames so Keep,
-/// Recheck, Cancel, and Close do not carry a 4 KiB inline path buffer.
+/// Correlates a Start request with its connection-local request ID.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StartFrame {
     request_id: u64,
@@ -182,14 +151,21 @@ impl StartFrame {
         self.request
     }
 
-    pub fn encode_parts(
+    pub(crate) fn encode_parts_with_version(
         &self,
+        version: crate::ProtocolVersion,
         payload: &mut [u8],
     ) -> Result<(ControlFrameHeader, usize), SessionFrameError> {
-        encode_frame(MessageKind::Start, self.request_id, &self.request, payload)
+        encode_frame(
+            version,
+            MessageKind::Start,
+            self.request_id,
+            &self.request,
+            payload,
+        )
     }
 
-    pub fn decode_for(
+    pub(crate) fn decode_for(
         expected_request_id: u64,
         request: &PrepareRequestFrame<'_>,
         preparation_id: PreparationId,
@@ -209,8 +185,8 @@ impl StartFrame {
     }
 }
 
-/// Guest acknowledgement emitted after the guardian commits Prepared -> Starting.
-/// It does not mean that `execve` has succeeded; that result is reported separately.
+/// Acknowledges the guardian's acceptance of Start. The exec result is reported
+/// in Exit; this acknowledgement does not confirm that the program is running.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct StartAcceptedFrame {
     request_id: u64,
@@ -233,14 +209,21 @@ impl StartAcceptedFrame {
         self.control
     }
 
-    pub fn encode_parts(
+    pub(crate) fn encode_parts_with_version(
         &self,
+        version: crate::ProtocolVersion,
         payload: &mut [u8],
     ) -> Result<(ControlFrameHeader, usize), SessionFrameError> {
-        encode_frame(MessageKind::Start, self.request_id, &self.control, payload)
+        encode_frame(
+            version,
+            MessageKind::Start,
+            self.request_id,
+            &self.control,
+            payload,
+        )
     }
 
-    pub fn decode_for(
+    pub(crate) fn decode_for(
         expected_request_id: u64,
         request: &PrepareRequestFrame<'_>,
         preparation_id: PreparationId,
@@ -258,11 +241,4 @@ impl StartAcceptedFrame {
             .map_err(SessionFrameError::Payload)?;
         Ok(Self::new(header.request_id(), control))
     }
-}
-
-fn bounded_path(value: &str) -> Result<String<MAX_PROJECTION_PATH_BYTES>, PayloadCodecError> {
-    let mut path = String::new();
-    path.push_str(value)
-        .map_err(|_| PayloadCodecError::InvalidRequest)?;
-    Ok(path)
 }

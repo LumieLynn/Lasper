@@ -4,13 +4,11 @@ use lasper_guest_protocol::{
 };
 
 use super::super::error::SystemResultExt;
-use super::super::lifecycle::WORKER_SETUP_TIMEOUT_MS;
-use super::super::ready::IO_TIMEOUT_MS;
+use super::super::reply::IO_TIMEOUT_MS;
 use super::super::{
     GuardianContext, GuardianError, PrepareBuffer, PrepareStorage, PrepareStorageError,
     SessionGuardian, SupervisorStatus,
 };
-use super::capture::Capture;
 use crate::linux::uapi::{
     errno::{EINTR, EIO},
     nr,
@@ -21,12 +19,14 @@ use crate::linux::{self, PollFd};
 use crate::syscall::syscall3;
 use crate::transport::TransportError;
 
-const PREPARE_RECEIVE_TIMEOUT_MS: u64 = 5_000;
-
-pub(super) fn receive(context: &GuardianContext) -> Result<PrepareStorage, GuardianError> {
+pub(super) fn receive(
+    context: &GuardianContext,
+    wire: &mut lasper_guest_protocol::WireSessionState,
+) -> Result<PrepareStorage, GuardianError> {
     let deadline = context
         .hello_completed_at_ms()
-        .saturating_add(PREPARE_RECEIVE_TIMEOUT_MS);
+        .checked_add(crate::policy::prepare_receive_timeout_ms())
+        .ok_or(GuardianError::PrepareExpired)?;
     let connection = context.connection();
     let mut reader = connection.begin_receive().map_err(GuardianError::Control)?;
     let header = drive(
@@ -38,13 +38,6 @@ pub(super) fn receive(context: &GuardianContext) -> Result<PrepareStorage, Guard
     )?;
     if header.kind() != MessageKind::PrepareRequest || header.descriptor_count() != 0 {
         return Err(GuardianError::InvalidStatus);
-    }
-    if header.request_id() <= context.hello_request_id() {
-        return Err(reject(
-            context,
-            header.request_id(),
-            GuardianError::InvalidStatus,
-        ));
     }
     let buffer = match PrepareBuffer::new(header, context.broker_id(), context.negotiated_limits())
     {
@@ -72,6 +65,8 @@ pub(super) fn receive(context: &GuardianContext) -> Result<PrepareStorage, Guard
         return Err(reject(context, header.request_id(), error));
     }
     let frame = reader.finish().map_err(GuardianError::Control)?;
+    wire.request(header.request_id(), GuestOperation::Prepare)
+        .map_err(|_| reject(context, header.request_id(), GuardianError::InvalidStatus))?;
     PrepareStorage::from_received(frame).map_err(|error| {
         reject(
             context,
@@ -86,28 +81,17 @@ pub(super) fn assign<'request, 'context>(
     request: &'request PrepareRequestFrame<'request>,
     accepted_at: u64,
     entry: fn(super::super::WorkerBootstrap<'_>) -> !,
-) -> Result<
-    (
-        PreparationId,
-        SessionGuardian<'request, 'context>,
-        Option<Capture>,
-    ),
-    GuardianError,
-> {
-    let capture = if request.request().execution() == lasper_guest_protocol::ExecutionKind::Bounded
-    {
-        Some(Capture::new(context.negotiated_limits().get())?)
-    } else {
-        None
-    };
+) -> Result<(PreparationId, SessionGuardian<'request, 'context>), GuardianError> {
     let preparation = preparation_id()?;
     check(
         context,
-        accepted_at.saturating_add(WORKER_SETUP_TIMEOUT_MS),
+        accepted_at
+            .checked_add(crate::policy::worker_setup_timeout_ms())
+            .ok_or(GuardianError::PrepareExpired)?,
         GuardianError::PrepareExpired,
     )?;
     let guardian = context.spawn(request, preparation, accepted_at, entry)?;
-    Ok((preparation, guardian, capture))
+    Ok((preparation, guardian))
 }
 
 fn check(
@@ -206,6 +190,7 @@ fn send_error(
         }
         GuardianError::PrepareExpired => (GuestErrorCode::Expired, None),
         GuardianError::InvalidStatus
+        | GuardianError::ReadyDescriptorCapacity { .. }
         | GuardianError::PrepareStorage(PrepareStorageError::Frame(_)) => {
             (GuestErrorCode::InvalidRequest, None)
         }
@@ -220,10 +205,11 @@ fn send_error(
         errno,
     )
     .map_err(|_| GuardianError::ReplyEncoding)?;
-    // Rejection must still work when the Prepare/output mapping could not be allocated.
+    // Rejection must still work when the Prepare mapping could not be allocated.
     let mut bytes = [0; 512];
-    let (header, length) = error
-        .encode_parts(&mut bytes)
+    let (header, length) = context
+        .negotiated_protocol()
+        .encode_error(&error, &mut bytes)
         .map_err(GuardianError::SessionFrame)?;
     let mut sender = context
         .connection()

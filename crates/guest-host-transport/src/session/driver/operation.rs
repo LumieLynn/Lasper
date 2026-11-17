@@ -2,11 +2,10 @@ use super::control::{unexpected_reply, CleanupRequest, ExpectedReply, Outbound, 
 use super::Owner;
 use crate::session::{
     wire, BrokerSessionError, Reply, SessionPhase, StartError, StartOutcome, StartReply,
-    OPERATION_TIMEOUT,
 };
 use crate::WorkerObservation;
 use lasper_guest_protocol::{
-    ControlFrameHeader, MessageKind, PreparationControlKind, PreparationId, ProjectionObservations,
+    ControlFrameHeader, MessageKind, PreparationControlKind, PreparationId,
 };
 use std::future::pending;
 use std::io;
@@ -16,7 +15,6 @@ use tokio::time::Instant;
 
 pub(super) struct StartPlan {
     pub payload: Box<[u8]>,
-    pub evidence: ProjectionObservations,
     pub reply: StartReply,
     pub delivered: oneshot::Receiver<()>,
 }
@@ -28,7 +26,7 @@ pub(super) enum CheckPurpose {
 
 pub(super) enum Operation {
     Prepare {
-        reply: Reply<(PreparationId, WorkerObservation)>,
+        reply: Reply<(PreparationId, WorkerObservation, crate::PreparedIo)>,
         deadline: Instant,
     },
     Check {
@@ -113,7 +111,7 @@ impl Operation {
                 let outcome = match &error {
                     BrokerSessionError::Rejected(frame) => Err(StartError::Rejected(*frame)),
                     _ => Ok(StartOutcome::Unknown {
-                        cause: error.clone(),
+                        cause: Arc::new(error.clone()),
                     }),
                 };
                 let _ = reply.send(outcome);
@@ -145,7 +143,11 @@ impl Owner<'_> {
         match self.operation.take() {
             Some(Operation::Prepare { reply, .. }) => {
                 if reply
-                    .send(Ok((self.token.preparation_id(), observed)))
+                    .send(Ok((
+                        self.token.preparation_id(),
+                        observed,
+                        self.worker.take_io(),
+                    )))
                     .is_err()
                 {
                     self.abandon_start()?;
@@ -164,13 +166,7 @@ impl Owner<'_> {
                 if start.reply.is_closed() {
                     return Ok(());
                 }
-                if observed.reply().projections() != start.evidence {
-                    let _ = start.reply.send(Err(StartError::NotSubmitted(
-                        BrokerSessionError::ProjectionChanged,
-                    )));
-                } else {
-                    self.operation = Some(Operation::ReadyToStart { start, deadline });
-                }
+                self.operation = Some(Operation::ReadyToStart { start, deadline });
             }
             operation => {
                 self.operation = operation;
@@ -201,8 +197,14 @@ impl Owner<'_> {
         // Keep may have used more request IDs while identity was pending.
         // Assign Start's ID at submission so the guest sees increasing IDs.
         let header = self.request_id().and_then(|id| {
-            ControlFrameHeader::new(MessageKind::Start, id, start.payload.len() as u32, 0)
-                .map_err(wire::encoding)
+            ControlFrameHeader::new_with_version(
+                self.hello.version(),
+                MessageKind::Start,
+                id,
+                start.payload.len() as u32,
+                0,
+            )
+            .map_err(wire::encoding)
         });
         let header = match header {
             Ok(header) => header,
@@ -234,7 +236,10 @@ impl Owner<'_> {
             }
             return Err(error);
         }
-        self.set_phase(SessionPhase::Starting);
+        self.state.send_modify(|s| {
+            s.phase = SessionPhase::Starting;
+            s.submission = crate::StartSubmission::Unconfirmed;
+        });
         Ok(())
     }
 
@@ -250,7 +255,7 @@ impl Owner<'_> {
         });
         self.begin_cleanup(CleanupRequest {
             kind: PreparationControlKind::Close,
-            deadline: Instant::now() + OPERATION_TIMEOUT,
+            deadline: Instant::now() + self.timeouts.cleanup_observation,
             reply: None,
         })
     }
@@ -279,7 +284,7 @@ impl Owner<'_> {
     pub(super) fn abandon_start(&mut self) -> Result<(), BrokerSessionError> {
         self.begin_cleanup(CleanupRequest {
             kind: PreparationControlKind::Close,
-            deadline: Instant::now() + OPERATION_TIMEOUT,
+            deadline: Instant::now() + self.timeouts.cleanup_observation,
             reply: None,
         })
     }

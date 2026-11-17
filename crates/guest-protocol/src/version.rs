@@ -1,29 +1,21 @@
-use crate::{PROTOCOL_MAJOR, PROTOCOL_MINOR};
+use serde::{Deserialize, Serialize};
 
-/// The wire revision understood by a peer. Both numbers must match: there is
-/// no cross-minor decoding or downgrade. Optional behavior uses feature bits.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// A concrete schema revision. Hello selects one profile from the peers' ranges;
+/// every established frame carries that selected revision.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProtocolVersion {
     pub major: u16,
     pub minor: u16,
 }
 
 impl ProtocolVersion {
-    pub const CURRENT: Self = Self {
-        major: PROTOCOL_MAJOR,
-        minor: PROTOCOL_MINOR,
+    /// Hello keeps minor zero while its payload advertises the supported range.
+    /// Established frames use the version selected for their connection.
+    pub const BOOTSTRAP: Self = Self {
+        major: crate::ProtocolRange::CURRENT.major,
+        minor: crate::BOOTSTRAP_MANIFEST.minor,
     };
-
-    pub const fn check(self) -> Result<(), ProtocolVersionMismatch> {
-        if self.major != Self::CURRENT.major || self.minor != Self::CURRENT.minor {
-            Err(ProtocolVersionMismatch {
-                expected: Self::CURRENT,
-                actual: self,
-            })
-        } else {
-            Ok(())
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

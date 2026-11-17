@@ -15,7 +15,7 @@ pub enum GuestFailureStage {
     Start = 5,
     Exec = 6,
     Signals = 7,
-    Projection = 8,
+    Identity = 8,
     GroupDatabase = 9,
     SupplementaryGroups = 10,
     GroupIdentity = 11,
@@ -40,7 +40,7 @@ impl TryFrom<u32> for GuestFailureStage {
             5 => Ok(Self::Start),
             6 => Ok(Self::Exec),
             7 => Ok(Self::Signals),
-            8 => Ok(Self::Projection),
+            8 => Ok(Self::Identity),
             9 => Ok(Self::GroupDatabase),
             10 => Ok(Self::SupplementaryGroups),
             11 => Ok(Self::GroupIdentity),
@@ -59,6 +59,7 @@ impl TryFrom<u32> for GuestFailureStage {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct GuestFailure {
+    #[serde(deserialize_with = "crate::json::deserialize_string_enum")]
     stage: GuestFailureStage,
     errno: i32,
 }
@@ -87,44 +88,5 @@ impl GuestFailure {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn failure_stage_numbers_are_fixed_in_both_directions() {
-        let cases = [
-            (GuestFailureStage::Descriptors, 1),
-            (GuestFailureStage::Session, 2),
-            (GuestFailureStage::StandardIo, 3),
-            (GuestFailureStage::Account, 4),
-            (GuestFailureStage::Start, 5),
-            (GuestFailureStage::Exec, 6),
-            (GuestFailureStage::Signals, 7),
-            (GuestFailureStage::Projection, 8),
-            (GuestFailureStage::GroupDatabase, 9),
-            (GuestFailureStage::SupplementaryGroups, 10),
-            (GuestFailureStage::GroupIdentity, 11),
-            (GuestFailureStage::UserIdentity, 12),
-            (GuestFailureStage::HomeDirectory, 13),
-            (GuestFailureStage::LoginShell, 14),
-            (GuestFailureStage::LoginDisabled, 15),
-            (GuestFailureStage::TerminalOwnership, 16),
-            (GuestFailureStage::Environment, 17),
-            (GuestFailureStage::Memory, 18),
-        ];
-        for (stage, number) in cases {
-            assert_eq!(stage as u32, number);
-            assert_eq!(GuestFailureStage::try_from(number), Ok(stage));
-        }
-    }
-
-    #[test]
-    fn failure_stage_rejects_reserved_and_unknown_numbers() {
-        for number in [0, 19, 0x1_0001, u32::MAX] {
-            assert_eq!(
-                GuestFailureStage::try_from(number),
-                Err(SessionPayloadError::InvalidResponse)
-            );
-        }
-    }
-}
+#[path = "../../tests/session/failure.rs"]
+mod tests;

@@ -1,7 +1,7 @@
 use super::*;
 use lasper_guest_protocol::{
-    CommandArgv, ExecutionKind, GuestProcess, PrepareRequest, PrepareRequestFrame,
-    ProjectionRequests, StartRequest, TerminalEnvironment, TerminalSize,
+    CommandArgv, ExecutionKind, GuestProcess, PrepareRequest, PrepareRequestFrame, StartRequest,
+    TerminalSize,
 };
 
 const BROKER: BrokerId = BrokerId::new([1; 16]);
@@ -13,11 +13,10 @@ fn request() -> PrepareRequestFrame<'static> {
         BROKER,
         PrepareRequest::new(
             "alice",
-            ExecutionKind::Interactive,
+            ExecutionKind::Terminal,
             GuestProcess::Command(CommandArgv::new(&["/usr/bin/editor"]).unwrap()),
-            Some(TerminalEnvironment::new("xterm", None, None).unwrap()),
+            lasper_guest_protocol::ProcessEnvironment::default(),
             Some(TerminalSize::new(80, 24).unwrap()),
-            ProjectionRequests::default(),
         )
         .unwrap(),
     )
@@ -94,8 +93,6 @@ fn start_frame() -> StartFrame {
     let start = StartRequest::new(
         &request,
         PREPARATION,
-        None,
-        None,
         Some(TerminalSize::new(80, 24).unwrap()),
         None,
     )
@@ -198,12 +195,12 @@ fn keep_prepared_renews_only_a_live_preparation() {
     assert_eq!(
         session.control(1_000, control(PreparationControlKind::KeepPrepared)),
         Ok(SessionAction::LeaseRenewed {
-            deadline_ms: 46_000,
+            deadline_ms: 11_000,
         }),
     );
-    assert_eq!(session.deadline_ms(), 46_000);
+    assert_eq!(session.deadline_ms(), 11_000);
     assert_eq!(
-        session.control(46_000, control(PreparationControlKind::KeepPrepared)),
+        session.control(11_000, control(PreparationControlKind::KeepPrepared)),
         Ok(SessionAction::BeginCleanup(CleanupReason::LeaseExpired)),
     );
 }

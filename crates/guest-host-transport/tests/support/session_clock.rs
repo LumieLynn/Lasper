@@ -60,7 +60,7 @@ pub(crate) async fn snapshot(
 }
 
 pub(crate) fn assert_expired(snapshot: &SessionSnapshot) {
-    assert_eq!(snapshot.phase(), SessionPhase::Failed);
+    assert_eq!(snapshot.phase(), SessionPhase::Finished);
     assert!(matches!(
         snapshot.error(),
         Some(BrokerSessionError::Deadline)

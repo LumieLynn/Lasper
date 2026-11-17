@@ -1,4 +1,4 @@
-use lasper_guest_protocol::{PrepareReadyFrame, ProjectionObservations};
+use lasper_guest_protocol::PrepareReadyFrame;
 use lasper_guest_runtime::session::{SessionGuardian, WorkerBootstrap, WorkerFailure, WorkerStage};
 use std::os::fd::OwnedFd;
 #[path = "../support/accounts.rs"]
@@ -7,6 +7,19 @@ pub(super) use accounts::{get, initialize};
 pub(super) struct ReceivedReady {
     pub frame: PrepareReadyFrame,
     pub descriptors: Vec<OwnedFd>,
+    pub profile: &'static lasper_guest_protocol::ProtocolProfile,
+}
+
+impl ReceivedReady {
+    pub fn stdout(&self) -> std::fs::File {
+        assert_eq!(self.descriptors.len(), 4);
+        self.descriptors[2].try_clone().unwrap().into()
+    }
+
+    pub fn stderr(&self) -> std::fs::File {
+        assert_eq!(self.descriptors.len(), 4);
+        self.descriptors[3].try_clone().unwrap().into()
+    }
 }
 
 pub(super) fn receive_ready(
@@ -34,6 +47,7 @@ pub(super) fn receive_ready(
     ReceivedReady {
         frame,
         descriptors: echoed.descriptors,
+        profile: lasper_guest_protocol::protocol_profile(echoed.header.protocol_version()).unwrap(),
     }
 }
 
@@ -41,5 +55,5 @@ pub(super) fn entry(bootstrap: WorkerBootstrap<'_>) -> ! {
     if get().enter_root().is_err() {
         bootstrap.fail(WorkerFailure::new(WorkerStage::Account, 13));
     }
-    bootstrap.run(|_| Ok(ProjectionObservations::default()))
+    bootstrap.run()
 }

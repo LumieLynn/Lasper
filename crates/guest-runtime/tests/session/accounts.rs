@@ -1,7 +1,6 @@
 use lasper_guest_protocol::{
-    BrokerId, CommandArgv, ExecutionKind, GuestIdentityReply, GuestProcess, PreparationId,
-    PrepareRequest, PrepareRequestFrame, ProjectionRequests, StartFrame, StartRequest,
-    TerminalEnvironment, TerminalSize, MAX_IDENTITY_MESSAGE_BYTES,
+    BrokerId, CommandArgv, ExecutionKind, GuestProcess, PreparationId, PrepareRequest,
+    PrepareRequestFrame, StartFrame, StartRequest, TerminalSize, MAX_IDENTITY_MESSAGE_BYTES,
 };
 use lasper_guest_runtime::session::*;
 use std::fs::File;
@@ -36,16 +35,22 @@ fn request(process: GuestProcess<'_>, interactive: bool) -> PrepareRequestFrame<
         PrepareRequest::new(
             "alice",
             if interactive {
-                ExecutionKind::Interactive
+                ExecutionKind::Terminal
             } else {
-                ExecutionKind::Bounded
+                ExecutionKind::Piped
             },
             process,
-            interactive.then(|| {
-                TerminalEnvironment::new("xterm-256color", Some("truecolor"), Some("")).unwrap()
-            }),
+            if interactive {
+                lasper_guest_protocol::ProcessEnvironment::new([
+                    ("COLORTERM", "truecolor"),
+                    ("NO_COLOR", ""),
+                    ("TERM", "xterm-256color"),
+                ])
+                .unwrap()
+            } else {
+                lasper_guest_protocol::ProcessEnvironment::default()
+            },
             interactive.then(|| TerminalSize::new(80, 24).unwrap()),
-            ProjectionRequests::default(),
         )
         .unwrap(),
     )
@@ -113,18 +118,22 @@ fn assert_terminal_owner(worker: &SessionGuardian<'_, '_>) {
 }
 
 fn verify_reply(ready: &fixture::ReceivedReady, request: &PrepareRequestFrame<'_>) {
-    let index = usize::from(request.request().execution() == ExecutionKind::Interactive);
+    let index = usize::from(request.request().execution() == ExecutionKind::Terminal);
     let identity: UnixDatagram = ready.descriptors[index].try_clone().unwrap().into();
     identity
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
     let challenge = ready.frame.identity_challenge([7; 32]);
+    let profile = ready.profile;
     let mut packet = vec![0; MAX_IDENTITY_MESSAGE_BYTES];
-    let length = challenge.encode_packet(&mut packet).unwrap();
+    let length = profile
+        .encode_identity_challenge(challenge, &mut packet)
+        .unwrap();
     identity.send(&packet[..length]).unwrap();
     let length = identity.recv(&mut packet).unwrap();
-    let reply =
-        GuestIdentityReply::decode_for(&packet[..length], challenge, request.request()).unwrap();
+    let reply = profile
+        .decode_identity_reply(&packet[..length], challenge, request.request())
+        .unwrap();
     assert_eq!(reply.guest_user(), "alice");
     assert_eq!(
         (reply.guest_uid(), reply.guest_gid()),
@@ -138,15 +147,8 @@ fn start(worker: &mut SessionGuardian<'_, '_>, request: &PrepareRequestFrame<'_>
             now_ms(),
             StartFrame::new(
                 11,
-                StartRequest::new(
-                    request,
-                    PREPARATION,
-                    None,
-                    None,
-                    request.request().initial_size(),
-                    None,
-                )
-                .unwrap(),
+                StartRequest::new(request, PREPARATION, request.request().initial_size(), None)
+                    .unwrap(),
             ),
         )
         .unwrap();
@@ -162,7 +164,7 @@ fn terminal(ready: &fixture::ReceivedReady) -> File {
 
 fn completed(
     worker: &mut SessionGuardian<'_, '_>,
-    mut terminal: Option<File>,
+    mut output_reader: File,
 ) -> (WorkerObservation, String) {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut output = Vec::new();
@@ -170,17 +172,10 @@ fn completed(
         let observation = worker.poll(now_ms()).unwrap();
         loop {
             let mut bytes = [0; 1024];
-            let result = if let Some(master) = terminal.as_mut() {
-                match master.read(&mut bytes) {
-                    Ok(length) => Ok(length),
-                    Err(error) if error.raw_os_error() == Some(5) => Ok(0),
-                    Err(error) => Err(error.raw_os_error().unwrap()),
-                }
-            } else {
-                worker.read_stdout(&mut bytes).map_err(|error| match error {
-                    GuardianError::System { errno, .. } => errno,
-                    other => panic!("unexpected output error: {other:?}"),
-                })
+            let result = match output_reader.read(&mut bytes) {
+                Ok(length) => Ok(length),
+                Err(error) if error.raw_os_error() == Some(5) => Ok(0),
+                Err(error) => Err(error.raw_os_error().unwrap()),
             };
             match result {
                 Ok(0) | Err(EAGAIN) => break,
@@ -220,7 +215,7 @@ fn login_snapshot(context: &mut GuardianContext) {
     fixture.write_account("/different-home", "/different-shell", 999, 999);
     std::fs::write(fixture.path("etc/group"), "broken\n").unwrap();
     start(&mut worker, &request);
-    let (result, output) = completed(&mut worker, Some(master));
+    let (result, output) = completed(&mut worker, master);
     assert_eq!(result.failure, None, "{result:?}");
     assert_eq!(result.exit, Some(WorkerExit::Exited(0)), "{output}");
     for expected in [
@@ -262,9 +257,9 @@ fn command_arguments(context: &mut GuardianContext) {
     let mut worker = spawn(context, &request);
     prepared(&mut worker);
     assert_credentials(&worker, &fixture.groups);
-    let _ready = fixture::receive_ready(&mut worker, context.connection(), now_ms());
+    let ready = fixture::receive_ready(&mut worker, context.connection(), now_ms());
     start(&mut worker, &request);
-    let (result, output) = completed(&mut worker, None);
+    let (result, output) = completed(&mut worker, ready.stdout());
     assert_eq!(result.failure, None);
     assert_eq!(result.exit, Some(WorkerExit::Exited(0)));
     assert_eq!(
@@ -389,7 +384,7 @@ fn missing_groups(context: &mut GuardianContext) {
     let ready = fixture::receive_ready(&mut worker, context.connection(), now_ms());
     verify_reply(&ready, &request);
     start(&mut worker, &request);
-    let (result, output) = completed(&mut worker, None);
+    let (result, output) = completed(&mut worker, ready.stdout());
     assert_eq!(result.failure, None);
     assert_eq!(result.exit, Some(WorkerExit::Exited(0)));
     assert_eq!(output, "minimal");

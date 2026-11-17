@@ -1,7 +1,7 @@
 use lasper_guest_protocol::{
-    BrokerId, CommandArgv, ExecutionKind, GuestIdentityReply, GuestProcess, PreparationId,
-    PrepareRequest, PrepareRequestFrame, ProjectionRequests, StartFrame, StartRequest,
-    TerminalEnvironment, TerminalSize, MAX_EXECUTION_TIMEOUT_MS, MAX_IDENTITY_MESSAGE_BYTES,
+    BrokerId, CommandArgv, ExecutionKind, GuestProcess, PreparationId, PrepareRequest,
+    PrepareRequestFrame, StartFrame, StartRequest, TerminalSize, MAX_EXECUTION_TIMEOUT_MS,
+    MAX_IDENTITY_MESSAGE_BYTES,
 };
 use lasper_guest_runtime::session::*;
 use std::io::Read;
@@ -51,13 +51,10 @@ fn advance_to(time: u64) -> u64 {
 }
 
 fn request(execution: ExecutionKind, argv: &[&'static str]) -> PrepareRequestFrame<'static> {
-    let (terminal, size) = if execution == ExecutionKind::Interactive {
-        (
-            Some(TerminalEnvironment::new("xterm", None, None).unwrap()),
-            Some(TerminalSize::new(80, 24).unwrap()),
-        )
+    let size = if execution == ExecutionKind::Terminal {
+        Some(TerminalSize::new(80, 24).unwrap())
     } else {
-        (None, None)
+        None
     };
     PrepareRequestFrame::new(
         10,
@@ -66,9 +63,8 @@ fn request(execution: ExecutionKind, argv: &[&'static str]) -> PrepareRequestFra
             "alice",
             execution,
             GuestProcess::Command(CommandArgv::new(argv).unwrap()),
-            terminal,
+            lasper_guest_protocol::ProcessEnvironment::default(),
             size,
-            ProjectionRequests::default(),
         )
         .unwrap(),
     )
@@ -84,8 +80,6 @@ fn start_with_timeout(request: &PrepareRequestFrame<'_>, timeout_ms: Option<u64>
         StartRequest::new(
             request,
             PREPARATION,
-            None,
-            None,
             request.request().initial_size(),
             timeout_ms,
         )
@@ -151,19 +145,19 @@ fn wait_for(
     }
 }
 
-fn bounded_stdout(worker: &mut SessionGuardian<'_, '_>) -> Vec<u8> {
+fn pipe_output(mut pipe: std::fs::File) -> Vec<u8> {
     let deadline = Instant::now() + Duration::from_secs(2);
-    let mut result = Vec::new();
+    let mut output = Vec::new();
     loop {
         let mut bytes = [0; 1024];
-        match worker.read_stdout(&mut bytes) {
-            Ok(0) => return result,
-            Ok(length) => result.extend_from_slice(&bytes[..length]),
-            Err(GuardianError::System { errno: EAGAIN, .. }) => {
-                assert!(Instant::now() < deadline, "stdout never closed");
+        match pipe.read(&mut bytes) {
+            Ok(0) => return output,
+            Ok(length) => output.extend_from_slice(&bytes[..length]),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(Instant::now() < deadline, "pipe never closed");
                 std::thread::sleep(Duration::from_millis(2));
             }
-            Err(error) => panic!("read stdout: {error:?}"),
+            Err(error) => panic!("read pipe: {error}"),
         }
     }
 }
@@ -220,30 +214,34 @@ fn finish(
 
 fn bounded_start_scenario(context: &mut GuardianContext) {
     let request = request(
-        ExecutionKind::Bounded,
+        ExecutionKind::Piped,
         &["/bin/sh", "-c", "printf '%s' \"$$\""],
     );
     let mut worker = context
         .spawn(&request, PREPARATION, now_ms(), entry)
         .unwrap();
     wait_for(&mut worker, |observation| observation.prepared);
-    assert!(matches!(
-        worker.read_stdout(&mut [0; 8]),
-        Err(GuardianError::System { errno: EAGAIN, .. })
-    ));
     let ready = fixture::receive_ready(&mut worker, context.connection(), now_ms());
-    assert_eq!(ready.frame.descriptor_count(), 2);
+    assert_eq!(ready.frame.descriptor_count(), 4);
+    assert_eq!(
+        ready.stdout().read(&mut [0; 8]).unwrap_err().raw_os_error(),
+        Some(EAGAIN)
+    );
     let identity: UnixDatagram = ready.descriptors[0].try_clone().unwrap().into();
     identity
         .set_read_timeout(Some(Duration::from_secs(2)))
         .unwrap();
     let mut packet = vec![0; MAX_IDENTITY_MESSAGE_BYTES];
+    let profile = ready.profile;
     for nonce in [1, 2] {
         let challenge = ready.frame.identity_challenge([nonce; 32]);
-        let length = challenge.encode_packet(&mut packet).unwrap();
+        let length = profile
+            .encode_identity_challenge(challenge, &mut packet)
+            .unwrap();
         identity.send(&packet[..length]).unwrap();
         let length = identity.recv(&mut packet).unwrap();
-        let reply = GuestIdentityReply::decode_for(&packet[..length], challenge, request.request())
+        let reply = profile
+            .decode_identity_reply(&packet[..length], challenge, request.request())
             .unwrap();
         assert_eq!(reply.guest_user(), "alice");
         assert_eq!(
@@ -259,15 +257,14 @@ fn bounded_start_scenario(context: &mut GuardianContext) {
             SessionLifecycleError::InvalidTransition { .. }
         ))
     ));
-    let output = bounded_stdout(&mut worker);
+    let output = pipe_output(ready.stdout());
     let observation = wait_for(&mut worker, |observation| observation.exit.is_some());
-    let mut error = [0; 1024];
-    let error_length = worker.read_stderr(&mut error).unwrap();
+    let error = pipe_output(ready.stderr());
     assert_eq!(
         output,
         std::format!("{}", worker.pid()).as_bytes(),
         "{observation:?}; {}",
-        String::from_utf8_lossy(&error[..error_length])
+        String::from_utf8_lossy(&error)
     );
     assert_eq!(observation.exit, Some(WorkerExit::Exited(0)));
     assert!(matches!(
@@ -278,7 +275,7 @@ fn bounded_start_scenario(context: &mut GuardianContext) {
 }
 
 fn terminal_scenario(context: &mut GuardianContext) {
-    let request = request(ExecutionKind::Interactive, &["/bin/sh", "-c", "stty size"]);
+    let request = request(ExecutionKind::Terminal, &["/bin/sh", "-c", "stty size"]);
     let mut worker = context
         .spawn(&request, PREPARATION, now_ms(), entry)
         .unwrap();
@@ -298,8 +295,6 @@ fn terminal_scenario(context: &mut GuardianContext) {
     let start = StartRequest::new(
         &request,
         PREPARATION,
-        None,
-        None,
         Some(TerminalSize::new(101, 37).unwrap()),
         None,
     )
@@ -347,7 +342,7 @@ fn ready_delivery_scenario(context: &mut GuardianContext, execution: ExecutionKi
                 &mut lasper_guest_runtime::transport::IoBudget::new()
             )
             .err(),
-        Some(GuardianError::ReadyAlreadyTaken)
+        Some(GuardianError::ReadyAlreadyDelivered)
     );
     worker.start(now_ms(), start(&request)).unwrap();
     finish(&mut worker, &request);
@@ -358,8 +353,12 @@ fn ready_delivery_scenario(context: &mut GuardianContext, execution: ExecutionKi
 
 fn abandoned_ready_scenario(context: &mut GuardianContext, fail_delivery: bool) {
     let request = request(
-        ExecutionKind::Bounded,
-        &["/bin/sh", "-c", "printf must-not-run"],
+        ExecutionKind::Piped,
+        &[
+            "/bin/sh",
+            "-c",
+            "printf must-not-run > /home/alice/unexpected-execution",
+        ],
     );
     let mut worker = context
         .spawn(&request, PREPARATION, now_ms(), entry)
@@ -381,12 +380,14 @@ fn abandoned_ready_scenario(context: &mut GuardianContext, fail_delivery: bool) 
         Some(CleanupReason::ClientClosed)
     );
     finish(&mut worker, &request);
-    assert!(bounded_stdout(&mut worker).is_empty());
+    assert!(!fixture::get()
+        .path("home/alice/unexpected-execution")
+        .exists());
 }
 
 fn expired_ready_scenario(context: &mut GuardianContext) {
     let request = request(
-        ExecutionKind::Bounded,
+        ExecutionKind::Piped,
         &["/bin/sh", "-c", "printf must-not-run"],
     );
     let mut worker = context
@@ -411,7 +412,7 @@ fn expired_ready_scenario(context: &mut GuardianContext) {
 }
 
 fn exec_failure_scenario(context: &mut GuardianContext) {
-    let request = request(ExecutionKind::Bounded, &["/not/a/real/guest/program"]);
+    let request = request(ExecutionKind::Piped, &["/not/a/real/guest/program"]);
     let mut worker = context
         .spawn(&request, PREPARATION, now_ms(), entry)
         .unwrap();
@@ -428,7 +429,7 @@ fn exec_failure_scenario(context: &mut GuardianContext) {
 }
 
 fn account_failure_scenario(context: &mut GuardianContext) {
-    let request = request(ExecutionKind::Bounded, &["/bin/true"]);
+    let request = request(ExecutionKind::Piped, &["/bin/true"]);
     std::fs::remove_file(fixture::get().path("etc/passwd")).unwrap();
     let mut worker = context
         .spawn(&request, PREPARATION, now_ms(), entry)
@@ -456,13 +457,13 @@ fn completed_before_poll_scenario(
     argv: &[&'static str],
     exit: WorkerExit,
 ) {
-    let request = request(ExecutionKind::Bounded, argv);
+    let request = request(ExecutionKind::Piped, argv);
     let mut worker = context
         .spawn(&request, PREPARATION, now_ms(), entry)
         .unwrap();
     wait_for(&mut worker, |observation| observation.prepared);
     let ready = fixture::receive_ready(&mut worker, context.connection(), now_ms());
-    let pidfd = ready.descriptors.last().unwrap().try_clone().unwrap();
+    let pidfd = ready.descriptors[1].try_clone().unwrap();
     worker.start(now_ms(), start(&request)).unwrap();
     wait_for_pidfd(&pidfd);
     assert_eq!(worker.phase(), SessionPhase::Starting);
@@ -481,13 +482,13 @@ fn completed_before_poll_scenario(
 }
 
 fn exec_failure_before_poll_scenario(context: &mut GuardianContext) {
-    let request = request(ExecutionKind::Bounded, &["/not/a/real/guest/program"]);
+    let request = request(ExecutionKind::Piped, &["/not/a/real/guest/program"]);
     let mut worker = context
         .spawn(&request, PREPARATION, now_ms(), entry)
         .unwrap();
     wait_for(&mut worker, |observation| observation.prepared);
     let ready = fixture::receive_ready(&mut worker, context.connection(), now_ms());
-    let pidfd = ready.descriptors.last().unwrap().try_clone().unwrap();
+    let pidfd = ready.descriptors[1].try_clone().unwrap();
     worker.start(now_ms(), start(&request)).unwrap();
     wait_for_pidfd(&pidfd);
 
@@ -510,13 +511,13 @@ fn exec_failure_before_poll_scenario(context: &mut GuardianContext) {
 }
 
 fn killed_before_exec_scenario(context: &mut GuardianContext) {
-    let request = request(ExecutionKind::Bounded, &["/bin/true"]);
+    let request = request(ExecutionKind::Piped, &["/bin/true"]);
     let mut worker = context
         .spawn(&request, PREPARATION, now_ms(), entry)
         .unwrap();
     wait_for(&mut worker, |observation| observation.prepared);
     let ready = fixture::receive_ready(&mut worker, context.connection(), now_ms());
-    let pidfd = ready.descriptors.last().unwrap().try_clone().unwrap();
+    let pidfd = ready.descriptors[1].try_clone().unwrap();
     assert_eq!(unsafe { kill(worker.pid(), 19) }, 0);
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
@@ -547,8 +548,12 @@ fn killed_before_exec_scenario(context: &mut GuardianContext) {
 
 fn cancel_scenario(context: &mut GuardianContext) {
     let request = request(
-        ExecutionKind::Bounded,
-        &["/bin/sh", "-c", "printf should-not-run"],
+        ExecutionKind::Piped,
+        &[
+            "/bin/sh",
+            "-c",
+            "printf should-not-run > /home/alice/unexpected-execution",
+        ],
     );
     let mut worker = context
         .spawn(&request, PREPARATION, now_ms(), entry)
@@ -570,25 +575,26 @@ fn cancel_scenario(context: &mut GuardianContext) {
         ))
     ));
     finish(&mut worker, &request);
-    assert!(bounded_stdout(&mut worker).is_empty());
+    assert!(!fixture::get()
+        .path("home/alice/unexpected-execution")
+        .exists());
 }
 
 fn descendants_scenario(context: &mut GuardianContext) {
-    let request = request(ExecutionKind::Bounded, &["/bin/sh", "-c",
+    let request = request(ExecutionKind::Piped, &["/bin/sh", "-c",
         "setsid --fork /bin/sh -c 'trap \"\" HUP TERM; printf \"%s\" \"$$\"; exec >/home/alice/detached.out 2>&1; while :; do sleep 1; done'; exit 23"]);
     let mut worker = context
         .spawn(&request, PREPARATION, now_ms(), entry)
         .unwrap();
     wait_for(&mut worker, |observation| observation.prepared);
-    let _ready = fixture::receive_ready(&mut worker, context.connection(), now_ms());
+    let ready = fixture::receive_ready(&mut worker, context.connection(), now_ms());
     worker.start(now_ms(), start(&request)).unwrap();
-    let output = bounded_stdout(&mut worker);
-    let mut error = [0; 1024];
-    let error_length = worker.read_stderr(&mut error).unwrap();
+    let output = pipe_output(ready.stdout());
+    let error = pipe_output(ready.stderr());
     assert!(
         !output.is_empty(),
         "descendant did not report its PID: {}",
-        String::from_utf8_lossy(&error[..error_length])
+        String::from_utf8_lossy(&error)
     );
     let descendant = std::str::from_utf8(&output)
         .unwrap()
@@ -607,7 +613,7 @@ fn descendants_scenario(context: &mut GuardianContext) {
 }
 
 fn preparation_timeout_scenario(context: &mut GuardianContext) {
-    let request = request(ExecutionKind::Bounded, &["/bin/true"]);
+    let request = request(ExecutionKind::Piped, &["/bin/true"]);
     let accepted_at = context.hello_completed_at_ms() + 4_900;
     let mut worker = context
         .spawn(&request, PREPARATION, accepted_at, blocked_entry)
@@ -653,7 +659,7 @@ fn preparation_timeout_scenario(context: &mut GuardianContext) {
 }
 
 fn lease_and_disconnect_scenario(context: &mut GuardianContext, connection: SessionConnection) {
-    let request = request(ExecutionKind::Bounded, &["/bin/sh", "-c", "exec sleep 30"]);
+    let request = request(ExecutionKind::Piped, &["/bin/sh", "-c", "exec sleep 30"]);
     let mut worker = context
         .spawn(&request, PREPARATION, now_ms(), entry)
         .unwrap();
@@ -808,21 +814,13 @@ fn maximum_execution_timeout_scenario(context: &mut GuardianContext, execution: 
 }
 
 fn wrong_start_scenario(context: &mut GuardianContext) {
-    let request = request(ExecutionKind::Bounded, &["/bin/true"]);
+    let request = request(ExecutionKind::Piped, &["/bin/true"]);
     let mut worker = context
         .spawn(&request, PREPARATION, now_ms(), entry)
         .unwrap();
     wait_for(&mut worker, |observation| observation.prepared);
     let _ready = fixture::receive_ready(&mut worker, context.connection(), now_ms());
-    let wrong = StartRequest::new(
-        &request,
-        PreparationId::new([3; 16]),
-        None,
-        None,
-        None,
-        None,
-    )
-    .unwrap();
+    let wrong = StartRequest::new(&request, PreparationId::new([3; 16]), None, None).unwrap();
     assert!(matches!(
         worker.start(now_ms(), StartFrame::new(11, wrong)),
         Err(GuardianError::InvalidStart(
@@ -836,8 +834,12 @@ fn wrong_start_scenario(context: &mut GuardianContext) {
 
 fn worker_exit_before_start_scenario(context: &mut GuardianContext) {
     let request = request(
-        ExecutionKind::Bounded,
-        &["/bin/sh", "-c", "printf should-not-run"],
+        ExecutionKind::Piped,
+        &[
+            "/bin/sh",
+            "-c",
+            "printf should-not-run > /home/alice/unexpected-execution",
+        ],
     );
     let mut worker = context
         .spawn(&request, PREPARATION, now_ms(), entry)
@@ -850,17 +852,19 @@ fn worker_exit_before_start_scenario(context: &mut GuardianContext) {
     assert!(!observation.prepared);
     assert!(worker.start(now_ms(), start(&request)).is_err());
     finish(&mut worker, &request);
-    assert!(bounded_stdout(&mut worker).is_empty());
+    assert!(!fixture::get()
+        .path("home/alice/unexpected-execution")
+        .exists());
 }
 
 pub(super) const SCENARIOS: &[(&str, super::ScenarioFn)] = &[
     (
         "interactive Ready owns exported endpoints and is one-shot",
-        |context| ready_delivery_scenario(context, ExecutionKind::Interactive),
+        |context| ready_delivery_scenario(context, ExecutionKind::Terminal),
     ),
     (
         "bounded Ready owns exported endpoints and is one-shot",
-        |context| ready_delivery_scenario(context, ExecutionKind::Bounded),
+        |context| ready_delivery_scenario(context, ExecutionKind::Piped),
     ),
     ("abandoned Ready enters cleanup", |context| {
         abandoned_ready_scenario(context, false)
@@ -875,26 +879,26 @@ pub(super) const SCENARIOS: &[(&str, super::ScenarioFn)] = &[
     ),
     ("PTY ownership and Start dimensions", terminal_scenario),
     ("bounded execution is unlimited by default", |context| {
-        unlimited_execution_scenario(context, ExecutionKind::Bounded)
+        unlimited_execution_scenario(context, ExecutionKind::Piped)
     }),
     ("interactive execution is unlimited by default", |context| {
-        unlimited_execution_scenario(context, ExecutionKind::Interactive)
+        unlimited_execution_scenario(context, ExecutionKind::Terminal)
     }),
     (
         "bounded execution timeout starts at Start and reaps descendants",
-        |context| execution_timeout_scenario(context, ExecutionKind::Bounded),
+        |context| execution_timeout_scenario(context, ExecutionKind::Piped),
     ),
     (
         "interactive execution timeout starts at Start and reaps descendants",
-        |context| execution_timeout_scenario(context, ExecutionKind::Interactive),
+        |context| execution_timeout_scenario(context, ExecutionKind::Terminal),
     ),
     (
         "bounded execution accepts the protocol's maximum timeout",
-        |context| maximum_execution_timeout_scenario(context, ExecutionKind::Bounded),
+        |context| maximum_execution_timeout_scenario(context, ExecutionKind::Piped),
     ),
     (
         "interactive execution accepts the protocol's maximum timeout",
-        |context| maximum_execution_timeout_scenario(context, ExecutionKind::Interactive),
+        |context| maximum_execution_timeout_scenario(context, ExecutionKind::Terminal),
     ),
     ("guest exec failure", exec_failure_scenario),
     ("guest account failure", account_failure_scenario),

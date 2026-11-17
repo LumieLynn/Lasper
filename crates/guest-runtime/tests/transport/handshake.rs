@@ -84,14 +84,15 @@ fn minor_mismatch_is_rejected_before_payload_in_hello_and_established_sessions()
             MessageKind::HelloRequest
         };
         let mut bytes = header(kind, 8, 0).encode();
-        bytes[14..16].copy_from_slice(&(ProtocolVersion::CURRENT.minor + 1).to_le_bytes());
+        bytes[14..16]
+            .copy_from_slice(&((ProtocolVersion { major: 1, minor: 0 }).minor + 1).to_le_bytes());
         peer.write_all(&bytes).unwrap();
         let mut reader = guest.begin_receive().unwrap();
         assert!(matches!(
             reader.advance(),
             Err(TransportError::Session(ControlSessionError::ProtocolVersion(error)))
-                if error.actual.major == ProtocolVersion::CURRENT.major
-                    && error.actual.minor == ProtocolVersion::CURRENT.minor + 1
+                if error.actual.major == (ProtocolVersion { major: 1, minor: 0 }).major
+                    && error.actual.minor == (ProtocolVersion { major: 1, minor: 0 }).minor + 1
         ));
         drop(reader);
         assert!(!guest.can_continue());
@@ -100,10 +101,10 @@ fn minor_mismatch_is_rejected_before_payload_in_hello_and_established_sessions()
 
 #[test]
 fn negotiated_limits_reject_headers_before_payload_or_fd_duplication() {
-    let limits = ControlLimits::new(CONTROL_FRAME_HEADER_BYTES as u32 + 8, 0).unwrap();
+    let limits = ControlLimits::new(4096, 0).unwrap();
     let (guest, mut peer) = established(limits);
     assert!(matches!(
-        guest.begin_send(header(MessageKind::Exit, 9, 0), &[0; 9], &[]),
+        guest.begin_send(header(MessageKind::Exit, 4096, 0), &[0; 4096], &[]),
         Err(TransportError::Session(ControlSessionError::Limit(
             ControlLimitError::FrameTooLarge { .. }
         )))
@@ -119,7 +120,7 @@ fn negotiated_limits_reject_headers_before_payload_or_fd_duplication() {
     let mut bytes = [0; CONTROL_FRAME_HEADER_BYTES + 2];
     peer.read_exact(&mut bytes).unwrap();
     assert_eq!(&bytes[CONTROL_FRAME_HEADER_BYTES..], b"ok");
-    peer.write_all(&header(MessageKind::PrepareRequest, 9, 0).encode())
+    peer.write_all(&header(MessageKind::PrepareRequest, 4096, 0).encode())
         .unwrap();
     assert!(matches!(
         receive(&guest, &mut []),

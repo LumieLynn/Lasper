@@ -97,7 +97,7 @@ if [[ -n "${run_binary}" ]]; then
     exit 1
   fi
   "${binary}" --identify | cargo run --quiet --locked \
-    -p lasper-guest-protocol --example verify_identity -- "${target}"
+    -p lasper-guest-protocol --example verify_identity -- --artifact-target "${target}"
   help=$("${binary}" --help)
   for expected in 'Usage:' 'Commands:' 'Options:' '--identify' '--broker' 'wrap'; do
     if ! grep -Fq -- "${expected}" <<<"${help}"; then

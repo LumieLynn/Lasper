@@ -12,7 +12,8 @@ pub enum SupervisorSignal {
 
 pub(crate) struct Signals(Descriptor);
 
-// This token carries signal setup across FD pruning without owning a new FD.
+// Block signals before FD validation so startup stops remain pending. Create
+// signalfd only after pruning so its descriptor stays open.
 #[must_use = "finish signal setup; dropping this token leaves signals blocked"]
 pub(crate) struct BlockedSignals {
     _private: (),

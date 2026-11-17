@@ -9,7 +9,14 @@ use std::task::Poll;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn header(descriptors: u16) -> ControlFrameHeader {
-    ControlFrameHeader::new(MessageKind::PrepareRequest, 17, 1, descriptors).unwrap()
+    ControlFrameHeader::new_with_version(
+        lasper_guest_protocol::ProtocolVersion { major: 1, minor: 0 },
+        MessageKind::Recheck,
+        17,
+        1,
+        descriptors,
+    )
+    .unwrap()
 }
 
 async fn receive(stream: &mut UnixControlStream) -> ReceivedControlFrame {
@@ -91,8 +98,14 @@ async fn available_input_cannot_read_past_its_byte_budget() {
     let mut host = established_stream_with_current_limits(host, 0);
     let mut peer = peer.into_std().unwrap();
     let payload = vec![0x5a; 64 * 1024];
-    let header =
-        ControlFrameHeader::new(MessageKind::PrepareRequest, 17, payload.len() as u32, 0).unwrap();
+    let header = ControlFrameHeader::new_with_version(
+        lasper_guest_protocol::ProtocolVersion { major: 1, minor: 0 },
+        MessageKind::Recheck,
+        17,
+        payload.len() as u32,
+        0,
+    )
+    .unwrap();
     peer.write_all(&header.encode()).unwrap();
     peer.write_all(&payload).unwrap();
     let mut budget = CONTROL_FRAME_HEADER_BYTES + 7;
@@ -274,9 +287,14 @@ async fn partial_output_resumes_without_repeating_bytes_after_processing_input()
             0
         );
         let payload: Vec<u8> = (0..512 * 1024).map(|index| index as u8).collect();
-        let outgoing =
-            ControlFrameHeader::new(MessageKind::PrepareRequest, 17, payload.len() as u32, 0)
-                .unwrap();
+        let outgoing = ControlFrameHeader::new_with_version(
+            lasper_guest_protocol::ProtocolVersion { major: 1, minor: 0 },
+            MessageKind::Recheck,
+            17,
+            payload.len() as u32,
+            0,
+        )
+        .unwrap();
         host.queue_frame(outgoing, payload.clone().into()).unwrap();
         peer.write_all(&header(0).encode()).await.unwrap();
         peer.write_all(b"x").await.unwrap();

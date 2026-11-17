@@ -172,4 +172,5 @@ impl<const N: usize> CString<N> {
 }
 
 #[cfg(test)]
+#[path = "../../../tests/session/account.rs"]
 mod tests;

@@ -5,6 +5,8 @@ mod accounts;
 mod bootstrap;
 mod client;
 mod failures;
+mod invalid_frames;
+mod io_drop;
 mod lifecycle;
 mod scenarios;
 #[path = "../support/control.rs"]
@@ -17,6 +19,10 @@ use std::process::Command;
 
 fn main() {
     let arguments: Vec<_> = std::env::args().collect();
+    if arguments.get(1).map(String::as_str) == Some("--pipe-drop-writer") {
+        io_drop::pipe_writer();
+        return;
+    }
     if arguments.get(1).map(String::as_str) == Some("--hold-output") {
         lifecycle::export_output(arguments.get(2).is_some_and(|arg| arg == "large"));
         return;
@@ -46,7 +52,9 @@ fn main() {
     for &(name, run) in scenarios::SCENARIOS
         .iter()
         .chain(lifecycle::SCENARIOS)
+        .chain(io_drop::SCENARIOS)
         .chain(failures::SCENARIOS)
+        .chain(invalid_frames::SCENARIOS)
     {
         if filter.is_some_and(|filter| !name.contains(filter)) {
             continue;
@@ -65,7 +73,7 @@ fn run_child(context: GuardianContext) -> i32 {
     if arguments[2] == "account-failure" {
         std::fs::remove_file(accounts::get().path("etc/passwd")).unwrap();
     }
-    if arguments[2] == "held-output" {
+    if matches!(arguments[2].as_str(), "held-output" | "pipe-reader-drop") {
         accounts::get().install_elf(std::env::current_exe().unwrap(), "bin/output-helper");
     }
     let proc_path = accounts::get().path("proc");

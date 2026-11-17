@@ -4,7 +4,7 @@
 
 use core::ffi::{c_char, CStr};
 
-use crate::broker::{self, BrokerError, BrokerResult, Startup};
+use crate::broker::{self, BrokerError, BrokerResult, Startup, STARTUP_TIMEOUT_MS};
 use crate::diagnostic::Diagnostic;
 use crate::failure::FailureClass;
 use crate::linux::uapi::{
@@ -17,8 +17,6 @@ use crate::linux::uapi::{
 use crate::linux::{self, filesystem, result_or_errno, Descriptor, Pipe, PollFd};
 use crate::paths;
 use crate::syscall::{syscall1, syscall3, syscall4, syscall5};
-
-pub(crate) const STARTUP_TIMEOUT_MS: u64 = 5_000;
 
 /// Starts the broker child, waits for Ready, then executes the payload with `execve`.
 ///

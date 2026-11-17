@@ -17,7 +17,7 @@ enum Scenario {
     PartialInput,
     Backpressure,
     Poisoned,
-    CapturedOutput,
+    ObservationFailure,
 }
 
 fn blocked_worker(_: WorkerBootstrap<'_>) -> ! {
@@ -32,11 +32,10 @@ fn request() -> PrepareRequestFrame<'static> {
         BrokerId::new([1; 16]),
         PrepareRequest::new(
             "root",
-            ExecutionKind::Bounded,
+            ExecutionKind::Piped,
             GuestProcess::Command(CommandArgv::new(&["/bin/true"]).unwrap()),
+            lasper_guest_protocol::ProcessEnvironment::default(),
             None,
-            None,
-            ProjectionRequests::default(),
         )
         .unwrap(),
     )
@@ -44,16 +43,18 @@ fn request() -> PrepareRequestFrame<'static> {
 
 fn run(context: GuardianContext, scenario: Scenario) -> i32 {
     let run = || -> Result<(), GuardianError> {
-        let storage = prepare::receive(&context)?;
-        let request = storage.request().map_err(GuardianError::PrepareStorage)?;
+        let mut wire =
+            lasper_guest_protocol::WireSessionState::after_hello(context.hello_request_id());
+        let storage = prepare::receive(&context, &mut wire)?;
+        let request = storage
+            .request_with(context.negotiated_protocol())
+            .map_err(GuardianError::PrepareStorage)?;
         let now = linux::monotonic_ms().context("read test preparation clock")?;
         let entry = match scenario {
             Scenario::BeforeReady => blocked_worker,
-            Scenario::CapturedOutput => clock_fixture::with_output,
             _ => clock_fixture::prepared,
         };
-        let (preparation, mut guardian, mut capture) =
-            prepare::assign(&context, &request, now, entry)?;
+        let (preparation, mut guardian) = prepare::assign(&context, &request, now, entry)?;
         if scenario != Scenario::BeforeReady {
             loop {
                 let now = linux::monotonic_ms().context("read test Ready clock")?;
@@ -65,6 +66,12 @@ fn run(context: GuardianContext, scenario: Scenario) -> i32 {
                     .deliver_ready(now, &mut IoBudget::new())?
                     .is_ready()
                 {
+                    wire.reply(
+                        request.request_id(),
+                        GuestOperation::Prepare,
+                        lasper_guest_protocol::WireReply::Ready,
+                    )
+                    .map_err(|_| GuardianError::InvalidStatus)?;
                     break;
                 }
                 linux::poll(&mut [], Some(1)).context("wait for test Ready")?;
@@ -76,23 +83,43 @@ fn run(context: GuardianContext, scenario: Scenario) -> i32 {
             request: &request,
             preparation,
             input: None,
-            last_request_id: request.request_id(),
+            wire,
+            sending_reply: None,
             reported: None,
             prepare_rejected: false,
             failure: None,
         };
-        prepare_failure(&mut driver, &mut guardian, capture.as_mut(), now, scenario)?;
-        let result = driver.drive(&mut guardian, capture, || Err(libc::EIO));
+        prepare_failure(&mut driver, &mut guardian, now, scenario)?;
+        let result = if scenario == Scenario::ObservationFailure {
+            deny_waitid()?;
+            driver.drive(&mut guardian, linux::monotonic_ms)
+        } else {
+            driver.drive(&mut guardian, || Err(libc::EIO))
+        };
         let observation = guardian.poll(now)?;
-        if matches!(
-            result,
-            Err(GuardianError::System {
-                errno: libc::EIO,
-                ..
-            })
-        ) && observation.phase == SessionPhase::Closed
-            && observation.cleanup_reason == Some(CleanupReason::ClockFailed)
-            && observation.worker.exit == Some(WorkerExit::Signaled(libc::SIGKILL))
+        let (expected_result, reason, signal) = if scenario == Scenario::ObservationFailure {
+            (
+                result.is_ok(),
+                CleanupReason::WorkerObservationFailed,
+                libc::SIGTERM,
+            )
+        } else {
+            (
+                matches!(
+                    result,
+                    Err(GuardianError::System {
+                        errno: libc::EIO,
+                        ..
+                    })
+                ),
+                CleanupReason::ClockFailed,
+                libc::SIGKILL,
+            )
+        };
+        if expected_result
+            && observation.phase == SessionPhase::Closed
+            && observation.cleanup_reason == Some(reason)
+            && observation.worker.exit == Some(WorkerExit::Signaled(signal))
             && guardian.next_deadline_ms().is_none()
         {
             Ok(())
@@ -107,10 +134,50 @@ fn run(context: GuardianContext, scenario: Scenario) -> i32 {
     }
 }
 
+fn deny_waitid() -> Result<(), GuardianError> {
+    let filter = [
+        libc::sock_filter {
+            code: (libc::BPF_LD | libc::BPF_W | libc::BPF_ABS) as u16,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 1,
+            k: libc::SYS_waitid as u32,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ERRNO | libc::EIO as u32,
+        },
+        libc::sock_filter {
+            code: (libc::BPF_RET | libc::BPF_K) as u16,
+            jt: 0,
+            jf: 0,
+            k: libc::SECCOMP_RET_ALLOW,
+        },
+    ];
+    let program = libc::sock_fprog {
+        len: filter.len() as u16,
+        filter: filter.as_ptr().cast_mut(),
+    };
+    // Only this guardian is restricted, after the worker has reached Ready.
+    // wait4 remains available so the test also checks that cleanup still reaps.
+    if unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0
+        || unsafe { libc::prctl(libc::PR_SET_SECCOMP, libc::SECCOMP_MODE_FILTER, &program) } != 0
+    {
+        return Err(GuardianError::InvalidStatus);
+    }
+    Ok(())
+}
+
 fn prepare_failure(
     driver: &mut ControlLoop<'_, '_>,
     guardian: &mut SessionGuardian<'_, '_>,
-    capture: Option<&mut Capture>,
     now: u64,
     scenario: Scenario,
 ) -> Result<(), GuardianError> {
@@ -132,13 +199,6 @@ fn prepare_failure(
         }
         driver.input = Some(reader);
     }
-    if scenario == Scenario::CapturedOutput {
-        let capture = capture.ok_or(GuardianError::InvalidStatus)?;
-        while capture.view()?.stdout().len() < MAX_CAPTURED_OUTPUT_BYTES {
-            capture.drain(guardian, now, &mut IoBudget::new())?;
-            linux::poll(&mut [], Some(1)).context("wait for captured test output")?;
-        }
-    }
     if scenario == Scenario::Poisoned {
         connection.poison();
     }
@@ -146,7 +206,7 @@ fn prepare_failure(
 }
 
 fn queue_recheck_reply(
-    driver: &ControlLoop<'_, '_>,
+    driver: &mut ControlLoop<'_, '_>,
     guardian: &mut SessionGuardian<'_, '_>,
     now: u64,
     backpressure: bool,
@@ -159,15 +219,25 @@ fn queue_recheck_reply(
         }
         linux::poll(&mut [], Some(1)).context("wait for test command")?;
     };
-    let command = PreparationControlFrame::decode_for(
+    let command = fixture::protocol()
+        .decode_control_request(
+            11,
+            driver.request,
+            driver.preparation,
+            frame.header(),
+            frame.payload(),
+            0,
+        )
+        .map_err(GuardianError::SessionFrame)?;
+    driver
+        .wire
+        .request(11, GuestOperation::Recheck)
+        .map_err(|_| GuardianError::InvalidStatus)?;
+    driver.sending_reply = Some((
         11,
-        driver.request,
-        driver.preparation,
-        frame.header(),
-        frame.payload(),
-        0,
-    )
-    .map_err(GuardianError::SessionFrame)?;
+        GuestOperation::Recheck,
+        lasper_guest_protocol::WireReply::Prepared,
+    ));
     guardian.control(now, command)?;
     let reply = ControlReplyFrame::new(
         command,
@@ -196,8 +266,8 @@ fn queue_recheck_reply(
         4096
     };
     let payload = Payload::encode(capacity, |bytes| {
-        let (header, length) = reply
-            .encode_parts(bytes)
+        let (header, length) = fixture::protocol()
+            .encode_control_reply(&reply, bytes)
             .map_err(GuardianError::SessionFrame)?;
         if !backpressure {
             return Ok((header, length));
@@ -205,9 +275,14 @@ fn queue_recheck_reply(
         // JSON whitespace keeps the response valid while making this one
         // queued frame larger than the socket's send buffer.
         bytes[length..].fill(b' ');
-        let header =
-            ControlFrameHeader::new(header.kind(), header.request_id(), capacity as u32, 0)
-                .map_err(|_| GuardianError::ReplyEncoding)?;
+        let header = ControlFrameHeader::new_with_version(
+            lasper_guest_protocol::ProtocolVersion { major: 1, minor: 0 },
+            header.kind(),
+            header.request_id(),
+            capacity as u32,
+            0,
+        )
+        .map_err(|_| GuardianError::ReplyEncoding)?;
         Ok((header, capacity))
     })?;
     guardian.queue_reply(ReplyKind::Command, now, payload)
@@ -217,7 +292,9 @@ fn spawn(entry: fn(GuardianContext) -> i32) -> fixture::ForkedGuardian {
     let guardian = fixture::ForkedGuardian::spawn(entry);
     let request = request();
     let mut bytes = [0; 2048];
-    let length = request.encode_into(&mut bytes).unwrap();
+    let length = fixture::protocol()
+        .encode_prepare_frame(&request, &mut bytes)
+        .unwrap();
     let header = ControlFrameHeader::decode(&bytes[..CONTROL_FRAME_HEADER_BYTES]).unwrap();
     wire::send(
         guardian.control.as_raw_fd(),
@@ -233,8 +310,13 @@ fn expect_exit(entry: fn(GuardianContext) -> i32, scenario: Scenario) {
     let mut guardian = spawn(entry);
     let request = request();
     let frame = wire::receive(guardian.control.as_raw_fd()).unwrap();
-    let ready = request
-        .decode_ready_parts(frame.header, &frame.payload, frame.descriptors.len())
+    let ready = fixture::protocol()
+        .decode_ready(
+            &request,
+            frame.header,
+            &frame.payload,
+            frame.descriptors.len(),
+        )
         .unwrap();
     let command = PreparationControlFrame::new(
         11,
@@ -243,7 +325,9 @@ fn expect_exit(entry: fn(GuardianContext) -> i32, scenario: Scenario) {
     );
     if matches!(scenario, Scenario::QueuedReply | Scenario::Backpressure) {
         let mut bytes = [0; 1024];
-        let (header, length) = command.encode_parts(&mut bytes).unwrap();
+        let (header, length) = fixture::protocol()
+            .encode_control_request(&command, &mut bytes)
+            .unwrap();
         wire::send(guardian.control.as_raw_fd(), header, &bytes[..length], &[]).unwrap();
         if scenario == Scenario::Backpressure {
             guardian.wait();
@@ -254,34 +338,46 @@ fn expect_exit(entry: fn(GuardianContext) -> i32, scenario: Scenario) {
             return;
         }
         let frame = wire::receive(guardian.control.as_raw_fd()).unwrap();
-        ControlReplyFrame::decode_for(&command, frame.header, &frame.payload, 0).unwrap();
+        fixture::protocol()
+            .decode_control_reply(&command, frame.header, &frame.payload, 0)
+            .unwrap();
     }
     if scenario == Scenario::PartialInput {
-        let (header, _) = command.encode_parts(&mut [0; 1024]).unwrap();
+        let (header, _) = fixture::protocol()
+            .encode_control_request(&command, &mut [0; 1024])
+            .unwrap();
         guardian.control.write_all(&header.encode()[..1]).unwrap();
     }
     if scenario != Scenario::Poisoned {
         loop {
             let frame = wire::receive(guardian.control.as_raw_fd()).unwrap();
-            let exit = ExitFrame::decode_for(
-                &request,
-                ready.response().preparation_id(),
-                frame.header,
-                &frame.payload,
-                frame.descriptors.len(),
-            )
-            .unwrap();
-            assert_eq!(exit.report().reason(), ExitReason::ClockFailed);
-            if scenario == Scenario::CapturedOutput {
-                let output = exit.output().unwrap();
-                assert_eq!(output.stdout().len(), MAX_CAPTURED_OUTPUT_BYTES);
-                assert!(output.stdout().truncated());
-                assert!(!output.stdout().complete());
-            }
+            let exit = fixture::protocol()
+                .decode_exit(
+                    &request,
+                    ready.response().preparation_id(),
+                    frame.header,
+                    &frame.payload,
+                    frame.descriptors.len(),
+                )
+                .unwrap();
+            assert_eq!(
+                exit.report().reason(),
+                if scenario == Scenario::ObservationFailure {
+                    ExitReason::WorkerObservationFailed
+                } else {
+                    ExitReason::ClockFailed
+                }
+            );
             if exit.report().is_final() {
                 assert_eq!(
                     exit.report().exit(),
-                    Some(ExitStatus::Signaled(libc::SIGKILL as u8))
+                    Some(ExitStatus::Signaled(
+                        if scenario == Scenario::ObservationFailure {
+                            libc::SIGTERM as u8
+                        } else {
+                            libc::SIGKILL as u8
+                        }
+                    ))
                 );
                 break;
             }
@@ -292,15 +388,26 @@ fn expect_exit(entry: fn(GuardianContext) -> i32, scenario: Scenario) {
 }
 
 #[test]
+fn worker_observation_failure_after_ready_keeps_its_reason_and_reaps() {
+    expect_exit(
+        |context| run(context, Scenario::ObservationFailure),
+        Scenario::ObservationFailure,
+    );
+}
+
+#[test]
 fn clock_failure_before_ready_sends_a_correlated_system_error_and_reaps() {
     let mut guardian = spawn(|context| run(context, Scenario::BeforeReady));
     let frame = wire::receive(guardian.control.as_raw_fd()).unwrap();
     let request = request();
     let mut bytes = [0; 2048];
-    request.encode_into(&mut bytes).unwrap();
+    fixture::protocol()
+        .encode_prepare_frame(&request, &mut bytes)
+        .unwrap();
     let header = ControlFrameHeader::decode(&bytes[..CONTROL_FRAME_HEADER_BYTES]).unwrap();
-    let error =
-        ErrorFrame::decode_for(header, &request, None, frame.header, &frame.payload, 0).unwrap();
+    let error = fixture::protocol()
+        .decode_error(header, &request, None, frame.header, &frame.payload, 0)
+        .unwrap();
     assert_eq!(error.code(), GuestErrorCode::System);
     assert_eq!(error.errno(), Some(libc::EIO));
     assert_eq!(guardian.control.read(&mut [0]).unwrap(), 0);
@@ -344,13 +451,5 @@ fn clock_failure_keeps_reaping_when_the_connection_is_already_poisoned() {
     expect_exit(
         |context| run(context, Scenario::Poisoned),
         Scenario::Poisoned,
-    );
-}
-
-#[test]
-fn clock_failure_reports_captured_output_larger_than_one_io_turn() {
-    expect_exit(
-        |context| run(context, Scenario::CapturedOutput),
-        Scenario::CapturedOutput,
     );
 }

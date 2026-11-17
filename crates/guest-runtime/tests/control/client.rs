@@ -2,15 +2,23 @@ use super::{bootstrap::GuardianProcess, wire};
 use lasper_guest_protocol::*;
 use std::os::fd::{AsRawFd, OwnedFd};
 
-pub struct Client {
+pub fn protocol() -> NegotiatedProtocol {
+    negotiate_hello(
+        HelloRequest::new(FeatureSet::EMPTY, ControlLimits::CURRENT).unwrap(),
+        HelloOffer::local(ControlLimits::CURRENT),
+    )
+    .unwrap()
+}
+
+pub struct Client<'a> {
     pub guardian: GuardianProcess,
-    pub request: PrepareRequestFrame<'static>,
+    pub request: PrepareRequestFrame<'a>,
     pub ready: PrepareReadyFrame,
     pub descriptors: Vec<OwnedFd>,
     pub next_id: u64,
 }
 
-impl Client {
+impl<'a> Client<'a> {
     pub fn prepared(
         name: &str,
         privileged: bool,
@@ -28,9 +36,14 @@ impl Client {
         execution: ExecutionKind,
         argv: &[&'static str],
     ) -> Self {
-        let request = request(execution, argv);
+        Self::prepare_request(guardian, request(execution, argv))
+    }
+
+    pub fn prepare_request(guardian: GuardianProcess, request: PrepareRequestFrame<'a>) -> Self {
         let mut bytes = vec![0; MAX_CONTROL_FRAME_BYTES as usize];
-        let length = request.encode_into(&mut bytes).unwrap();
+        let length = super::client::protocol()
+            .encode_prepare_frame(&request, &mut bytes)
+            .unwrap();
         let header = ControlFrameHeader::decode(&bytes[..CONTROL_FRAME_HEADER_BYTES]).unwrap();
         wire::send(
             guardian.control.as_raw_fd(),
@@ -40,8 +53,13 @@ impl Client {
         )
         .unwrap();
         let frame = wire::receive(guardian.control.as_raw_fd()).unwrap();
-        let ready = request
-            .decode_ready_parts(frame.header, &frame.payload, frame.descriptors.len())
+        let ready = super::client::protocol()
+            .decode_ready(
+                &request,
+                frame.header,
+                &frame.payload,
+                frame.descriptors.len(),
+            )
             .unwrap();
         Self {
             guardian,
@@ -50,6 +68,35 @@ impl Client {
             descriptors: frame.descriptors,
             next_id: 11,
         }
+    }
+
+    pub fn drain_output(
+        &self,
+    ) -> (
+        std::thread::JoinHandle<Vec<u8>>,
+        std::thread::JoinHandle<Vec<u8>>,
+    ) {
+        fn read(fd: OwnedFd) -> std::thread::JoinHandle<Vec<u8>> {
+            std::thread::spawn(move || {
+                use std::io::Read;
+                // This fixture reads on blocking threads; Ready uses nonblocking FDs.
+                let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFL) };
+                assert!(flags >= 0);
+                assert_eq!(
+                    unsafe {
+                        libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK)
+                    },
+                    0
+                );
+                let mut bytes = Vec::new();
+                std::fs::File::from(fd).read_to_end(&mut bytes).unwrap();
+                bytes
+            })
+        }
+        (
+            read(self.descriptors[2].try_clone().unwrap()),
+            read(self.descriptors[3].try_clone().unwrap()),
+        )
     }
 
     pub fn start(&mut self) {
@@ -62,25 +109,28 @@ impl Client {
             StartRequest::new(
                 &self.request,
                 self.ready.response().preparation_id(),
-                None,
-                None,
                 self.request.request().initial_size(),
                 timeout_ms,
             )
             .unwrap(),
         );
         self.next_id += 1;
-        self.send(|bytes| command.encode_parts(bytes).unwrap());
+        self.send(|bytes| {
+            super::client::protocol()
+                .encode_start_frame(&command, bytes)
+                .unwrap()
+        });
         let response = self.receive();
-        StartAcceptedFrame::decode_for(
-            command.request_id(),
-            &self.request,
-            self.ready.response().preparation_id(),
-            response.header,
-            &response.payload,
-            response.descriptors.len(),
-        )
-        .unwrap();
+        super::client::protocol()
+            .decode_start_accepted(
+                command.request_id(),
+                &self.request,
+                self.ready.response().preparation_id(),
+                response.header,
+                &response.payload,
+                response.descriptors.len(),
+            )
+            .unwrap();
     }
 
     pub fn control(&mut self, kind: PreparationControlKind) -> ControlReplyFrame {
@@ -93,15 +143,20 @@ impl Client {
             ),
         );
         self.next_id += 1;
-        self.send(|bytes| command.encode_parts(bytes).unwrap());
+        self.send(|bytes| {
+            super::client::protocol()
+                .encode_control_request(&command, bytes)
+                .unwrap()
+        });
         let response = self.receive();
-        ControlReplyFrame::decode_for(
-            &command,
-            response.header,
-            &response.payload,
-            response.descriptors.len(),
-        )
-        .unwrap()
+        super::client::protocol()
+            .decode_control_reply(
+                &command,
+                response.header,
+                &response.payload,
+                response.descriptors.len(),
+            )
+            .unwrap()
     }
 
     pub fn send_control(&mut self, kind: PreparationControlKind) {
@@ -114,7 +169,11 @@ impl Client {
             ),
         );
         self.next_id += 1;
-        self.send(|bytes| command.encode_parts(bytes).unwrap());
+        self.send(|bytes| {
+            super::client::protocol()
+                .encode_control_request(&command, bytes)
+                .unwrap()
+        });
     }
 
     pub fn send(&self, encode: impl FnOnce(&mut [u8]) -> (ControlFrameHeader, usize)) {
@@ -136,14 +195,15 @@ impl Client {
     pub fn finish(&mut self) -> wire::Frame {
         loop {
             let frame = self.receive();
-            let report = ExitFrame::decode_for(
-                &self.request,
-                self.ready.response().preparation_id(),
-                frame.header,
-                &frame.payload,
-                frame.descriptors.len(),
-            )
-            .unwrap();
+            let report = super::client::protocol()
+                .decode_exit(
+                    &self.request,
+                    self.ready.response().preparation_id(),
+                    frame.header,
+                    &frame.payload,
+                    frame.descriptors.len(),
+                )
+                .unwrap();
             if report.report().is_final() {
                 return frame;
             }
@@ -166,10 +226,8 @@ pub fn request(execution: ExecutionKind, argv: &[&'static str]) -> PrepareReques
             "alice",
             execution,
             GuestProcess::Command(CommandArgv::new(argv).unwrap()),
-            (execution == ExecutionKind::Interactive)
-                .then(|| TerminalEnvironment::new("xterm", None, None).unwrap()),
-            (execution == ExecutionKind::Interactive).then(|| TerminalSize::new(80, 24).unwrap()),
-            ProjectionRequests::default(),
+            lasper_guest_protocol::ProcessEnvironment::default(),
+            (execution == ExecutionKind::Terminal).then(|| TerminalSize::new(80, 24).unwrap()),
         )
         .unwrap(),
     )

@@ -10,8 +10,8 @@ use super::{
     EAGAIN, EINTR,
 };
 
-/// Reads only the header. Its validated length lets the caller allocate Prepare
-/// storage before handing ownership of that storage to the payload receiver.
+/// Validates the header and negotiated limits before the caller provides payload
+/// storage. This keeps an untrusted frame length from driving an unchecked mapping.
 #[must_use]
 pub struct FrameReceiver<'a> {
     operation: Operation<'a>,

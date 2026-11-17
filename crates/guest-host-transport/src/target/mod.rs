@@ -1,3 +1,9 @@
+//! Retains a host-registered machine instance across guest execution.
+//!
+//! Acquisition brackets procfs and cgroup inspection with registration queries.
+//! Later checks use the retained leader, namespaces and unit cgroup so a machine
+//! restart cannot revive a stale target.
+
 mod cgroup;
 mod runtime;
 
@@ -115,4 +121,5 @@ impl MachineTarget {
 }
 
 #[cfg(test)]
+#[path = "../../tests/target/acquisition.rs"]
 mod tests;

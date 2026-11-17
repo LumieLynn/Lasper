@@ -15,6 +15,7 @@ pub(crate) mod errno {
     pub(crate) const EEXIST: i32 = 17;
     pub(crate) const EINVAL: i32 = 22;
     pub(crate) const EFBIG: i32 = 27;
+    pub(crate) const EPIPE: i32 = 32;
     pub(crate) const ENAMETOOLONG: i32 = 36;
     pub(crate) const ETIMEDOUT: i32 = 110;
 }
@@ -46,7 +47,6 @@ pub(crate) mod file {
     pub(crate) const F_DUPFD_CLOEXEC: usize = 1030;
     pub(crate) const FD_CLOEXEC: usize = 1;
     pub(crate) const X_OK: usize = 1;
-    pub(crate) const W_OK: usize = 2;
     pub(crate) const STATX_MODE: usize = 2;
     pub(crate) const STATX_NLINK: usize = 4;
     pub(crate) const STATX_UID: usize = 8;

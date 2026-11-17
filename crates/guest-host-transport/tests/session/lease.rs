@@ -1,6 +1,6 @@
 use super::fixture::{command, final_exit, publish_ready, ready, reply, Server, PREPARATION};
 use crate::control::receive_guest_frame;
-use lasper_guest_host_transport::{BrokerSessionError, SessionPhase, SessionStartOptions};
+use lasper_guest_host_transport::{BrokerSessionError, SessionPhase, StartOptions};
 use lasper_guest_protocol::{ExitReason, PreparationControlFrame, PreparationControlKind};
 use lasper_guest_runtime::transport::TransportError;
 use std::time::Duration;
@@ -47,8 +47,8 @@ async fn cancelled_identity(start: bool) {
     let mut operation = Box::pin(async {
         if start {
             assert!(matches!(
-                session.start(SessionStartOptions::default()).await.unwrap(),
-                lasper_guest_host_transport::StartOutcome::Accepted { .. }
+                session.start(StartOptions::default()).await.unwrap(),
+                lasper_guest_host_transport::StartOutcome::Accepted
             ));
         } else {
             session.recheck().await.unwrap();
@@ -85,9 +85,9 @@ async fn lease_is_confirmed_while_the_caller_is_idle_and_drop_requests_cleanup()
         reply(&guest, keep, 45_000);
         renewed.send(()).unwrap();
         let close = command(&guest, &request);
-        assert_eq!(close.kind(), PreparationControlKind::Close);
+        assert_eq!(close.kind(), PreparationControlKind::Cancel);
         reply(&guest, close, 0);
-        final_exit(&guest, &request, ExitReason::ClientClosed);
+        final_exit(&guest, &request, ExitReason::Cancelled);
     });
     let session = server.prepare().await;
     timeout(Duration::from_secs(2), renewal)
@@ -110,7 +110,7 @@ async fn a_mismatched_lease_reply_invalidates_the_owner_instead_of_renewing() {
     });
     let mut session = server.prepare().await;
     timeout(Duration::from_secs(2), async {
-        while session.snapshot().phase() != SessionPhase::Failed {
+        while session.snapshot().phase() != SessionPhase::Finished {
             session.changed().await.unwrap();
         }
     })
@@ -138,7 +138,7 @@ async fn an_unacknowledged_keep_cannot_extend_the_previous_lease() {
     });
     let mut session = server.prepare().await;
     timeout(Duration::from_secs(3), async {
-        while session.snapshot().phase() != SessionPhase::Failed {
+        while session.snapshot().phase() != SessionPhase::Finished {
             session.changed().await.unwrap();
         }
     })

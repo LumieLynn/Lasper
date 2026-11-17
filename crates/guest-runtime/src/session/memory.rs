@@ -7,10 +7,11 @@ use super::account::{Account, MAX_ACCOUNT_FILE_BYTES};
 
 /// One private mapping per worker, retained through exec/exit. This is a
 /// multiple of all supported Linux page sizes (4, 16 and 64 KiB).
-pub const WORKER_MEMORY_BYTES: usize = 192 * 1024;
+pub const WORKER_MEMORY_BYTES: usize = size_of::<WorkerStorage>().next_multiple_of(64 * 1024);
 
 /// Stack budget for the dedicated guardian's call chain through worker exec,
-/// including entry/observer code. The large workspace is mapped separately.
+/// including the worker entry. Large account, argv and identity buffers are
+/// mapped separately.
 pub const WORKER_STACK_BUDGET_BYTES: usize = 1024 * 1024;
 
 // File reads need one extra byte to distinguish an exact-limit file from an

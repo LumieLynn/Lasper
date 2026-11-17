@@ -3,7 +3,10 @@ mod support;
 #[path = "support/target.rs"]
 mod target;
 
-use lasper_guest_host_transport::{
+#[path = "support/invalid_hello.rs"]
+mod invalid_hello;
+
+use lasper_guest_host_transport::raw::{
     HandshakeError, PreparedWorker, WorkerHello, WorkerReadiness, WorkerReadinessError,
 };
 // The shared fixture's gated rechecks are used by tests/session/lease.rs.
@@ -11,26 +14,47 @@ use lasper_guest_host_transport::{
 #[path = "support/worker.rs"]
 mod worker;
 use lasper_guest_protocol::{
-    BrokerId, CommandArgv, ControlFrameHeader, ControlLimits, ExecutionKind, FeatureSet,
-    GuestProcess, HelloNegotiationError, HelloRequest, HelloResponse, MessageKind, PreparationId,
-    PrepareReady, PrepareRequest, PrepareRequestFrame, ProjectionRequests, TerminalEnvironment,
-    TerminalSize, CONTROL_FRAME_HEADER_BYTES,
+    BrokerId, CommandArgv, CompatibilityError, ControlFrameHeader, ControlLimits, ExecutionKind,
+    FeatureSet, GuestProcess, HelloRequest, HelloResponse, MessageKind, PreparationId,
+    PrepareReady, PrepareRequest, PrepareRequestFrame, TerminalSize, CONTROL_FRAME_HEADER_BYTES,
 };
 use lasper_guest_runtime::readiness::{GuestHelloError, GuestWorkerReadiness};
 use lasper_guest_runtime::transport::GuestControlStream;
 use std::fs::File;
 use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+
+#[test]
+fn unsupported_local_features_are_request_errors_before_host_readiness_checks() {
+    let supported =
+        lasper_guest_protocol::HelloOffer::local(ControlLimits::CURRENT).supported_features;
+    let unsupported = FeatureSet::from_bits(!supported.bits());
+    assert_ne!(unsupported, FeatureSet::EMPTY);
+    assert!(matches!(
+        WorkerHello::with_features(ControlLimits::CURRENT, unsupported),
+        Err(WorkerReadinessError::InvalidRequest(
+            lasper_guest_protocol::PayloadCodecError::InvalidRequest
+        ))
+    ));
+}
+
+#[test]
+fn missing_optional_features_keep_the_negotiation_diagnostic() {
+    let error = lasper_guest_host_transport::BrokerConnectError::Incompatible(
+        CompatibilityError::MissingFeatures {
+            required: FeatureSet::EXECUTION_TIMEOUT,
+            available: FeatureSet::WORKER_PIDFD,
+        },
+    );
+    assert!(error.to_string().contains("MissingFeatures"));
+}
 use support::handshake::{establish_guest, establish_host, raw_stream_pair};
 use worker::TestWorker;
 
 fn preparation_request(execution: ExecutionKind) -> PrepareRequestFrame<'static> {
-    let (terminal, size) = match execution {
-        ExecutionKind::Interactive => (
-            Some(TerminalEnvironment::new("xterm-256color", None, None).unwrap()),
-            Some(TerminalSize::new(80, 24).unwrap()),
-        ),
-        ExecutionKind::Bounded => (None, None),
+    let size = match execution {
+        ExecutionKind::Terminal => Some(TerminalSize::new(80, 24).unwrap()),
+        ExecutionKind::Piped => None,
     };
     PrepareRequestFrame::new(
         17,
@@ -39,9 +63,8 @@ fn preparation_request(execution: ExecutionKind) -> PrepareRequestFrame<'static>
             "alice",
             execution,
             GuestProcess::Command(CommandArgv::new(&["/usr/bin/id"]).unwrap()),
-            terminal,
+            lasper_guest_protocol::ProcessEnvironment::default(),
             size,
-            ProjectionRequests::default(),
         )
         .unwrap(),
     )
@@ -136,7 +159,7 @@ async fn readiness() -> WorkerReadiness {
     let accepted = GuestWorkerReadiness::check()
         .unwrap()
         .accept_hello(
-            lasper_guest_protocol::ProtocolVersion::CURRENT,
+            lasper_guest_protocol::ProtocolVersion { major: 1, minor: 0 },
             hello.request(),
             BrokerId::new([0x5a; 16]),
             ControlLimits::CURRENT,
@@ -150,21 +173,24 @@ async fn readiness() -> WorkerReadiness {
 async fn readiness_from_response(
     hello: WorkerHello,
     response: HelloResponse,
-) -> Result<WorkerReadiness, WorkerReadinessError> {
+) -> Result<WorkerReadiness, HandshakeError> {
     let (mut host, mut peer) = raw_stream_pair();
     let mut payload = [0; lasper_guest_protocol::HELLO_PAYLOAD_BUFFER_BYTES];
     let length = response.encode_payload(&mut payload).unwrap();
-    let header = ControlFrameHeader::new(MessageKind::HelloResponse, 1, length as u32, 0).unwrap();
+    let header = ControlFrameHeader::new_with_version(
+        lasper_guest_protocol::ProtocolVersion { major: 1, minor: 0 },
+        MessageKind::HelloResponse,
+        1,
+        length as u32,
+        0,
+    )
+    .unwrap();
     peer.write_all(&header.encode()).unwrap();
     peer.write_all(&payload[..length]).unwrap();
-    match host.handshake(1, hello.request()).await {
-        Ok(_) => {}
-        Err(HandshakeError::Negotiation(error)) => {
-            return Err(WorkerReadinessError::Negotiation(error));
-        }
-        Err(error) => panic!("exchange fixture Hello: {error}"),
-    };
-    hello.complete(&host)
+    host.handshake(1, hello.request()).await?;
+    Ok(hello
+        .complete(&host)
+        .expect("fixture negotiated worker readiness"))
 }
 
 #[tokio::test]
@@ -173,22 +199,35 @@ async fn worker_readiness_requires_its_own_hello_request() {
         HelloRequest::new(FeatureSet::EMPTY, ControlLimits::CURRENT).unwrap(),
         HelloRequest::new(
             FeatureSet::WORKER_PIDFD,
-            ControlLimits::new(lasper_guest_protocol::MIN_HELPER_CONTROL_FRAME_BYTES, 2).unwrap(),
+            ControlLimits::new(
+                lasper_guest_protocol::V1_0_CAPACITIES.min_control_frame_bytes,
+                2,
+            )
+            .unwrap(),
         )
         .unwrap(),
     ] {
         let hello = WorkerHello::new(ControlLimits::CURRENT).unwrap();
         let (mut host, mut peer) = raw_stream_pair();
-        let response = HelloResponse::new(
-            FeatureSet::WORKER_PIDFD,
+        let (response, _) = HelloResponse::accept(
+            other,
+            lasper_guest_protocol::HelloOffer {
+                supported_features: FeatureSet::WORKER_PIDFD,
+                ..lasper_guest_protocol::HelloOffer::local(ControlLimits::CURRENT)
+            },
             BrokerId::new([0x5a; 16]),
-            ControlLimits::CURRENT,
         )
         .unwrap();
         let mut payload = [0; lasper_guest_protocol::HELLO_PAYLOAD_BUFFER_BYTES];
         let length = response.encode_payload(&mut payload).unwrap();
-        let header =
-            ControlFrameHeader::new(MessageKind::HelloResponse, 1, length as u32, 0).unwrap();
+        let header = ControlFrameHeader::new_with_version(
+            lasper_guest_protocol::ProtocolVersion { major: 1, minor: 0 },
+            MessageKind::HelloResponse,
+            1,
+            length as u32,
+            0,
+        )
+        .unwrap();
         peer.write_all(&header.encode()).unwrap();
         peer.write_all(&payload[..length]).unwrap();
         host.handshake(1, other).await.unwrap();
@@ -201,10 +240,10 @@ async fn worker_readiness_requires_its_own_hello_request() {
 
 #[tokio::test]
 async fn helper_hello_rejects_limits_that_cannot_hold_session_results() {
-    let minimum = lasper_guest_protocol::MIN_HELPER_CONTROL_FRAME_BYTES;
+    let minimum = lasper_guest_protocol::V1_0_CAPACITIES.min_control_frame_bytes;
     assert!(matches!(
         WorkerHello::new(ControlLimits::new(minimum - 1, 3).unwrap()),
-        Err(WorkerReadinessError::FrameLimit { available }) if available == minimum - 1
+        Err(WorkerReadinessError::FrameLimit { required, available }) if required == minimum && available == minimum - 1
     ));
     let guest = GuestWorkerReadiness::check().unwrap();
     for (host_limit, guest_limit) in [(minimum - 1, minimum), (minimum, minimum - 1)] {
@@ -214,26 +253,27 @@ async fn helper_hello_rejects_limits_that_cannot_hold_session_results() {
         )
         .unwrap();
         assert!(matches!(
-            guest.accept_hello(lasper_guest_protocol::ProtocolVersion::CURRENT, request, BrokerId::new([1; 16]), ControlLimits::new(guest_limit, 3).unwrap()),
-            Err(GuestHelloError::FrameLimit { available }) if available == minimum - 1
+            guest.accept_hello(lasper_guest_protocol::ProtocolVersion { major: 1, minor: 0 }, request, BrokerId::new([1; 16]), ControlLimits::new(guest_limit, 3).unwrap()),
+            Err(GuestHelloError::Negotiation(CompatibilityError::InsufficientFrameCapacity { available, .. })) if available == minimum - 1
         ));
     }
     let host = WorkerHello::new(ControlLimits::CURRENT).unwrap();
-    let response = HelloResponse::new(
+    let response = invalid_hello::response(
         FeatureSet::WORKER_PIDFD,
         BrokerId::new([1; 16]),
         ControlLimits::new(minimum - 1, 3).unwrap(),
-    )
-    .unwrap();
+    );
     assert!(matches!(
         readiness_from_response(host, response).await,
-        Err(WorkerReadinessError::FrameLimit { .. })
+        Err(HandshakeError::Negotiation(
+            CompatibilityError::InsufficientFrameCapacity { .. }
+        ))
     ));
 }
 
 #[tokio::test]
 async fn prepare_ready_transfers_the_assigned_worker_for_both_execution_kinds() {
-    for execution in [ExecutionKind::Interactive, ExecutionKind::Bounded] {
+    for execution in [ExecutionKind::Terminal, ExecutionKind::Piped] {
         let (mut host, guest) = raw_stream_pair();
         let hello = WorkerHello::new(ControlLimits::CURRENT).unwrap();
         let request = preparation_request(execution);
@@ -252,7 +292,7 @@ async fn prepare_ready_transfers_the_assigned_worker_for_both_execution_kinds() 
             // SAFETY: The control endpoint transfers its sole ownership to
             // the blocking guest transport.
             let mut guest = unsafe { GuestControlStream::from_raw_fd(guest.into_raw_fd()) };
-            let mut payload = [0; 256];
+            let mut payload = [0; lasper_guest_protocol::HELLO_PAYLOAD_BUFFER_BYTES];
             let frame = receive_guest_frame(&guest, &mut payload).unwrap();
             let hello_request = HelloRequest::decode_payload(frame.payload()).unwrap();
             let version = frame.header().protocol_version();
@@ -269,22 +309,36 @@ async fn prepare_ready_transfers_the_assigned_worker_for_both_execution_kinds() 
             let length = hello_response.encode_payload(&mut payload).unwrap();
             send_guest_frame(
                 &guest,
-                ControlFrameHeader::new(MessageKind::HelloResponse, 1, length as u32, 0).unwrap(),
+                ControlFrameHeader::new_with_version(
+                    lasper_guest_protocol::ProtocolVersion { major: 1, minor: 0 },
+                    MessageKind::HelloResponse,
+                    1,
+                    length as u32,
+                    0,
+                )
+                .unwrap(),
                 &payload[..length],
                 &[],
             )
             .unwrap();
-            guest.complete_hello(accepted.limits()).unwrap();
+            guest.complete_protocol(accepted.negotiated()).unwrap();
             let mut payload = [0; 4096];
             let frame = receive_guest_frame(&guest, &mut payload).unwrap();
             assert_eq!(frame.header().kind(), MessageKind::PrepareRequest);
             let mut bytes = [0; 512];
-            let length = ready.encode_into(&mut bytes).unwrap();
+            let length = accepted
+                .negotiated()
+                .encode_ready(ready, &mut bytes)
+                .unwrap();
             let mut descriptors = Vec::new();
             if let Some(terminal) = &terminal {
                 descriptors.push(terminal.as_raw_fd());
             }
             descriptors.extend([identity.as_raw_fd(), pidfd.as_raw_fd()]);
+            let pipes = (execution == ExecutionKind::Piped).then(pipe_readers);
+            if let Some(pipes) = &pipes {
+                descriptors.extend(pipes.iter().map(AsRawFd::as_raw_fd));
+            }
             send_guest_frame(
                 &guest,
                 ControlFrameHeader::decode(&bytes[..CONTROL_FRAME_HEADER_BYTES]).unwrap(),
@@ -296,7 +350,10 @@ async fn prepare_ready_transfers_the_assigned_worker_for_both_execution_kinds() 
         host.handshake(1, hello.request()).await.unwrap();
         let readiness = hello.complete(&host).unwrap();
         let mut bytes = [0; 4096];
-        let length = request.encode_into(&mut bytes).unwrap();
+        let length = readiness
+            .protocol()
+            .encode_prepare_frame(&request, &mut bytes)
+            .unwrap();
         host.send_frame(
             ControlFrameHeader::decode(&bytes[..CONTROL_FRAME_HEADER_BYTES]).unwrap(),
             &bytes[CONTROL_FRAME_HEADER_BYTES..length],
@@ -320,7 +377,7 @@ async fn prepare_ready_transfers_the_assigned_worker_for_both_execution_kinds() 
         assert_eq!(prepared.ready(), ready);
         assert_eq!(
             prepared.terminal().is_some(),
-            execution == ExecutionKind::Interactive
+            execution == ExecutionKind::Terminal
         );
         let first = prepared.observe().await.unwrap();
         let second = prepared.observe().await.unwrap();
@@ -344,9 +401,9 @@ async fn invalid_preparation_resources_close_the_received_identity_endpoint() {
     ] {
         let (mut host, guest) = raw_stream_pair();
         let execution = if failure == "not-pty" {
-            ExecutionKind::Interactive
+            ExecutionKind::Terminal
         } else {
-            ExecutionKind::Bounded
+            ExecutionKind::Piped
         };
         let request = preparation_request(execution);
         let other = PrepareRequestFrame::new(
@@ -371,7 +428,7 @@ async fn invalid_preparation_resources_close_the_received_identity_endpoint() {
         let guest_task = tokio::task::spawn_blocking(move || {
             // SAFETY: The connected control endpoint moves into this transport.
             let mut guest = unsafe { GuestControlStream::from_raw_fd(guest.into_raw_fd()) };
-            establish_guest(&mut guest);
+            let protocol = establish_guest(&mut guest);
             let pidfd = if failure == "not-pidfd" {
                 File::open("/dev/null").unwrap().into()
             } else {
@@ -379,7 +436,7 @@ async fn invalid_preparation_resources_close_the_received_identity_endpoint() {
             };
             let terminal = File::open("/dev/null").unwrap();
             let mut descriptors = Vec::new();
-            if execution == ExecutionKind::Interactive {
+            if execution == ExecutionKind::Terminal {
                 descriptors.push(terminal.as_raw_fd());
             }
             descriptors.push(identity_host.as_raw_fd());
@@ -390,8 +447,9 @@ async fn invalid_preparation_resources_close_the_received_identity_endpoint() {
                 descriptors.swap(0, 1);
             }
             let mut bytes = [0; 512];
-            let length = ready.encode_into(&mut bytes).unwrap();
-            let header = ControlFrameHeader::new(
+            let length = protocol.encode_ready(ready, &mut bytes).unwrap();
+            let header = ControlFrameHeader::new_with_version(
+                lasper_guest_protocol::ProtocolVersion { major: 1, minor: 0 },
                 MessageKind::PrepareReady,
                 ready.request_id(),
                 (length - CONTROL_FRAME_HEADER_BYTES) as u32,
@@ -425,15 +483,18 @@ async fn invalid_preparation_resources_close_the_received_identity_endpoint() {
 
 async fn deliver_ready(
     ready: lasper_guest_protocol::PrepareReadyFrame,
-    descriptors: Vec<OwnedFd>,
-) -> lasper_guest_host_transport::ReceivedControlFrame {
+    mut descriptors: Vec<OwnedFd>,
+) -> lasper_guest_host_transport::raw::ReceivedControlFrame {
+    if ready.descriptor_count() == 4 && descriptors.len() == 2 {
+        descriptors.extend(pipe_readers());
+    }
     let (mut host, guest) = raw_stream_pair();
     let sender = tokio::task::spawn_blocking(move || {
         // SAFETY: The connected control endpoint transfers its ownership.
         let mut guest = unsafe { GuestControlStream::from_raw_fd(guest.into_raw_fd()) };
-        establish_guest(&mut guest);
+        let protocol = establish_guest(&mut guest);
         let mut bytes = [0; 512];
-        let length = ready.encode_into(&mut bytes).unwrap();
+        let length = protocol.encode_ready(ready, &mut bytes).unwrap();
         let descriptors = descriptors
             .iter()
             .map(AsRawFd::as_raw_fd)
@@ -452,13 +513,33 @@ async fn deliver_ready(
     frame
 }
 
+fn pipe_readers() -> [OwnedFd; 2] {
+    std::array::from_fn(|_| {
+        let mut descriptors = [-1; 2];
+        // SAFETY: pipe2 initializes two result slots on success; each endpoint
+        // immediately acquires exactly one owner.
+        assert_eq!(
+            unsafe { libc::pipe2(descriptors.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let (read, write) = unsafe {
+            (
+                OwnedFd::from_raw_fd(descriptors[0]),
+                OwnedFd::from_raw_fd(descriptors[1]),
+            )
+        };
+        drop(write);
+        read
+    })
+}
+
 #[tokio::test]
 async fn another_workers_pty_cannot_be_combined_with_valid_identity_resources() {
     let readiness = readiness().await;
     let request = readiness
         .prepare(
             17,
-            preparation_request(ExecutionKind::Interactive)
+            preparation_request(ExecutionKind::Terminal)
                 .request()
                 .clone(),
         )
@@ -495,7 +576,7 @@ async fn terminal_assignment_is_rechecked_before_accepting_another_observation()
     let request = readiness
         .prepare(
             17,
-            preparation_request(ExecutionKind::Interactive)
+            preparation_request(ExecutionKind::Terminal)
                 .request()
                 .clone(),
         )
@@ -540,12 +621,11 @@ async fn hello_rejects_missing_worker_pidfd_before_any_prepare() {
         .contains(FeatureSet::WORKER_PIDFD));
     let result = readiness_from_response(
         hello,
-        HelloResponse::new(
+        invalid_hello::response(
             FeatureSet::EMPTY,
             BrokerId::new([0x5a; 16]),
             ControlLimits::CURRENT,
-        )
-        .unwrap(),
+        ),
     )
     .await;
     let error = match result {
@@ -554,12 +634,8 @@ async fn hello_rejects_missing_worker_pidfd_before_any_prepare() {
     };
     assert!(matches!(
         error,
-        WorkerReadinessError::Negotiation(HelloNegotiationError::UnsupportedFeatures { .. })
+        HandshakeError::Negotiation(CompatibilityError::MissingFeatures { .. })
     ));
-    assert_eq!(
-        error.to_string(),
-        "helper does not support worker pidfd assignment"
-    );
 }
 
 #[tokio::test]
@@ -580,20 +656,34 @@ async fn guest_rejects_legacy_host_during_hello_without_a_prepare_ready() {
             );
             assert!(matches!(
                 result,
-                Err(GuestHelloError::WorkerPidfdNotRequested)
+                Err(GuestHelloError::Negotiation(
+                    CompatibilityError::MissingFeatures { .. }
+                ))
             ));
             // Reject before responding or creating any worker resources.
         });
-        let legacy_request = HelloRequest::new(
+        let legacy_request = HelloRequest::from_offer(
+            lasper_guest_protocol::HelloOffer {
+                supported_features: FeatureSet::EMPTY,
+                ..lasper_guest_protocol::HelloOffer::local(
+                    ControlLimits::new(lasper_guest_protocol::MAX_CONTROL_FRAME_BYTES, descriptors)
+                        .unwrap(),
+                )
+            },
             FeatureSet::EMPTY,
-            ControlLimits::new(lasper_guest_protocol::MAX_CONTROL_FRAME_BYTES, descriptors)
-                .unwrap(),
         )
         .unwrap();
         let mut payload = [0; 256];
         let length = legacy_request.encode_payload(&mut payload).unwrap();
         host.send_frame(
-            ControlFrameHeader::new(MessageKind::HelloRequest, 1, length as u32, 0).unwrap(),
+            ControlFrameHeader::new_with_version(
+                lasper_guest_protocol::ProtocolVersion { major: 1, minor: 0 },
+                MessageKind::HelloRequest,
+                1,
+                length as u32,
+                0,
+            )
+            .unwrap(),
             &payload[..length],
             &[],
         )
@@ -610,7 +700,8 @@ async fn guest_rejects_legacy_host_during_hello_without_a_prepare_ready() {
 async fn insufficient_descriptor_limit_is_rejected_before_sending_prepare() {
     let readiness = readiness_from_response(
         WorkerHello::new(ControlLimits::CURRENT).unwrap(),
-        HelloResponse::new(
+        support::handshake::response_for(
+            HelloRequest::new(FeatureSet::WORKER_PIDFD, ControlLimits::CURRENT).unwrap(),
             FeatureSet::WORKER_PIDFD,
             BrokerId::new([0x5a; 16]),
             ControlLimits::new(lasper_guest_protocol::MAX_CONTROL_FRAME_BYTES, 2).unwrap(),
@@ -619,7 +710,7 @@ async fn insufficient_descriptor_limit_is_rejected_before_sending_prepare() {
     )
     .await
     .unwrap();
-    let request = preparation_request(ExecutionKind::Interactive);
+    let request = preparation_request(ExecutionKind::Terminal);
     assert!(matches!(
         readiness.prepare(17, request.request().clone()),
         Err(WorkerReadinessError::DescriptorLimit {
@@ -627,14 +718,20 @@ async fn insufficient_descriptor_limit_is_rejected_before_sending_prepare() {
             available: 2
         })
     ));
-    let request = preparation_request(ExecutionKind::Bounded);
-    assert!(readiness.prepare(17, request.request().clone()).is_ok());
+    let request = preparation_request(ExecutionKind::Piped);
+    assert!(matches!(
+        readiness.prepare(17, request.request().clone()),
+        Err(WorkerReadinessError::DescriptorLimit {
+            required: 4,
+            available: 2
+        })
+    ));
 }
 
 #[tokio::test]
 async fn target_leader_exit_invalidates_preparation_without_rebinding_to_a_replacement() {
     let readiness = readiness().await;
-    let request = preparation_request(ExecutionKind::Bounded);
+    let request = preparation_request(ExecutionKind::Piped);
     let ready = request
         .ready_frame(
             PrepareReady::new(PreparationId::new([8; 16]), request.broker_id(), 30_000).unwrap(),
@@ -708,7 +805,7 @@ async fn target_exit_while_waiting_for_identity_rejects_the_otherwise_valid_repl
     use std::time::Duration;
 
     let readiness = readiness().await;
-    let request = preparation_request(ExecutionKind::Bounded);
+    let request = preparation_request(ExecutionKind::Piped);
     let ready = request
         .ready_frame(
             PrepareReady::new(PreparationId::new([8; 16]), request.broker_id(), 30_000).unwrap(),
@@ -728,12 +825,14 @@ async fn target_exit_while_waiting_for_identity_rejects_the_otherwise_valid_repl
     let (waiting, challenge_received) = tokio::sync::oneshot::channel();
     let (release, released) = mpsc::channel();
     let worker_request = request.request().clone();
+    let profile = readiness.profile();
     let worker = tokio::task::spawn_blocking(move || {
         // SAFETY: Transfer the sole ownership of a connected blocking endpoint.
         let mut guest = unsafe {
             GuestIdentityChannel::from_raw_fd(
                 guest.into_raw_fd(),
                 ready.response().preparation_id(),
+                profile,
             )
         };
         let mut bytes = [0; MAX_IDENTITY_MESSAGE_BYTES];
@@ -746,7 +845,6 @@ async fn target_exit_while_waiting_for_identity_rejects_the_otherwise_valid_repl
             "alice",
             unsafe { libc::getuid() },
             unsafe { libc::getgid() },
-            Default::default(),
         )
         .unwrap();
         guest.send_reply(&reply, &mut bytes).unwrap();
@@ -780,7 +878,7 @@ async fn exited_target_rejects_ready_and_closes_received_resources() {
         return;
     }
     let readiness = readiness().await;
-    let request = preparation_request(ExecutionKind::Bounded);
+    let request = preparation_request(ExecutionKind::Piped);
     let ready = request
         .ready_frame(
             PrepareReady::new(PreparationId::new([8; 16]), request.broker_id(), 30_000).unwrap(),

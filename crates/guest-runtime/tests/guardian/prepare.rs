@@ -1,8 +1,7 @@
 use lasper_guest_protocol::{
     BrokerId, CommandArgv, ControlFrameHeader, ExecutionKind, GuestProcess, MessageKind,
     PayloadCodecError, PreparationControl, PreparationControlFrame, PreparationControlKind,
-    PreparationId, PrepareFrameError, PrepareRequest, PrepareRequestFrame, ProjectionRequests,
-    MAX_COMMAND_TOTAL_BYTES,
+    PreparationId, PrepareFrameError, PrepareRequest, PrepareRequestFrame, MAX_COMMAND_TOTAL_BYTES,
 };
 use lasper_guest_runtime::session::{
     GuardianContext, PrepareBuffer, PrepareStorage, PrepareStorageError,
@@ -17,6 +16,15 @@ use super::{command, control_fixture, guardian_fixture::GuardianProcess};
 
 const BROKER: BrokerId = BrokerId::new([1; 16]);
 const PREPARATION: PreparationId = PreparationId::new([2; 16]);
+
+fn protocol() -> lasper_guest_protocol::NegotiatedProtocol {
+    use lasper_guest_protocol::*;
+    negotiate_hello(
+        HelloRequest::new(FeatureSet::EMPTY, ControlLimits::CURRENT).unwrap(),
+        HelloOffer::local(ControlLimits::CURRENT),
+    )
+    .unwrap()
+}
 
 unsafe extern "C" {
     fn mincore(address: *const u8, length: usize, residency: *mut u8) -> i32;
@@ -76,7 +84,7 @@ pub(super) fn child(context: &mut GuardianContext, name: &str) {
     let storage = PrepareStorage::from_received(receiver.finish().unwrap()).unwrap();
     if name == "prepare-invalid" {
         assert!(matches!(
-            storage.request(),
+            storage.request_with(context.negotiated_protocol()),
             Err(PrepareStorageError::Frame(PrepareFrameError::Payload(
                 PayloadCodecError::InvalidRequest
             )))
@@ -86,7 +94,7 @@ pub(super) fn child(context: &mut GuardianContext, name: &str) {
         return;
     }
     {
-        let request = storage.request().unwrap();
+        let request = storage.request_with(context.negotiated_protocol()).unwrap();
         let GuestProcess::Command(argv) = request.request().process() else {
             panic!("expected argv");
         };
@@ -97,15 +105,17 @@ pub(super) fn child(context: &mut GuardianContext, name: &str) {
         for request_id in 20..28 {
             control.fill(0xa5);
             let frame = control_fixture::receive(context.connection(), &mut control).unwrap();
-            let received = PreparationControlFrame::decode_for(
-                request_id,
-                &request,
-                PREPARATION,
-                frame.header(),
-                frame.payload(),
-                frame.descriptors().len(),
-            )
-            .unwrap();
+            let received = context
+                .negotiated_protocol()
+                .decode_control_request(
+                    request_id,
+                    &request,
+                    PREPARATION,
+                    frame.header(),
+                    frame.payload(),
+                    frame.descriptors().len(),
+                )
+                .unwrap();
             assert_eq!(received.request_id(), request_id);
             assert_eq!(received.kind(), PreparationControlKind::KeepPrepared);
             let mut current = vec![0; MAX_COMMAND_TOTAL_BYTES + 1];
@@ -137,16 +147,17 @@ fn stable_request() {
         BROKER,
         PrepareRequest::new(
             "alice",
-            ExecutionKind::Bounded,
+            ExecutionKind::Piped,
             GuestProcess::Command(CommandArgv::new(&argv).unwrap()),
+            lasper_guest_protocol::ProcessEnvironment::default(),
             None,
-            None,
-            ProjectionRequests::default(),
         )
         .unwrap(),
     );
     let mut bytes = vec![0; 128 * 1024];
-    let length = request.encode_into(&mut bytes).unwrap();
+    let length = protocol()
+        .encode_prepare_frame(&request, &mut bytes)
+        .unwrap();
     guardian.control.write_all(&bytes[..length]).unwrap();
     for id in 20..28 {
         let message = PreparationControlFrame::new(
@@ -155,7 +166,9 @@ fn stable_request() {
             PreparationControl::new(BROKER, PREPARATION),
         );
         let mut payload = [0; 256];
-        let (header, length) = message.encode_parts(&mut payload).unwrap();
+        let (header, length) = protocol()
+            .encode_control_request(&message, &mut payload)
+            .unwrap();
         guardian.control.write_all(&header.encode()).unwrap();
         guardian.control.write_all(&payload[..length]).unwrap();
     }
@@ -170,7 +183,14 @@ fn interrupted_prepare(name: &str) {
         .set_read_timeout(Some(Duration::from_secs(4)))
         .unwrap();
     guardian.hello();
-    let header = ControlFrameHeader::new(MessageKind::PrepareRequest, 2, 1024, 0).unwrap();
+    let header = ControlFrameHeader::new_with_version(
+        lasper_guest_protocol::ProtocolVersion { major: 1, minor: 0 },
+        MessageKind::PrepareRequest,
+        2,
+        1024,
+        0,
+    )
+    .unwrap();
     guardian.control.write_all(&header.encode()).unwrap();
     guardian.control.write_all(b"{\"user\":").unwrap();
     if name == "prepare-eof" {
@@ -188,9 +208,15 @@ fn malformed_request() {
         .unwrap();
     guardian.hello();
     let payload =
-        br#"{"user":"bad/name","execution":"bounded","process":{"command":["/bin/true"]}}"#;
-    let header =
-        ControlFrameHeader::new(MessageKind::PrepareRequest, 2, payload.len() as u32, 0).unwrap();
+        br#"{"user":"bad/name","execution":"piped","environment":[],"process":{"command":["/bin/true"]}}"#;
+    let header = ControlFrameHeader::new_with_version(
+        lasper_guest_protocol::ProtocolVersion { major: 1, minor: 0 },
+        MessageKind::PrepareRequest,
+        2,
+        payload.len() as u32,
+        0,
+    )
+    .unwrap();
     guardian.control.write_all(&header.encode()).unwrap();
     guardian.control.write_all(payload).unwrap();
     assert!(guardian.wait().success());

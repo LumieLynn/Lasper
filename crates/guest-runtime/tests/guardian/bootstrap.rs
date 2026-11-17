@@ -1,6 +1,6 @@
 use lasper_guest_protocol::{
     BrokerId, CommandArgv, ExecutionKind, GuestProcess, PreparationId, PrepareRequest,
-    PrepareRequestFrame, ProjectionRequests,
+    PrepareRequestFrame,
 };
 use lasper_guest_runtime::session::{
     GuardianContext, GuardianError, SupervisorStatus, WorkerBootstrap,
@@ -82,11 +82,10 @@ pub(super) fn child(context: &mut GuardianContext, name: &str) {
             BrokerId::new([1; 16]),
             PrepareRequest::new(
                 "root",
-                ExecutionKind::Bounded,
+                ExecutionKind::Piped,
                 GuestProcess::Command(CommandArgv::new(&["/bin/true"]).unwrap()),
+                lasper_guest_protocol::ProcessEnvironment::default(),
                 None,
-                None,
-                ProjectionRequests::default(),
             )
             .unwrap(),
         );

@@ -12,7 +12,7 @@ fn delayed_prepare(privileged: bool) {
     guardian.release();
     guardian.hello();
     std::thread::sleep(Duration::from_millis(4_100));
-    let mut client = Client::prepare(guardian, ExecutionKind::Bounded, &["/bin/true"]);
+    let mut client = Client::prepare(guardian, ExecutionKind::Piped, &["/bin/true"]);
     // Cross the old Hello+5s deadline after Ready, while retaining a fresh lease.
     std::thread::sleep(Duration::from_millis(1_100));
     assert!(matches!(
@@ -30,7 +30,7 @@ fn closing_rejects_input(privileged: bool) {
     let mut client = Client::prepared(
         "closing-input",
         privileged,
-        ExecutionKind::Bounded,
+        ExecutionKind::Piped,
         &["/bin/true"],
     );
     assert_eq!(
@@ -46,11 +46,124 @@ fn closing_rejects_input(privileged: bool) {
     client.wait();
 }
 
+fn running_rejects_prepared_operations(privileged: bool) {
+    let mut client = Client::prepared(
+        "running-order",
+        privileged,
+        ExecutionKind::Piped,
+        &["/bin/sleep", "30"],
+    );
+    client.start();
+    for invalid in [false, true] {
+        for operation in [
+            GuestOperation::Prepare,
+            GuestOperation::KeepPrepared,
+            GuestOperation::Recheck,
+            GuestOperation::Start,
+            GuestOperation::Cancel,
+        ] {
+            let id = client.next_id;
+            client.next_id += 1;
+            let mut bytes = [0; 4096];
+            let preparation = if invalid {
+                PreparationId::new([9; 16])
+            } else {
+                client.ready.response().preparation_id()
+            };
+            let (header, length) = match operation {
+                GuestOperation::Prepare => {
+                    let request = PrepareRequestFrame::new(
+                        id,
+                        client.request.broker_id(),
+                        client.request.request().clone(),
+                    );
+                    let length = super::client::protocol()
+                        .encode_prepare_frame(&request, &mut bytes)
+                        .unwrap();
+                    let header =
+                        ControlFrameHeader::decode(&bytes[..CONTROL_FRAME_HEADER_BYTES]).unwrap();
+                    bytes.copy_within(CONTROL_FRAME_HEADER_BYTES..length, 0);
+                    (header, length - CONTROL_FRAME_HEADER_BYTES)
+                }
+                GuestOperation::Start => super::client::protocol()
+                    .encode_start_frame(
+                        &StartFrame::new(
+                            id,
+                            StartRequest::new(&client.request, preparation, None, None).unwrap(),
+                        ),
+                        &mut bytes,
+                    )
+                    .unwrap(),
+                _ => super::client::protocol()
+                    .encode_control_request(
+                        &PreparationControlFrame::new(
+                            id,
+                            match operation {
+                                GuestOperation::KeepPrepared => {
+                                    PreparationControlKind::KeepPrepared
+                                }
+                                GuestOperation::Recheck => PreparationControlKind::Recheck,
+                                GuestOperation::Cancel => PreparationControlKind::Cancel,
+                                _ => unreachable!(),
+                            },
+                            PreparationControl::new(client.request.broker_id(), preparation),
+                        ),
+                        &mut bytes,
+                    )
+                    .unwrap(),
+            };
+            let (header, payload) = if invalid && operation == GuestOperation::Prepare {
+                (
+                    ControlFrameHeader::new_with_version(
+                        header.protocol_version(),
+                        header.kind(),
+                        id,
+                        2,
+                        0,
+                    )
+                    .unwrap(),
+                    b"{}".as_slice(),
+                )
+            } else {
+                (header, &bytes[..length])
+            };
+            wire::send(client.guardian.control.as_raw_fd(), header, payload, &[]).unwrap();
+            let frame = client.receive();
+            let rejected = super::client::protocol()
+                .decode_error(
+                    header,
+                    &client.request,
+                    Some(client.ready.response().preparation_id()),
+                    frame.header,
+                    &frame.payload,
+                    frame.descriptors.len(),
+                )
+                .unwrap();
+            assert_eq!(
+                rejected.code(),
+                if invalid {
+                    GuestErrorCode::InvalidRequest
+                } else {
+                    GuestErrorCode::InvalidState
+                },
+                "{operation:?}, invalid={invalid}"
+            );
+            assert_eq!(rejected.operation(), operation);
+        }
+    }
+    assert_eq!(
+        client.control(PreparationControlKind::Close).status(),
+        ControlReplyStatus::CleanupRequested
+    );
+    client.finish();
+    client.wait();
+}
+
 fn cleanup_progress(privileged: bool) {
     let mut client = Client::prepared(
         "cleanup-progress",
         privileged,
-        ExecutionKind::Bounded,
+        ExecutionKind::Piped,
         &[
             "/bin/sh",
             "-c",
@@ -102,10 +215,17 @@ fn partial_input_during_cleanup(privileged: bool) {
     let mut client = Client::prepared(
         "partial-input-cleanup",
         privileged,
-        ExecutionKind::Bounded,
+        ExecutionKind::Piped,
         &["/bin/true"],
     );
-    let header = ControlFrameHeader::new(MessageKind::Recheck, 11, 100, 0).unwrap();
+    let header = ControlFrameHeader::new_with_version(
+        lasper_guest_protocol::ProtocolVersion { major: 1, minor: 0 },
+        MessageKind::Recheck,
+        11,
+        100,
+        0,
+    )
+    .unwrap();
     client
         .guardian
         .control
@@ -125,7 +245,7 @@ fn closed_output(privileged: bool, large: bool, close_writers: bool) {
     let mut client = Client::prepared(
         "held-output",
         privileged,
-        ExecutionKind::Bounded,
+        ExecutionKind::Piped,
         if large {
             &["/bin/output-helper", "--hold-output", "large"]
         } else {
@@ -140,6 +260,7 @@ fn closed_output(privileged: bool, large: bool, close_writers: bool) {
     std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o666)).unwrap();
     listener.set_nonblocking(true).unwrap();
     client.start();
+    let readers = client.drain_output();
     let limit = Instant::now() + Duration::from_secs(4);
     let stream = loop {
         match listener.accept() {
@@ -162,7 +283,6 @@ fn closed_output(privileged: bool, large: bool, close_writers: bool) {
     wait_until_reaped(&client);
     // No descendant owns these writers now. Cleanup is complete, but EOF is not.
     let started = Instant::now();
-    send_late_commands(&mut client);
     let mut stdout = std::fs::File::from(writers[0].try_clone().unwrap());
     stdout.write_all(b"after-cleanup").unwrap();
     drop(stdout);
@@ -174,29 +294,19 @@ fn closed_output(privileged: bool, large: bool, close_writers: bool) {
     };
     let frame = client.finish();
     let report = exit(&client, &frame);
-    let output = report.output().unwrap();
-    if large {
-        assert_eq!(
-            output.stdout().len() + output.stderr().len(),
-            MAX_CAPTURED_OUTPUT_BYTES
-        );
-        assert!(output.stdout().truncated() && output.stderr().truncated());
-    } else {
-        let mut bytes = [0; 32];
-        let length = output.stdout().write_into(&mut bytes).unwrap();
-        assert_eq!(&bytes[..length], b"after-cleanup");
-    }
-    assert_eq!(output.stdout().complete(), close_writers);
-    assert_eq!(output.stderr().complete(), close_writers);
-    if !close_writers {
-        assert!(
-            started.elapsed() >= Duration::from_millis(500),
-            "capture abandoned before its drain interval"
-        );
-        assert!(output.stdout().truncated() && output.stderr().truncated());
-    }
+    assert!(report.report().is_final());
+    // Status completion is independent of writers retained outside the guest.
+
     assert!(started.elapsed() < Duration::from_secs(3));
     drop(held);
+    let stdout = readers.0.join().unwrap();
+    let stderr = readers.1.join().unwrap();
+    if large {
+        assert!(stdout.len() > 64 * 1024);
+        assert!(stderr.len() > 64 * 1024);
+    } else {
+        assert_eq!(stdout, b"after-cleanup");
+    }
     client.wait();
 }
 
@@ -211,13 +321,15 @@ fn send_late_commands(client: &mut Client) {
                 client.ready.response().preparation_id(),
                 None,
                 None,
-                None,
-                None,
             )
             .unwrap(),
         );
         client.next_id += 1;
-        client.send(|bytes| start.encode_parts(bytes).unwrap());
+        client.send(|bytes| {
+            super::client::protocol()
+                .encode_start_frame(&start, bytes)
+                .unwrap()
+        });
     }
 }
 
@@ -231,15 +343,16 @@ fn wait_until_reaped(client: &Client) {
     }
 }
 
-fn exit<'a>(client: &Client, frame: &'a wire::Frame) -> ExitFrame<'a> {
-    ExitFrame::decode_for(
-        &client.request,
-        client.ready.response().preparation_id(),
-        frame.header,
-        &frame.payload,
-        frame.descriptors.len(),
-    )
-    .unwrap()
+fn exit(client: &Client, frame: &wire::Frame) -> ExitFrame {
+    super::client::protocol()
+        .decode_exit(
+            &client.request,
+            client.ready.response().preparation_id(),
+            frame.header,
+            &frame.payload,
+            frame.descriptors.len(),
+        )
+        .unwrap()
 }
 
 pub fn export_output(large: bool) {
@@ -249,11 +362,22 @@ pub fn export_output(large: bool) {
     }
     let stream = UnixStream::connect("/home/alice/output.sock").unwrap();
     // Fixture-only FD transfer; the parent holds both writers outside the session tree.
-    let header = ControlFrameHeader::new(MessageKind::PrepareReady, 1, 0, 2).unwrap();
+    let header = ControlFrameHeader::new_with_version(
+        lasper_guest_protocol::ProtocolVersion { major: 1, minor: 0 },
+        MessageKind::PrepareReady,
+        1,
+        0,
+        2,
+    )
+    .unwrap();
     wire::send(stream.as_raw_fd(), header, &[], &[1, 2]).unwrap();
 }
 
 pub const SCENARIOS: &[super::Scenario] = &[
+    (
+        "running rejects Keep, Recheck and repeated Start but still accepts Close",
+        running_rejects_prepared_operations,
+    ),
     (
         "cleanup progress precedes final Exit without duplicate reports or late command replies",
         cleanup_progress,
@@ -271,11 +395,11 @@ pub const SCENARIOS: &[super::Scenario] = &[
         partial_input_during_cleanup,
     ),
     (
-        "Closed keeps draining output to EOF without accepting commands",
+        "host can drain output after final Exit without accepting commands",
         |p| closed_output(p, false, true),
     ),
     (
-        "Closed abandons externally held output after its drain interval",
+        "final Exit does not wait for externally held pipe writers",
         |p| closed_output(p, false, false),
     ),
     (

@@ -1,5 +1,10 @@
 //! Host connections and worker observations for the Lasper guest runtime.
 //!
+//! Acquire a MachineTarget, then use GuestClient to probe or prepare execution.
+//! Prepare returns a Session control owner and independent SessionIo descriptors.
+//! The background session driver owns protocol ordering, lease renewal and
+//! cleanup observation. Protocol tests use the lower-level types in [`raw`].
+//!
 //! The host trusts its kernel, procfs view and machine registration source. It
 //! pins the machine and peer processes, checks namespace/root/cgroup membership,
 //! and binds identity replies to the specific worker pidfd supplied in Ready.
@@ -12,18 +17,23 @@
 //! against a compromised guardian or guest administrator.
 //!
 //! Low-level identity observations establish sender credentials, not machine
-//! membership. PreparedWorker adds target and PTY checks; BrokerSession repeats
-//! those checks before Start. Acceptance of Start does not confirm exec success.
+//! membership. PreparedWorker checks target membership and PTY ownership before
+//! delivering data descriptors. Before Start, the driver repeats identity and
+//! target checks; it no longer owns the delivered PTY. Start acceptance does not
+//! confirm exec success.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
 #[cfg(not(target_os = "linux"))]
 compile_error!("Lasper guest transport currently supports Linux only");
 
+mod client;
 mod connection;
 mod identity;
+mod io;
 mod preparation;
 mod process;
+pub mod raw;
 mod readiness;
 mod session;
 mod stream;
@@ -31,16 +41,28 @@ mod target;
 
 const SCM_PIDFD: libc::c_int = 4;
 
-pub use connection::{BrokerConnectError, BrokerConnection};
-pub use identity::{
-    IdentityPeerCredentials, IdentityWorker, UnixIdentityChannel, WorkerObservation, WorkerProcess,
-};
-pub use preparation::PreparedWorker;
-pub use readiness::{WorkerHello, WorkerReadiness, WorkerReadinessError};
+pub use connection::BrokerConnectError;
+use connection::BrokerConnection;
+pub use identity::WorkerObservation;
+use identity::{IdentityWorker, UnixIdentityChannel, WorkerProcess};
+use preparation::{PreparedIo, PreparedWorker};
+use readiness::{WorkerHello, WorkerReadiness, WorkerReadinessError};
+use session::BrokerSession;
 pub use session::{
-    BrokerSession, BrokerSessionError, SessionPhase, SessionSnapshot, SessionStartOptions,
-    StartError, StartOutcome,
+    BrokerSessionError, Completion, SessionPhase, SessionSnapshot, StartError, StartOutcome,
+    StartSubmission,
 };
-pub use session::{CapturedStream, SessionExit, SessionOutput};
-pub use stream::{HandshakeError, NegotiatedHello, ReceivedControlFrame, UnixControlStream};
+pub use stream::NegotiatedHello;
+use stream::{HandshakeError, ReceivedControlFrame, UnixControlStream};
 pub use target::{MachineRegistration, MachineTarget, MachineTargetSource};
+
+pub use client::{
+    open_shell, ClientOptions, ClientTimeouts, GuestClient, PrepareCapacityError, PrepareError,
+    Prepared, ProcessSpec, Program, RequestError, RuntimeInfo, Session, ShellOpenError,
+    StartOptions, Stdio, DEFAULT_ENDPOINT,
+};
+pub use io::{PipeReader, PtyMaster, SessionIo};
+pub use lasper_guest_protocol::{
+    CleanupStatus, ExecutionStatus, ExitReason, ExitReport, ExitStatus, GuestFailure,
+    GuestFailureStage, TerminalSize,
+};

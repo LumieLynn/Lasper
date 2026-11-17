@@ -4,14 +4,14 @@ use super::frame::{
     check_reply, codec_error, encode_frame, validate_session_frame, validate_token,
     SessionFrameError, SessionPayloadError,
 };
-use crate::messages::{decode_json_payload, encode_json_payload};
+use crate::json::decode_json_payload;
 use crate::{
-    BrokerId, ControlFrameHeader, MessageKind, PayloadCodecError, PreparationId,
-    PrepareRequestFrame, MAX_PREPARED_LEASE_MS,
+    BrokerId, ControlFrameHeader, MessageKind, PreparationId, PrepareRequestFrame,
+    MAX_PREPARED_LEASE_MS,
 };
 
-/// Correlates commands sent after `PrepareReady` with one broker generation
-/// and one prepared worker.
+/// Binds commands after Ready to one broker instance and one preparation
+/// on this connection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 pub struct PreparationControl {
     broker_id: BrokerId,
@@ -41,20 +41,21 @@ impl PreparationControl {
         self.preparation_id
     }
 
-    pub fn encode_payload(self, output: &mut [u8]) -> Result<usize, PayloadCodecError> {
-        encode_json_payload(&self, output)
-    }
-
     /// Decodes a control payload only when it belongs to the prepared request
     /// on this connection.
-    pub fn decode_for(
+    pub(crate) fn decode_for(
         request: &PrepareRequestFrame<'_>,
         preparation_id: PreparationId,
         bytes: &[u8],
     ) -> Result<Self, SessionPayloadError> {
         let wire: WirePreparationControl =
             decode_json_payload(bytes).map_err(SessionPayloadError::Payload)?;
-        validate_token(request, preparation_id, wire.broker_id, wire.preparation_id)?;
+        validate_token(
+            request.broker_id(),
+            preparation_id,
+            wire.broker_id,
+            wire.preparation_id,
+        )?;
         Ok(Self::new(wire.broker_id, wire.preparation_id))
     }
 }
@@ -68,7 +69,7 @@ pub enum PreparationControlKind {
 }
 
 impl PreparationControlKind {
-    const fn message_kind(self) -> MessageKind {
+    pub(crate) const fn message_kind(self) -> MessageKind {
         match self {
             Self::KeepPrepared => MessageKind::KeepPrepared,
             Self::Recheck => MessageKind::Recheck,
@@ -88,8 +89,7 @@ impl PreparationControlKind {
     }
 }
 
-/// A control operation other than Start. Its small fixed layout does not
-/// reserve the path buffer carried only by Start.
+/// A control operation bound to one prepared worker on this connection.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PreparationControlFrame {
     request_id: u64,
@@ -122,11 +122,13 @@ impl PreparationControlFrame {
         self.control
     }
 
-    pub fn encode_parts(
+    pub(crate) fn encode_parts_with_version(
         &self,
+        version: crate::ProtocolVersion,
         payload: &mut [u8],
     ) -> Result<(ControlFrameHeader, usize), SessionFrameError> {
         encode_frame(
+            version,
             self.kind.message_kind(),
             self.request_id,
             &self.control,
@@ -136,7 +138,7 @@ impl PreparationControlFrame {
 
     /// Decodes a command against the Prepare that owns this control
     /// connection, including its correlation ID and descriptor-free contract.
-    pub fn decode_for(
+    pub(crate) fn decode_for(
         expected_request_id: u64,
         request: &PrepareRequestFrame<'_>,
         preparation_id: PreparationId,
@@ -156,8 +158,10 @@ impl PreparationControlFrame {
     }
 }
 
+/// KeepPrepared and Recheck return the remaining lease. Cancel and Close only
+/// acknowledge the cleanup request; completion is reported in Exit.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ControlReplyStatus {
     Prepared { remaining_lease_ms: u32 },
     CleanupRequested,
@@ -205,12 +209,14 @@ impl ControlReplyFrame {
         self.status
     }
 
-    pub fn encode_parts(
+    pub(crate) fn encode_parts_with_version(
         &self,
+        version: crate::ProtocolVersion,
         payload: &mut [u8],
     ) -> Result<(ControlFrameHeader, usize), SessionFrameError> {
         let token = self.command.control();
         encode_frame(
+            version,
             self.command.kind().message_kind(),
             self.command.request_id(),
             &WireControlReply {
@@ -222,7 +228,7 @@ impl ControlReplyFrame {
         )
     }
 
-    pub fn decode_for(
+    pub(crate) fn decode_for(
         command: &PreparationControlFrame,
         header: ControlFrameHeader,
         payload: &[u8],
@@ -236,25 +242,17 @@ impl ControlReplyFrame {
             received_descriptors,
         )?;
         let wire: WireControlReply = decode_json_payload(payload).map_err(codec_error)?;
-        check_token(command.control(), wire.broker_id, Some(wire.preparation_id))?;
+        if wire.status == ControlReplyStatus::CleanupRequested {
+            crate::json::require_top_level_strings(payload, &["status"]).map_err(codec_error)?;
+        }
+        let expected = command.control();
+        validate_token(
+            expected.broker_id(),
+            expected.preparation_id(),
+            wire.broker_id,
+            wire.preparation_id,
+        )
+        .map_err(SessionFrameError::Payload)?;
         Self::new(*command, wire.status).map_err(SessionFrameError::Payload)
     }
-}
-
-fn check_token(
-    expected: PreparationControl,
-    broker: BrokerId,
-    preparation: Option<PreparationId>,
-) -> Result<(), SessionFrameError> {
-    if broker != expected.broker_id() {
-        return Err(SessionFrameError::Payload(
-            SessionPayloadError::BrokerMismatch,
-        ));
-    }
-    if preparation != Some(expected.preparation_id()) {
-        return Err(SessionFrameError::Payload(
-            SessionPayloadError::PreparationMismatch,
-        ));
-    }
-    Ok(())
 }

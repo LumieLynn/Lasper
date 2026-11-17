@@ -1,12 +1,12 @@
 use super::fixture::{command, exit_report, final_exit, ready, reply, Server, BROKER, PREPARATION};
 use crate::control::{receive_guest_frame, send_guest_frame};
 use lasper_guest_host_transport::{
-    BrokerSessionError, SessionPhase, SessionStartOptions, StartError, StartOutcome,
+    BrokerSessionError, SessionPhase, StartError, StartOptions, StartOutcome,
 };
 use lasper_guest_protocol::{
     CleanupStatus, ErrorFrame, ExecutionStatus, ExitReason, ExitReport, ExitStatus, GuestErrorCode,
-    GuestOperation, OutputStream, PreparationControl, PreparationControlFrame,
-    PreparationControlKind, StartAcceptedFrame, StartFrame, TerminalSize, MAX_EXECUTION_TIMEOUT_MS,
+    GuestOperation, PreparationControl, PreparationControlFrame, PreparationControlKind,
+    StartAcceptedFrame, TerminalSize, MAX_EXECUTION_TIMEOUT_MS,
 };
 use std::time::Duration;
 use tokio::time::timeout;
@@ -28,17 +28,18 @@ async fn invalid_start_reply(wrong_error: bool) {
         reply(&guest, recheck, 45_000);
         let mut bytes = [0; 4096];
         let frame = receive_guest_frame(&guest, &mut bytes).unwrap();
-        let start = StartFrame::decode_for(
-            frame.header().request_id(),
-            &request,
-            PREPARATION,
-            frame.header(),
-            frame.payload(),
-            frame.descriptors().len(),
-        )
-        .unwrap();
+        let start = super::fixture::protocol()
+            .decode_start_frame(
+                frame.header().request_id(),
+                &request,
+                PREPARATION,
+                frame.header(),
+                frame.payload(),
+                frame.descriptors().len(),
+            )
+            .unwrap();
         if wrong_error {
-            let (header, length) = ErrorFrame::new(
+            let error = ErrorFrame::new(
                 start.request_id(),
                 BROKER,
                 Some(PREPARATION),
@@ -46,9 +47,10 @@ async fn invalid_start_reply(wrong_error: bool) {
                 GuestErrorCode::InvalidState,
                 None,
             )
-            .unwrap()
-            .encode_parts(&mut bytes)
             .unwrap();
+            let (header, length) = super::fixture::protocol()
+                .encode_error(&error, &mut bytes)
+                .unwrap();
             send_guest_frame(&guest, header, &bytes[..length], &[]).unwrap();
         } else {
             reply(
@@ -67,23 +69,21 @@ async fn invalid_start_reply(wrong_error: bool) {
         ));
     });
     let mut session = server.prepare().await;
-    let outcome = session.start(SessionStartOptions::default()).await.unwrap();
+    let outcome = session.start(StartOptions::default()).await.unwrap();
     assert!(
         matches!(
             outcome,
-            StartOutcome::Unknown {
-                cause: BrokerSessionError::Protocol(_)
-            }
+            StartOutcome::Unknown { ref cause } if matches!(cause.as_ref(), BrokerSessionError::Protocol(_))
         ),
         "{outcome:?}"
     );
-    assert_eq!(session.snapshot().phase(), SessionPhase::Failed);
+    assert_eq!(session.snapshot().phase(), SessionPhase::Finished);
     assert!(matches!(
         session.snapshot().error(),
         Some(BrokerSessionError::Protocol(_))
     ));
     assert!(matches!(
-        session.start(SessionStartOptions::default()).await,
+        session.start(StartOptions::default()).await,
         Err(StartError::NotSubmitted(BrokerSessionError::DriverStopped))
     ));
     server.finish().await;
@@ -97,16 +97,17 @@ async fn a_matching_start_error_remains_a_definite_rejection() {
         reply(&guest, recheck, 45_000);
         let mut bytes = [0; 4096];
         let frame = receive_guest_frame(&guest, &mut bytes).unwrap();
-        let start = StartFrame::decode_for(
-            frame.header().request_id(),
-            &request,
-            PREPARATION,
-            frame.header(),
-            frame.payload(),
-            frame.descriptors().len(),
-        )
-        .unwrap();
-        let (header, length) = ErrorFrame::new(
+        let start = super::fixture::protocol()
+            .decode_start_frame(
+                frame.header().request_id(),
+                &request,
+                PREPARATION,
+                frame.header(),
+                frame.payload(),
+                frame.descriptors().len(),
+            )
+            .unwrap();
+        let error = ErrorFrame::new(
             start.request_id(),
             BROKER,
             Some(PREPARATION),
@@ -114,14 +115,15 @@ async fn a_matching_start_error_remains_a_definite_rejection() {
             GuestErrorCode::Expired,
             None,
         )
-        .unwrap()
-        .encode_parts(&mut bytes)
         .unwrap();
+        let (header, length) = super::fixture::protocol()
+            .encode_error(&error, &mut bytes)
+            .unwrap();
         send_guest_frame(&guest, header, &bytes[..length], &[]).unwrap();
     });
     let mut session = server.prepare().await;
     assert!(matches!(
-        session.start(SessionStartOptions::default()).await,
+        session.start(StartOptions::default()).await,
         Err(StartError::Rejected(error)) if error.code() == GuestErrorCode::Expired
     ));
     server.finish().await;
@@ -135,20 +137,23 @@ async fn acceptance_is_distinct_from_a_later_exec_failure() {
         reply(&guest, command(&guest, &request), 45_000);
         let mut bytes = [0; 4096];
         let frame = receive_guest_frame(&guest, &mut bytes).unwrap();
-        let start = StartFrame::decode_for(
-            frame.header().request_id(),
-            &request,
-            PREPARATION,
-            frame.header(),
-            frame.payload(),
-            frame.descriptors().len(),
-        )
-        .unwrap();
+        let start = super::fixture::protocol()
+            .decode_start_frame(
+                frame.header().request_id(),
+                &request,
+                PREPARATION,
+                frame.header(),
+                frame.payload(),
+                frame.descriptors().len(),
+            )
+            .unwrap();
         let accepted = StartAcceptedFrame::new(
             start.request_id(),
             PreparationControl::new(BROKER, PREPARATION),
         );
-        let (header, length) = accepted.encode_parts(&mut bytes).unwrap();
+        let (header, length) = super::fixture::protocol()
+            .encode_start_accepted(&accepted, &mut bytes)
+            .unwrap();
         send_guest_frame(&guest, header, &bytes[..length], &[]).unwrap();
         released.recv_timeout(Duration::from_secs(3)).unwrap();
         exit_report(
@@ -161,26 +166,25 @@ async fn acceptance_is_distinct_from_a_later_exec_failure() {
                 ExitReason::ExecFailed,
             )
             .unwrap(),
-            OutputStream::new(&[], false, true).unwrap(),
         );
     });
     let mut session = server.prepare().await;
     assert!(matches!(
-        session.start(SessionStartOptions::default()).await.unwrap(),
-        StartOutcome::Accepted { terminal: None }
+        session.start(StartOptions::default()).await.unwrap(),
+        StartOutcome::Accepted
     ));
-    assert_eq!(session.snapshot().phase(), SessionPhase::StartAccepted);
-    assert!(session.snapshot().exit().is_none());
+    assert_eq!(session.snapshot().phase(), SessionPhase::Accepted);
+    assert!(session.snapshot().report.is_none());
     release.send(()).unwrap();
     timeout(Duration::from_secs(3), async {
-        while session.snapshot().phase() != SessionPhase::Closed {
+        while session.snapshot().phase() != SessionPhase::Finished {
             session.changed().await.unwrap();
         }
     })
     .await
     .unwrap();
     let snapshot = session.snapshot();
-    let report = snapshot.exit().unwrap().report();
+    let report = snapshot.report.unwrap();
     assert_eq!(report.execution(), ExecutionStatus::Failed { errno: 2 });
     assert_eq!(report.command_exit(), None);
     assert!(snapshot.error().is_none());
@@ -196,24 +200,25 @@ async fn lost_start_ack_is_unknown_and_the_start_is_never_sent_twice() {
         reply(&guest, recheck, 45_000);
         let mut bytes = [0; 4096];
         let frame = receive_guest_frame(&guest, &mut bytes).unwrap();
-        StartFrame::decode_for(
-            frame.header().request_id(),
-            &request,
-            PREPARATION,
-            frame.header(),
-            frame.payload(),
-            frame.descriptors().len(),
-        )
-        .unwrap();
+        super::fixture::protocol()
+            .decode_start_frame(
+                frame.header().request_id(),
+                &request,
+                PREPARATION,
+                frame.header(),
+                frame.payload(),
+                frame.descriptors().len(),
+            )
+            .unwrap();
         // The host cannot tell whether execution followed this received Start.
     });
     let mut session = server.prepare().await;
     assert!(matches!(
-        session.start(SessionStartOptions::default()).await,
+        session.start(StartOptions::default()).await,
         Ok(StartOutcome::Unknown { .. })
     ));
     assert!(matches!(
-        session.start(SessionStartOptions::default()).await,
+        session.start(StartOptions::default()).await,
         Err(StartError::NotSubmitted(BrokerSessionError::DriverStopped))
     ));
     server.finish().await;
@@ -229,15 +234,16 @@ async fn cancelling_committed_start_sends_close_without_waiting_for_ack() {
         reply(&guest, recheck, 45_000);
         let mut bytes = [0; 4096];
         let frame = receive_guest_frame(&guest, &mut bytes).unwrap();
-        let start = StartFrame::decode_for(
-            frame.header().request_id(),
-            &request,
-            PREPARATION,
-            frame.header(),
-            frame.payload(),
-            frame.descriptors().len(),
-        )
-        .unwrap();
+        let start = super::fixture::protocol()
+            .decode_start_frame(
+                frame.header().request_id(),
+                &request,
+                PREPARATION,
+                frame.header(),
+                frame.payload(),
+                frame.descriptors().len(),
+            )
+            .unwrap();
         seen.send(()).unwrap();
         released.recv_timeout(Duration::from_secs(3)).unwrap();
         drop(frame);
@@ -247,7 +253,9 @@ async fn cancelling_committed_start_sends_close_without_waiting_for_ack() {
             start.request_id(),
             PreparationControl::new(BROKER, PREPARATION),
         );
-        let (header, length) = accepted.encode_parts(&mut bytes).unwrap();
+        let (header, length) = super::fixture::protocol()
+            .encode_start_accepted(&accepted, &mut bytes)
+            .unwrap();
         send_guest_frame(&guest, header, &bytes[..length], &[]).unwrap();
         reply(&guest, close, 0);
         exit_report(
@@ -260,11 +268,10 @@ async fn cancelling_committed_start_sends_close_without_waiting_for_ack() {
                 ExitReason::ClientClosed,
             )
             .unwrap(),
-            OutputStream::new(&[], false, true).unwrap(),
         );
     });
     let mut session = server.prepare().await;
-    let mut start = Box::pin(session.start(SessionStartOptions::default()));
+    let mut start = Box::pin(session.start(StartOptions::default()));
     tokio::select! {
         result = &mut start => panic!("Start should wait for acknowledgment: {result:?}"),
         _ = observed => {},
@@ -273,7 +280,7 @@ async fn cancelling_committed_start_sends_close_without_waiting_for_ack() {
     assert_eq!(session.snapshot().phase(), SessionPhase::Starting);
     release.send(()).unwrap();
     timeout(Duration::from_secs(3), async {
-        while session.snapshot().phase() != SessionPhase::Closed {
+        while session.snapshot().phase() != SessionPhase::Finished {
             session.changed().await.unwrap();
         }
     })
@@ -281,7 +288,7 @@ async fn cancelling_committed_start_sends_close_without_waiting_for_ack() {
     .unwrap();
     assert!(session.snapshot().error().is_none());
     assert_eq!(
-        session.snapshot().exit().unwrap().report().execution(),
+        session.snapshot().report.unwrap().execution(),
         ExecutionStatus::Started
     );
     server.finish().await;
@@ -290,6 +297,66 @@ async fn cancelling_committed_start_sends_close_without_waiting_for_ack() {
 #[tokio::test]
 async fn final_exit_before_start_ack_returns_the_execution_report() {
     exit_before_start_ack(CleanupStatus::Complete).await;
+}
+
+#[tokio::test]
+async fn start_ack_after_exit_progress_is_validated_without_reopening_the_session() {
+    let server = Server::spawn(|guest, request| {
+        let _worker = ready(&guest, &request, 45_000);
+        let recheck = command(&guest, &request);
+        reply(&guest, recheck, 45_000);
+        let mut bytes = [0; 4096];
+        let frame = receive_guest_frame(&guest, &mut bytes).unwrap();
+        let start = super::fixture::protocol()
+            .decode_start_frame(
+                frame.header().request_id(),
+                &request,
+                PREPARATION,
+                frame.header(),
+                frame.payload(),
+                frame.descriptors().len(),
+            )
+            .unwrap();
+        let accepted = StartAcceptedFrame::new(
+            start.request_id(),
+            PreparationControl::new(BROKER, PREPARATION),
+        );
+        let report = ExitReport::new(
+            ExecutionStatus::Started,
+            Some(ExitStatus::Exited(7)),
+            CleanupStatus::InProgress,
+            ExitReason::WorkerExited,
+        )
+        .unwrap();
+        exit_report(&guest, &request, report);
+        let (header, length) = super::fixture::protocol()
+            .encode_start_accepted(&accepted, &mut bytes)
+            .unwrap();
+        send_guest_frame(&guest, header, &bytes[..length], &[]).unwrap();
+        final_exit(&guest, &request, ExitReason::WorkerExited);
+    });
+    let mut session = server.prepare().await;
+    assert!(matches!(
+        session.start(StartOptions::default()).await.unwrap(),
+        StartOutcome::Reported(_)
+    ));
+    timeout(Duration::from_secs(3), async {
+        while session.snapshot().phase() != SessionPhase::Finished {
+            session.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        session.snapshot().error().is_none(),
+        "{:?}",
+        session.snapshot()
+    );
+    assert_eq!(
+        session.snapshot().submission,
+        lasper_guest_host_transport::StartSubmission::Accepted
+    );
+    server.finish().await;
 }
 
 #[tokio::test]
@@ -313,21 +380,17 @@ async fn exit_before_start_ack(cleanup: CleanupStatus) {
         reply(&guest, recheck, 45_000);
         let mut bytes = [0; 4096];
         let frame = receive_guest_frame(&guest, &mut bytes).unwrap();
-        StartFrame::decode_for(
-            frame.header().request_id(),
-            &request,
-            PREPARATION,
-            frame.header(),
-            frame.payload(),
-            frame.descriptors().len(),
-        )
-        .unwrap();
-        exit_report(
-            &guest,
-            &request,
-            report,
-            OutputStream::new(b"command ran", false, true).unwrap(),
-        );
+        super::fixture::protocol()
+            .decode_start_frame(
+                frame.header().request_id(),
+                &request,
+                PREPARATION,
+                frame.header(),
+                frame.payload(),
+                frame.descriptors().len(),
+            )
+            .unwrap();
+        exit_report(&guest, &request, report);
         if cleanup != CleanupStatus::Complete {
             next.recv_timeout(Duration::from_secs(3)).unwrap();
             exit_report(
@@ -340,22 +403,20 @@ async fn exit_before_start_ack(cleanup: CleanupStatus) {
                     report.reason(),
                 )
                 .unwrap(),
-                OutputStream::new(b"command ran", false, true).unwrap(),
             );
         }
     });
     let mut session = server.prepare().await;
-    let outcome = session.start(SessionStartOptions::default()).await.unwrap();
+    let outcome = session.start(StartOptions::default()).await.unwrap();
     let StartOutcome::Reported(exit) = outcome else {
         panic!("Exit must retain its execution report: {outcome:?}");
     };
-    assert_eq!(exit.report(), report);
-    assert_eq!(exit.output().unwrap().stdout().bytes(), b"command ran");
+    assert_eq!(exit, report);
     assert!(session.snapshot().error().is_none());
     assert_eq!(
         session.snapshot().phase(),
         if cleanup == CleanupStatus::Complete {
-            SessionPhase::Closed
+            SessionPhase::Finished
         } else {
             SessionPhase::Closing
         }
@@ -363,7 +424,7 @@ async fn exit_before_start_ack(cleanup: CleanupStatus) {
     if cleanup != CleanupStatus::Complete {
         advance.send(()).unwrap();
         timeout(Duration::from_secs(3), async {
-            while session.snapshot().phase() != SessionPhase::Closed {
+            while session.snapshot().phase() != SessionPhase::Finished {
                 session.changed().await.unwrap();
             }
         })
@@ -391,7 +452,7 @@ async fn cancelling_start_during_recheck_does_not_execute_the_command() {
         final_exit(&guest, &request, ExitReason::Cancelled);
     });
     let mut session = server.prepare().await;
-    let mut start = Box::pin(session.start(SessionStartOptions::default()));
+    let mut start = Box::pin(session.start(StartOptions::default()));
     tokio::select! {
         result = &mut start => panic!("Start must wait for Recheck: {result:?}"),
         _ = observed => {}
@@ -400,7 +461,7 @@ async fn cancelling_start_during_recheck_does_not_execute_the_command() {
     release.send(()).unwrap();
     session.cancel().await.unwrap();
     timeout(Duration::from_secs(3), async {
-        while session.snapshot().phase() != SessionPhase::Closed {
+        while session.snapshot().phase() != SessionPhase::Finished {
             session.changed().await.unwrap();
         }
     })
@@ -420,21 +481,21 @@ async fn invalid_start_options_leave_the_prepared_worker_usable() {
     });
     let mut session = server.prepare().await;
     for options in [
-        SessionStartOptions {
+        StartOptions {
             terminal_size: Some(TerminalSize::new(80, 24).unwrap()),
             ..Default::default()
         },
-        SessionStartOptions {
+        StartOptions {
             execution_timeout: Some(Duration::ZERO),
             ..Default::default()
         },
-        SessionStartOptions {
+        StartOptions {
             execution_timeout: Some(
                 Duration::from_millis(MAX_EXECUTION_TIMEOUT_MS) + Duration::from_nanos(1),
             ),
             ..Default::default()
         },
-        SessionStartOptions {
+        StartOptions {
             execution_timeout: Some(Duration::MAX),
             ..Default::default()
         },
@@ -470,21 +531,24 @@ async fn start_forwards_only_the_requested_execution_budget() {
             reply(&guest, recheck, 45_000);
             let mut bytes = [0; 4096];
             let frame = receive_guest_frame(&guest, &mut bytes).unwrap();
-            let start = StartFrame::decode_for(
-                frame.header().request_id(),
-                &request,
-                PREPARATION,
-                frame.header(),
-                frame.payload(),
-                frame.descriptors().len(),
-            )
-            .unwrap();
+            let start = super::fixture::protocol()
+                .decode_start_frame(
+                    frame.header().request_id(),
+                    &request,
+                    PREPARATION,
+                    frame.header(),
+                    frame.payload(),
+                    frame.descriptors().len(),
+                )
+                .unwrap();
             assert_eq!(start.request().execution_timeout_ms(), expected);
             let accepted = StartAcceptedFrame::new(
                 start.request_id(),
                 PreparationControl::new(BROKER, PREPARATION),
             );
-            let (header, length) = accepted.encode_parts(&mut bytes).unwrap();
+            let (header, length) = super::fixture::protocol()
+                .encode_start_accepted(&accepted, &mut bytes)
+                .unwrap();
             send_guest_frame(&guest, header, &bytes[..length], &[]).unwrap();
             let close = command(&guest, &request);
             assert_eq!(close.kind(), PreparationControlKind::Close);
@@ -499,19 +563,18 @@ async fn start_forwards_only_the_requested_execution_budget() {
                     ExitReason::ClientClosed,
                 )
                 .unwrap(),
-                OutputStream::new(&[], false, true).unwrap(),
             );
         });
         let mut session = server.prepare().await;
         assert!(matches!(
             session
-                .start(SessionStartOptions {
+                .start(StartOptions {
                     execution_timeout: duration,
                     ..Default::default()
                 })
                 .await
                 .unwrap(),
-            StartOutcome::Accepted { terminal: None }
+            StartOutcome::Accepted
         ));
         session.close().await.unwrap();
         server.finish().await;

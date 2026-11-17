@@ -1,7 +1,7 @@
 use core::task::Poll;
 use lasper_guest_protocol::{
     ErrorFrame, ExitFrame, ExitReport, GuestErrorCode, GuestOperation, PreparationId,
-    PrepareRequestFrame, CONTROL_FRAME_HEADER_BYTES, MAX_CAPTURED_OUTPUT_BYTES,
+    PrepareRequestFrame, CONTROL_FRAME_HEADER_BYTES,
 };
 
 use crate::linux::uapi::{
@@ -11,29 +11,29 @@ use crate::linux::uapi::{
 use crate::transport::{IoBudget, IO_BYTES_PER_TURN};
 
 use super::super::error::SystemResultExt;
-use super::super::ready::{Payload, ReplyKind};
+use super::super::reply::{Payload, ReplyKind};
 use super::super::{
     CleanupReason, GuardianContext, GuardianError, GuardianObservation, SessionConnection,
     SessionGuardian, SessionPhase, SupervisorStatus,
 };
-use super::capture::Capture;
 use super::input::{Input, InputProgress};
 use crate::linux::{self, PollFd};
 
-const MAX_EXIT_PAYLOAD_BYTES: usize = 4096 + 4 * MAX_CAPTURED_OUTPUT_BYTES.div_ceil(3);
+const MAX_EXIT_PAYLOAD_BYTES: usize = 4096;
 // A queued reply must finish before the cleanup report. Each pass can send at
 // most these two frames; a blocked socket ends the attempt rather than waiting.
 const CLOCK_FAILURE_FLUSH_TURNS: usize =
     2 * (MAX_EXIT_PAYLOAD_BYTES + CONTROL_FRAME_HEADER_BYTES).div_ceil(IO_BYTES_PER_TURN);
 
-// Only wire progress lives here. Worker phases and cleanup decisions remain in
-// SessionGuardian, even after the control connection can no longer be used.
+// Wire ordering is committed when a complete reply has been sent. Worker state
+// may already have advanced, so it remains with SessionGuardian during partial I/O.
 struct ControlLoop<'context, 'request> {
     context: &'context GuardianContext,
     request: &'request PrepareRequestFrame<'request>,
     preparation: PreparationId,
     input: Option<Input<'context>>,
-    last_request_id: u64,
+    wire: lasper_guest_protocol::WireSessionState,
+    sending_reply: Option<(u64, GuestOperation, lasper_guest_protocol::WireReply)>,
     reported: Option<ExitReport>,
     prepare_rejected: bool,
     failure: Option<GuardianError>,
@@ -44,26 +44,26 @@ pub(super) fn run<'request>(
     request: &'request PrepareRequestFrame<'request>,
     preparation: PreparationId,
     guardian: &mut SessionGuardian<'_, '_>,
-    capture: Option<Capture>,
+    wire: lasper_guest_protocol::WireSessionState,
 ) -> Result<(), GuardianError> {
     ControlLoop {
         context,
         request,
         preparation,
         input: None,
-        last_request_id: request.request_id(),
+        wire,
+        sending_reply: None,
         reported: None,
         prepare_rejected: false,
         failure: None,
     }
-    .drive(guardian, capture, linux::monotonic_ms)
+    .drive(guardian, linux::monotonic_ms)
 }
 
 impl ControlLoop<'_, '_> {
     fn drive(
         mut self,
         guardian: &mut SessionGuardian<'_, '_>,
-        mut capture: Option<Capture>,
         mut clock: impl FnMut() -> Result<u64, i32>,
     ) -> Result<(), GuardianError> {
         let mut last_now = self.context.hello_completed_at_ms();
@@ -71,12 +71,13 @@ impl ControlLoop<'_, '_> {
             let now = match clock().context("read guardian session clock") {
                 Ok(now) => now,
                 Err(error) => {
-                    return self.finish_without_clock(guardian, capture.as_mut(), last_now, error);
+                    return self.finish_without_clock(guardian, last_now, error);
                 }
             };
             last_now = now;
             let supervisor_alive = self.supervise(guardian, now);
             if !self.context.connection().can_continue() {
+                self.wire.disconnect();
                 self.input.take();
                 guardian.connection_closed(now, SessionConnection::Client);
             }
@@ -95,40 +96,26 @@ impl ControlLoop<'_, '_> {
                 self.fail(guardian, now, GuardianError::ControlExpired);
             }
             let mut budget = IoBudget::new();
-            if let Some(capture) = capture.as_mut() {
-                if observation.phase == SessionPhase::Closed {
-                    capture.after_cleanup(now);
-                }
-                if let Err(error) = capture.drain(guardian, now, &mut budget) {
-                    capture.abandon(guardian);
-                    guardian.fail(now, CleanupReason::WorkerObservationFailed);
-                    self.fail(guardian, now, error);
-                }
-            }
-            let output_finished = capture.as_ref().is_none_or(Capture::finished);
             if self.context.connection().can_continue() {
-                match self.advance(guardian, observation, capture.as_ref(), now, &mut budget) {
+                match self.advance(guardian, observation, now, &mut budget) {
                     Ok(true) => return self.result(),
                     Ok(false) => {}
                     Err(error) => self.fail(guardian, now, error),
                 }
             }
             if guardian.phase() == SessionPhase::Closed
-                && output_finished
                 && (!self.context.connection().can_continue()
                     || (self.prepare_rejected && !guardian.has_reply()))
             {
                 return self.result();
             }
-            let deadline = [
-                guardian.next_deadline_ms(),
-                self.input_deadline(guardian),
-                capture.as_ref().and_then(Capture::deadline_ms),
-            ]
-            .into_iter()
-            .flatten()
-            .min();
-            if let Err(error) = self.wait(guardian, supervisor_alive, now, deadline) {
+            let deadline = [guardian.next_deadline_ms(), self.input_deadline(guardian)]
+                .into_iter()
+                .flatten()
+                .min();
+            if let Err(error) =
+                self.wait(guardian, observation.phase, supervisor_alive, now, deadline)
+            {
                 self.fail(guardian, now, error);
             }
         }
@@ -147,29 +134,20 @@ impl ControlLoop<'_, '_> {
     fn finish_without_clock(
         &mut self,
         guardian: &mut SessionGuardian<'_, '_>,
-        mut capture: Option<&mut Capture>,
         last_now: u64,
         error: GuardianError,
     ) -> Result<(), GuardianError> {
-        // No grace or output deadline can be measured now. Keep the connection
+        // No grace or reply deadline can be measured now. Keep the connection
         // usable for a bounded report attempt, but do not read another command.
         self.failure.get_or_insert(error);
         guardian.force_cleanup(CleanupReason::ClockFailed);
-        if let Some(capture) = capture.as_deref_mut() {
-            capture.abandon(guardian);
-        }
         let mut first_observation = true;
         loop {
             match guardian.poll(last_now) {
                 Ok(observation) => {
                     let closed = observation.phase == SessionPhase::Closed;
                     if first_observation || closed {
-                        self.report_without_clock(
-                            guardian,
-                            observation,
-                            capture.as_deref(),
-                            last_now,
-                        );
+                        self.report_without_clock(guardian, observation, last_now);
                         first_observation = false;
                     }
                     if closed {
@@ -179,7 +157,7 @@ impl ControlLoop<'_, '_> {
                 }
                 Err(_) => guardian.force_cleanup(CleanupReason::ClockFailed),
             }
-            let [status, pidfd, _, _] = guardian.poll_descriptors();
+            let [status, pidfd] = guardian.poll_descriptors();
             let _ = linux::poll(&mut [PollFd::new(status), PollFd::new(pidfd)], Some(10));
         }
     }
@@ -188,17 +166,16 @@ impl ControlLoop<'_, '_> {
         &mut self,
         guardian: &mut SessionGuardian<'_, '_>,
         observation: GuardianObservation,
-        capture: Option<&Capture>,
         last_now: u64,
     ) {
         if !self.context.connection().can_continue() {
             return;
         }
-        // last_now only satisfies the existing reply API. The finite I/O budget,
-        // not a frozen absolute deadline, bounds this emergency flush.
+        // Replies use the last valid timestamp. A fixed I/O budget bounds this
+        // flush because that timestamp can no longer measure a send timeout.
         for _ in 0..CLOCK_FAILURE_FLUSH_TURNS {
             let mut budget = IoBudget::new();
-            match self.advance(guardian, observation, capture, last_now, &mut budget) {
+            match self.advance(guardian, observation, last_now, &mut budget) {
                 Ok(true) => return,
                 Ok(false) if !guardian.has_reply() => return,
                 Ok(false) if !budget.available() => continue,
@@ -231,6 +208,7 @@ impl ControlLoop<'_, '_> {
     }
 
     fn close_connection(&mut self, guardian: &mut SessionGuardian<'_, '_>, now: u64) {
+        self.wire.disconnect();
         self.context.connection().poison();
         self.input.take();
         guardian.connection_closed(now, SessionConnection::Client);
@@ -244,7 +222,6 @@ impl ControlLoop<'_, '_> {
         &mut self,
         guardian: &mut SessionGuardian<'_, '_>,
         observation: GuardianObservation,
-        capture: Option<&Capture>,
         now: u64,
         budget: &mut IoBudget,
     ) -> Result<bool, GuardianError> {
@@ -253,11 +230,20 @@ impl ControlLoop<'_, '_> {
         // reply first, then tries to send the report within the same I/O budget.
         loop {
             if !guardian.has_reply() {
-                self.queue_reply(guardian, observation, capture, now)?;
+                self.queue_reply(guardian, observation, now)?;
             }
             match guardian.flush(now, budget)? {
-                Poll::Ready(ReplyKind::Exit { final_report: true }) => return Ok(true),
-                Poll::Ready(_) if observation.cleanup_reason.is_some() => continue,
+                Poll::Ready(kind) => {
+                    self.reply_sent(kind)?;
+                    if kind == (ReplyKind::Exit { final_report: true }) {
+                        self.wire.disconnect();
+                        return Ok(true);
+                    }
+                    if observation.cleanup_reason.is_some() {
+                        continue;
+                    }
+                    break;
+                }
                 _ => break,
             }
         }
@@ -268,24 +254,44 @@ impl ControlLoop<'_, '_> {
             };
             match reader.advance(now, budget)? {
                 InputProgress::Pending(reader) => self.input = Some(reader),
-                InputProgress::Complete(frame) => super::dispatch::dispatch(
-                    guardian,
-                    self.request,
-                    self.preparation,
-                    &mut self.last_request_id,
-                    frame,
-                    now,
-                )?,
+                InputProgress::Complete(frame) => {
+                    self.sending_reply = super::dispatch::dispatch(
+                        guardian,
+                        self.request,
+                        self.preparation,
+                        &mut self.wire,
+                        frame,
+                        now,
+                    )?
+                }
             }
         }
         Ok(false)
+    }
+
+    fn reply_sent(&mut self, kind: ReplyKind) -> Result<(), GuardianError> {
+        use lasper_guest_protocol::WireReply;
+        match kind {
+            ReplyKind::Ready => self.wire.reply(
+                self.request.request_id(),
+                GuestOperation::Prepare,
+                WireReply::Ready,
+            ),
+            ReplyKind::Command => match self.sending_reply.take() {
+                Some((id, operation, reply)) => self.wire.reply(id, operation, reply),
+                None => Ok(()), // An unregistered request was rejected without changing the session.
+            },
+            ReplyKind::Exit { final_report } => {
+                self.wire.exit(self.request.request_id(), final_report)
+            }
+        }
+        .map_err(|_| GuardianError::InvalidStatus)
     }
 
     fn queue_reply(
         &mut self,
         guardian: &mut SessionGuardian<'_, '_>,
         observation: GuardianObservation,
-        capture: Option<&Capture>,
         now: u64,
     ) -> Result<(), GuardianError> {
         if observation.phase == SessionPhase::Prepared {
@@ -300,12 +306,11 @@ impl ControlLoop<'_, '_> {
         let Some(report) = super::report::report(observation)? else {
             return Ok(());
         };
-        let final_report = report.is_final() && capture.is_none_or(Capture::finished);
-        if self.reported == Some(report) || (report.is_final() && !final_report) {
+        let final_report = report.is_final();
+        if self.reported == Some(report) {
             return Ok(());
         }
-        let output = capture.map(Capture::view).transpose()?;
-        let exit = ExitFrame::new(self.request, self.preparation, report, output)
+        let exit = ExitFrame::new(self.request, self.preparation, report)
             .map_err(|_| GuardianError::ReplyEncoding)?;
         let capacity = (self
             .context
@@ -314,7 +319,9 @@ impl ControlLoop<'_, '_> {
             .max_control_frame_bytes() as usize)
             .min(MAX_EXIT_PAYLOAD_BYTES);
         let payload = Payload::encode(capacity, |bytes| {
-            exit.encode_parts(bytes)
+            self.context
+                .negotiated_protocol()
+                .encode_exit(&exit, bytes)
                 .map_err(GuardianError::SessionFrame)
         })?;
         guardian.queue_reply(ReplyKind::Exit { final_report }, now, payload)?;
@@ -353,11 +360,17 @@ impl ControlLoop<'_, '_> {
         .and_then(|error| error.with_stage(failure.stage))
         .map_err(|_| GuardianError::ReplyEncoding)?;
         let payload = Payload::encode(4096, |bytes| {
-            error
-                .encode_parts(bytes)
+            self.context
+                .negotiated_protocol()
+                .encode_error(&error, bytes)
                 .map_err(GuardianError::SessionFrame)
         })?;
         guardian.queue_reply(ReplyKind::Command, now, payload)?;
+        self.sending_reply = Some((
+            self.request.request_id(),
+            GuestOperation::Prepare,
+            lasper_guest_protocol::WireReply::Rejected,
+        ));
         self.prepare_rejected = true;
         Ok(())
     }
@@ -365,24 +378,29 @@ impl ControlLoop<'_, '_> {
     fn wait(
         &self,
         guardian: &SessionGuardian<'_, '_>,
+        observed_phase: SessionPhase,
         supervisor_alive: bool,
         now: u64,
         deadline: Option<u64>,
     ) -> Result<(), GuardianError> {
+        // Dispatch can observe worker exit and complete cleanup after the
+        // earlier poll. Rebuild the reply from that new state before waiting;
+        // a Closed worker has no remaining FD or deadline to wake this loop.
+        if guardian.phase() != observed_phase {
+            return Ok(());
+        }
         if deadline.is_some_and(|deadline| deadline <= now) {
             return Ok(());
         }
         let [control, broker, signals] = self.context.poll_descriptors();
-        let worker = guardian.poll_descriptors();
+        let [status, pidfd] = guardian.poll_descriptors();
         let connected = self.context.connection().can_continue();
         let mut descriptors = [
             PollFd::new(if connected { control } else { -1 }),
             PollFd::new(if supervisor_alive { broker } else { -1 }),
             PollFd::new(if supervisor_alive { signals } else { -1 }),
-            PollFd::new(worker[0]),
-            PollFd::new(worker[1]),
-            PollFd::new(worker[2]),
-            PollFd::new(worker[3]),
+            PollFd::new(status),
+            PollFd::new(pidfd),
         ];
         descriptors[0].events = (if guardian.has_reply() {
             POLLOUT
@@ -410,5 +428,9 @@ impl ControlLoop<'_, '_> {
 }
 
 #[cfg(test)]
-#[path = "../../../tests/control/clock.rs"]
-mod clock_tests;
+#[path = "../../../tests/control/driver_failures.rs"]
+mod failure_tests;
+
+#[cfg(test)]
+#[path = "../../../tests/control/wait.rs"]
+mod wait_tests;

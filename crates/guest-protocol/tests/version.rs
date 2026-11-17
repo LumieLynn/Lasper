@@ -1,129 +1,69 @@
-use lasper_guest_protocol::{
-    Architecture, BrokerId, ControlFrameHeader, ControlLimits, ControlSessionError,
-    ControlSessionState, FeatureSet, HelloNegotiationError, HelloRequest, HelloResponse,
-    MessageKind, ProtocolVersion, ProtocolVersionMismatch, RuntimeCompatibilityError,
-    RuntimeIdentity, RuntimeRequirements,
-};
+use lasper_guest_protocol::*;
 
-fn other_versions() -> [ProtocolVersion; 2] {
+fn other_versions(selected: ProtocolVersion) -> [ProtocolVersion; 2] {
     [
         ProtocolVersion {
-            major: ProtocolVersion::CURRENT.major + 1,
-            ..ProtocolVersion::CURRENT
+            major: selected.major + 1,
+            ..selected
         },
         ProtocolVersion {
-            minor: ProtocolVersion::CURRENT.minor + 1,
-            ..ProtocolVersion::CURRENT
+            minor: selected.minor + 1,
+            ..selected
         },
     ]
 }
 
 fn header(kind: MessageKind, version: ProtocolVersion) -> ControlFrameHeader {
-    let mut bytes = ControlFrameHeader::new(kind, 1, 0, 0).unwrap().encode();
-    bytes[12..14].copy_from_slice(&version.major.to_le_bytes());
-    bytes[14..16].copy_from_slice(&version.minor.to_le_bytes());
-    ControlFrameHeader::decode(&bytes).unwrap()
+    ControlFrameHeader::new_with_version(version, kind, 1, 0, 0).unwrap()
 }
 
 fn hello() -> (HelloRequest, HelloResponse) {
-    (
-        HelloRequest::new(FeatureSet::EMPTY, ControlLimits::CURRENT).unwrap(),
-        HelloResponse::new(
-            FeatureSet::EMPTY,
-            BrokerId::new([1; 16]),
-            ControlLimits::CURRENT,
-        )
-        .unwrap(),
+    let request = HelloRequest::new(FeatureSet::EMPTY, ControlLimits::CURRENT).unwrap();
+    let (response, _) = HelloResponse::accept(
+        request,
+        HelloOffer::local(ControlLimits::CURRENT),
+        BrokerId::new([1; 16]),
     )
+    .unwrap();
+    (request, response)
 }
 
 #[test]
-fn identity_and_hello_use_the_same_exact_version_requirement() {
-    let requirements = RuntimeRequirements {
-        architecture: Architecture::X86_64,
-        required_features: FeatureSet::EMPTY,
-        minimum_control_frame_bytes: 4096,
-    };
-    let current = RuntimeIdentity::current(Architecture::X86_64);
-    let (request, response) = hello();
-    assert_eq!(requirements.check(current), Ok(()));
-    assert!(request
-        .negotiate(ProtocolVersion::CURRENT, response)
+fn bootstrap_allows_foreign_major_to_reach_hello_negotiation() {
+    let foreign = ProtocolVersion { major: 2, minor: 0 };
+    assert!(ControlConnectionState::guest()
+        .next_inbound(header(MessageKind::HelloRequest, foreign))
         .is_ok());
-    for version in other_versions() {
-        let identity = RuntimeIdentity {
-            protocol_major: version.major,
-            protocol_minor: version.minor,
-            ..current
-        };
-        let identity = RuntimeIdentity::decode(&identity.encode()).unwrap();
-        assert_eq!(identity.protocol_version(), version);
-        let error = ProtocolVersionMismatch {
-            expected: ProtocolVersion::CURRENT,
-            actual: version,
-        };
-        assert_eq!(
-            requirements.check(identity),
-            Err(RuntimeCompatibilityError::ProtocolVersion(error))
-        );
-        assert_eq!(
-            request.negotiate(version, response),
-            Err(HelloNegotiationError::ProtocolVersion(error))
-        );
-    }
-}
-
-#[test]
-fn both_hello_directions_reject_different_major_or_minor_versions() {
-    let request = header(MessageKind::HelloRequest, ProtocolVersion::CURRENT);
-    let host = ControlSessionState::host().next_outbound(request).unwrap();
-    let guest = ControlSessionState::guest().next_inbound(request).unwrap();
-    for version in other_versions() {
-        let error = Err(ControlSessionError::ProtocolVersion(
-            ProtocolVersionMismatch {
-                expected: ProtocolVersion::CURRENT,
-                actual: version,
-            },
-        ));
-        let foreign_request = header(MessageKind::HelloRequest, version);
-        let foreign_response = header(MessageKind::HelloResponse, version);
-        assert_eq!(
-            ControlSessionState::host().next_outbound(foreign_request),
-            error
-        );
-        assert_eq!(
-            ControlSessionState::guest().next_inbound(foreign_request),
-            error
-        );
-        assert_eq!(host.next_inbound(foreign_response), error);
-        assert_eq!(guest.next_outbound(foreign_response), error);
-    }
+    let invalid = ProtocolVersion { major: 1, minor: 1 };
+    assert!(ControlConnectionState::guest()
+        .next_inbound(header(MessageKind::HelloRequest, invalid))
+        .is_err());
 }
 
 #[test]
 fn established_sessions_cannot_change_versions_in_either_direction() {
-    let request = header(MessageKind::HelloRequest, ProtocolVersion::CURRENT);
-    let response = header(MessageKind::HelloResponse, ProtocolVersion::CURRENT);
-    let mut host = ControlSessionState::host()
+    let request = header(MessageKind::HelloRequest, ProtocolVersion::BOOTSTRAP);
+    let response = header(MessageKind::HelloResponse, ProtocolVersion::BOOTSTRAP);
+    let mut host = ControlConnectionState::host()
         .next_outbound(request)
         .unwrap()
         .next_inbound(response)
         .unwrap();
-    let mut guest = ControlSessionState::guest()
+    let mut guest = ControlConnectionState::guest()
         .next_inbound(request)
         .unwrap()
         .next_outbound(response)
         .unwrap();
     let (request, response) = hello();
-    let limits = request
-        .negotiate(ProtocolVersion::CURRENT, response)
+    let protocol = request
+        .negotiate_protocol(ProtocolVersion::BOOTSTRAP, response)
         .unwrap();
-    host.complete_hello(limits).unwrap();
-    guest.complete_hello(limits).unwrap();
-    for version in other_versions() {
+    host.complete_protocol(protocol).unwrap();
+    guest.complete_protocol(protocol).unwrap();
+    for version in other_versions(protocol.profile().version()) {
         let error = Err(ControlSessionError::ProtocolVersion(
             ProtocolVersionMismatch {
-                expected: ProtocolVersion::CURRENT,
+                expected: protocol.profile().version(),
                 actual: version,
             },
         ));

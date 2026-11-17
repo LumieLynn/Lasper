@@ -2,6 +2,9 @@
 #![no_std]
 #![deny(unsafe_op_in_unsafe_fn)]
 
+//! Enters Rust after relocating the static PIE. Broker and wrapper invocations
+//! switch to a mapped stack before forking; identify and help use the entry stack.
+
 mod cli;
 mod entry_memory;
 mod entry_relocation;
@@ -82,6 +85,16 @@ unsafe extern "C" fn runtime_entry(initial_stack: *const usize) -> ! {
     let argv = unsafe { initial_stack.add(1) as *mut *const core::ffi::c_char };
     let envp = unsafe { argv.add(argc + 1) as *const *const core::ffi::c_char };
     let page_size = unsafe { entry_relocation::page_size(initial_stack) };
+    // SAFETY: envp is the kernel-provided terminated environment array.
+    match unsafe { lasper_guest_runtime::policy::GuestPolicy::from_envp(envp) } {
+        Ok(policy) => policy.install(),
+        Err(name) => {
+            let _ = write_all(2, b"lasper guest runtime: invalid policy ");
+            let _ = write_all(2, name.as_bytes());
+            let _ = write_all(2, b"\n");
+            exit_group(FailureClass::Configuration.exit_code());
+        }
+    }
     // Init entry detection precedes flag parsing so arguments such as --help
     // reach the guest init.
     if argc > 0
@@ -127,10 +140,9 @@ unsafe extern "C" fn runtime_entry(initial_stack: *const usize) -> ! {
         exit_group(FailureClass::Usage.exit_code());
     }
     if argc == 3 {
-        let argument = unsafe { *initial_stack.add(2) as *const u8 };
+        let argument = unsafe { (*argv.add(1)).cast::<u8>() };
         if unsafe { c_string_equals(argument, cli::BROKER_ARGUMENT) } {
-            let directory =
-                unsafe { CStr::from_ptr(*initial_stack.add(3) as *const core::ffi::c_char) };
+            let directory = unsafe { CStr::from_ptr(*argv.add(2)) };
             unsafe {
                 entry_stack::run(
                     &entry_stack::Invocation::Broker(directory.as_ptr()),
@@ -140,7 +152,7 @@ unsafe extern "C" fn runtime_entry(initial_stack: *const usize) -> ! {
         }
     }
     if argc == 2 {
-        let argument = unsafe { *initial_stack.add(2) as *const u8 };
+        let argument = unsafe { (*argv.add(1)).cast::<u8>() };
         if unsafe { c_string_equals(argument, cli::IDENTIFY_ARGUMENT) } {
             let identity = lasper_guest_runtime::identity_frame();
             if write_all(1, &identity) {

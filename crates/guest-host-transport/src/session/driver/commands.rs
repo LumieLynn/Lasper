@@ -2,10 +2,7 @@ use super::control::{CleanupRequest, ExpectedReply, Outbound, PendingRequest, Re
 use super::operation::{CheckPurpose, Operation, StartPlan};
 use super::worker::Worker;
 use super::Owner;
-use crate::session::{
-    wire, BrokerSessionError, Command, SessionPhase, SessionStartOptions, StartError,
-    OPERATION_TIMEOUT,
-};
+use crate::session::{wire, BrokerSessionError, Command, SessionPhase, StartError, StartOptions};
 use lasper_guest_protocol::{
     PreparationControlFrame, PreparationControlKind, StartRequest, CONTROL_FRAME_HEADER_BYTES,
 };
@@ -23,7 +20,7 @@ impl Owner<'_> {
         let allowed = match &command {
             Command::Close { .. } => matches!(
                 self.phase(),
-                SessionPhase::Prepared | SessionPhase::Starting | SessionPhase::StartAccepted
+                SessionPhase::Prepared | SessionPhase::Starting | SessionPhase::Accepted
             ),
             _ => self.phase() == SessionPhase::Prepared,
         };
@@ -62,7 +59,6 @@ impl Owner<'_> {
             Command::Start {
                 deadline,
                 options,
-                evidence,
                 reply,
                 delivered,
             } => {
@@ -77,7 +73,6 @@ impl Owner<'_> {
                 self.operation = Some(Operation::Check {
                     purpose: CheckPurpose::Start(StartPlan {
                         payload,
-                        evidence,
                         reply,
                         delivered,
                     }),
@@ -131,7 +126,9 @@ impl Owner<'_> {
     }
 
     pub(super) fn keep_prepared(&mut self) -> Result<(), BrokerSessionError> {
-        let deadline = self.lease_deadline.min(Instant::now() + OPERATION_TIMEOUT);
+        let deadline = self
+            .lease_deadline
+            .min(Instant::now() + self.timeouts.operation);
         let (frame, expected) = self.control_frame(PreparationControlKind::KeepPrepared)?;
         self.exchange(frame, expected, RequestPurpose::Keep, deadline)
     }
@@ -148,6 +145,10 @@ impl Owner<'_> {
             if Instant::now() >= deadline {
                 return Err(BrokerSessionError::Deadline);
             }
+            let mut checked = self.wire_state;
+            checked
+                .queue_request(frame.header.request_id(), expected.operation())
+                .map_err(wire::sequence)?;
             // The guardian can outlive the broker or machine leader. Let
             // cleanup reach it on this connection even if recheck would fail.
             if !matches!(
@@ -160,6 +161,7 @@ impl Owner<'_> {
             self.connection
                 .control()
                 .queue_frame(frame.header, frame.payload)?;
+            self.wire_state = checked;
             Ok(())
         })();
         if let Err(error) = queued {
@@ -172,7 +174,7 @@ impl Owner<'_> {
             .reject(&error);
             return Err(error);
         }
-        self.output_deadline = Some(deadline);
+        self.write_deadline = Some(deadline);
         self.pending = Some(PendingRequest {
             expected,
             sent_at,
@@ -188,7 +190,10 @@ impl Owner<'_> {
     ) -> Result<(Outbound, ExpectedReply), BrokerSessionError> {
         let command = PreparationControlFrame::new(self.request_id()?, kind, self.token);
         let mut payload = [0; 512];
-        let (header, length) = command.encode_parts(&mut payload)?;
+        let (header, length) = self
+            .hello
+            .protocol()
+            .encode_control_request(&command, &mut payload)?;
         Ok((
             Outbound {
                 header,
@@ -198,12 +203,11 @@ impl Owner<'_> {
         ))
     }
 
-    fn start_payload(&self, options: SessionStartOptions) -> Result<Box<[u8]>, BrokerSessionError> {
+    fn start_payload(&self, options: StartOptions) -> Result<Box<[u8]>, BrokerSessionError> {
+        let hello = self.hello;
         let start = StartRequest::new(
             &self.request,
             self.token.preparation_id(),
-            options.wayland_display.as_deref(),
-            options.x11_display,
             options.terminal_size,
             options
                 .execution_timeout
@@ -211,6 +215,24 @@ impl Owner<'_> {
                 .transpose()?,
         )
         .map_err(wire::encoding)?;
+        let required = hello
+            .profile()
+            .start_required_features(&start)
+            .map_err(wire::encoding)?;
+        if !hello.features().contains(required) {
+            return Err(BrokerSessionError::UnsupportedFeatures {
+                required,
+                available: hello.features(),
+            });
+        }
+        if start
+            .execution_timeout_ms()
+            .is_some_and(|timeout| timeout > hello.profile().capacities().max_execution_timeout_ms)
+        {
+            return Err(BrokerSessionError::InvalidRequest(
+                "execution timeout exceeds the selected profile".into(),
+            ));
+        }
         let maximum = self
             .connection
             .readiness()
@@ -218,6 +240,8 @@ impl Owner<'_> {
             .get()
             .max_control_frame_bytes() as usize
             - CONTROL_FRAME_HEADER_BYTES;
-        wire::encode(maximum, |output| start.encode_payload(output))
+        wire::encode(maximum, |output| {
+            hello.protocol().encode_start_payload(&start, output)
+        })
     }
 }
